@@ -1,0 +1,23 @@
+[package]
+name = "rupi"
+version = "0.1.0"
+edition = "2021"
+description = "Minimalistic RPC coding agent with OpenAI-compatible API support"
+
+[dependencies]
+tokio = { version = "1", features = ["full"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+serde_yaml = "0.9"
+clap = { version = "4", features = ["derive", "env"] }
+reqwest = { version = "0.12", features = ["json", "stream"] }
+uuid = { version = "1", features = ["v4"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+futures-util = "0.3"
+async-trait = "0.1"
+dirs = "5"
+
+[dev-dependencies]
+mockito = "1"
+dotenvy = "0.15"
