@@ -13,7 +13,7 @@ pub async fn run_raw(session: Arc<Mutex<AgentSession>>) {
     let mut stdin_reader = BufReader::new(tokio::io::stdin());
     let mut line = String::new();
 
-    let _ = writeln!(stdout(), "rupi raw mode. Type your prompts. Exit with Ctrl+C or 'exit'.");
+    let _ = writeln!(stdout(), "rupi raw mode. Type your prompts. Exit: Ctrl+D, /exit, /quit, or 'exit'.");
     let _ = stdout().flush();
 
     loop {
@@ -31,7 +31,7 @@ pub async fn run_raw(session: Arc<Mutex<AgentSession>>) {
         if input.is_empty() {
             continue;
         }
-        if input == "exit" || input == "/exit" {
+        if input == "exit" || input == "/exit" || input == "/quit" {
             break;
         }
 
