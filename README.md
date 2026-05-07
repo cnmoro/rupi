@@ -19,7 +19,7 @@ That's it. Everything else can be overridden via CLI flags (`--base-url`, `--api
 
 ### Default (interactive) — `./rupi`
 
-REPL prompt. Type your request, get streaming response. Supports `/model provider/model_id` to switch models on the fly. Exit with `Ctrl+D`, `/exit`, `/quit`, or `exit`.
+REPL prompt. Type your request, get streaming response. Supports `/model <model_name>` to switch models on the fly. Exit with `Ctrl+D`, `/exit`, `/quit`, or `exit`.
 
 ### RPC — `./rupi --rpc`
 
