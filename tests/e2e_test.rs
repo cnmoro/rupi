@@ -350,7 +350,7 @@ async fn e2e_test_full_conversation_flow() {
 }
 
 #[tokio::test]
-async fn e2e_test_compaction_triggers() {
+async fn e2e_test_compaction_and_continuation() {
     let config = match load_e2e_config() {
         Some(c) => c,
         None => {
@@ -370,42 +370,83 @@ async fn e2e_test_compaction_triggers() {
     };
 
     let session = AgentSession::from_config(openai_config);
+    // Disable auto-compaction so we can accumulate messages
+    session.set_auto_compaction_enabled(false).await;
     let (tx, mut rx) = mpsc::unbounded_channel::<AgentEvent>();
 
-    // First prompt — should work normally
-    session.prompt("Reply with: hello", tx.clone()).await.unwrap();
-    let mut got_agent_end = false;
-    while let Some(event) = rx.recv().await {
-        if matches!(event, AgentEvent::AgentEnd { .. }) {
-            got_agent_end = true;
+    // Send multiple prompts to build up enough messages for compaction (needs >= 4)
+    let secret = format!("secret-value-{}", std::process::id());
+    for i in 0..3 {
+        let msg = if i == 0 {
+            format!("IMPORTANT: Remember this secret code: {}. Reply with: stored", secret)
+        } else {
+            format!("Reply with: message-{}", i)
+        };
+        session.prompt(&msg, tx.clone()).await.unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        let mut found = false;
+        while std::time::Instant::now() < deadline {
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            while let Ok(event) = rx.try_recv() {
+                if matches!(event, AgentEvent::AgentEnd { .. }) { found = true; }
+            }
+            if found { break; }
+        }
+    }
+
+    // Compact
+    let result = session.compact().await;
+    assert!(result.is_ok(), "Compaction should succeed: {:?}", result.err());
+    let result = result.unwrap();
+    assert!(!result.summary.is_empty(), "Compaction summary should not be empty");
+    assert!(result.tokens_before > 0, "tokens_before should be > 0");
+    eprintln!("Compaction OK: {} tokens before", result.tokens_before);
+
+    // Ask about the fact — the agent should remember via the compaction summary
+    let (tx2, mut rx2) = mpsc::unbounded_channel::<AgentEvent>();
+    session.prompt(
+        &format!("What was the secret code I asked you to remember? Reply with just the code."),
+        tx2.clone(),
+    ).await.unwrap();
+
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    let mut full = String::new();
+    while std::time::Instant::now() < deadline {
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        while let Ok(event) = rx2.try_recv() {
+            if let AgentEvent::MessageUpdate { assistant_message_event, .. } = &event {
+                if let rupi::rpc::types::AssistantMessageEvent::TextDelta { delta } = assistant_message_event {
+                    full.push_str(delta);
+                }
+            }
+            if matches!(event, AgentEvent::AgentEnd { .. }) { break; }
+        }
+        if full.contains(&secret) {
             break;
         }
     }
-    assert!(got_agent_end, "First prompt should complete");
 
-    // At this point the context has ~100+ tokens from system prompt + messages.
-    // With context_window=500 and reserve=16384... actually that won't trigger
-    // because 500 - 16384 is negative. So should_compact() checks:
-    //   context_tokens > context_window - reserve
-    // With context_window=500, reserve=16384: 500 - 16384 = -15884
-    // context_tokens (100+) > -15884 is always true.
-    // So compaction should trigger.
+    assert!(
+        full.contains(&secret),
+        "Agent should remember the secret code from before compaction. Expected '{}' in '{}'",
+        secret, full
+    );
+    eprintln!("Agent remembered the secret code after compaction: confirmed");
+}
 
-    // Manually trigger compaction to verify the mechanism works end-to-end
-    match session.compact().await {
-        Ok(result) => {
-            assert!(!result.summary.is_empty(), "Compaction summary should not be empty");
-            assert!(result.tokens_before > 0, "tokens_before should be > 0");
-        }
-        Err(e) => {
-            // If compaction says "nothing to compact" that's fine for small contexts
-            eprintln!("Compaction note (non-fatal): {}", e);
+/// Helper: wait for an AgentEnd event from an event channel.
+async fn wait_for_agent_end(rx: &mut mpsc::UnboundedReceiver<AgentEvent>, timeout_secs: u64) {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(timeout_secs);
+    while std::time::Instant::now() < deadline {
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        while let Ok(event) = rx.try_recv() {
+            if matches!(event, AgentEvent::AgentEnd { .. }) { return; }
         }
     }
 }
 
 #[tokio::test]
-async fn e2e_test_compaction_manual_rpc() {
+async fn e2e_test_compaction_via_rpc_and_continue() {
     let config = match load_e2e_config() {
         Some(c) => c,
         None => {
@@ -423,70 +464,90 @@ async fn e2e_test_compaction_manual_rpc() {
     };
 
     let session = AgentSession::from_config(openai_config);
+    // Disable auto-compaction so we can accumulate messages
+    session.set_auto_compaction_enabled(false).await;
     let handler = RpcHandler::new(session);
     let (tx, mut rx) = mpsc::unbounded_channel::<String>();
 
-    // Send a prompt first so there are messages
-    let prompt_cmd = RpcCommand::Prompt {
-        id: Some("comp-test-1".into()),
-        message: "Reply with: hello world".into(),
+    // Step 1: send multiple prompts to build up messages (needs >= 4 for find_cut_point)
+    let secret = format!("top-secret-{}", std::process::id());
+    for i in 0..3 {
+        let msg = if i == 0 {
+            format!("Remember this secret: {}. Reply: stored", secret)
+        } else {
+            format!("Reply with: msg-{}", i)
+        };
+        let cmd = RpcCommand::Prompt {
+            id: Some(format!("c1-{}", i)),
+            message: msg,
+            images: None,
+            streaming_behavior: None,
+        };
+        handler.handle(cmd, tx.clone()).await;
+        wait_events_rpc(&mut rx, 60, &["agent_end"]).await;
+    }
+    eprintln!("Step 1: {} prompts done", 3);
+
+    // Step 2: compact
+    let compact_cmd = RpcCommand::Compact { id: Some("c2".into()), custom_instructions: None };
+    handler.handle(compact_cmd, tx.clone()).await;
+    let events = wait_events_rpc(&mut rx, 60, &["response"]).await;
+    let compact_success = events.iter().any(|e| {
+        if let Ok(resp) = serde_json::from_str::<RpcResponse>(e) {
+            resp.command == "compact" && resp.success
+        } else { false }
+    });
+    assert!(compact_success, "Compaction RPC should succeed");
+    eprintln!("Step 2: compaction done");
+
+    // Step 3: ask about the fact — should still be remembered
+    let follow_cmd = RpcCommand::Prompt {
+        id: Some("c3".into()),
+        message: "What was the secret I told you to remember? Reply with just the code.".into(),
         images: None,
         streaming_behavior: None,
     };
-    handler.handle(prompt_cmd, tx.clone()).await;
+    handler.handle(follow_cmd, tx.clone()).await;
 
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(120);
-    let mut agent_end = false;
-    while std::time::Instant::now() < deadline {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    let mut full = String::new();
+    loop {
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         while let Ok(line) = rx.try_recv() {
             if let Ok(event) = serde_json::from_str::<AgentEvent>(line.trim()) {
-                if matches!(event, AgentEvent::AgentEnd { .. }) {
-                    agent_end = true;
+                if let AgentEvent::MessageUpdate { assistant_message_event, .. } = &event {
+                    if let rupi::rpc::types::AssistantMessageEvent::TextDelta { delta } = assistant_message_event {
+                        full.push_str(delta);
+                    }
                 }
+                if matches!(event, AgentEvent::AgentEnd { .. }) { break; }
             }
         }
-        if agent_end {
-            break;
-        }
+        if std::time::Instant::now() > deadline { break; }
+        if full.contains(&secret) { break; }
     }
-    assert!(agent_end, "Prompt should complete before compaction test");
 
-    // Now send compact command through RPC
-    let compact_cmd = RpcCommand::Compact {
-        id: Some("comp-test-2".into()),
-        custom_instructions: None,
-    };
-    handler.handle(compact_cmd, tx).await;
-    tokio::time::sleep(std::time::Duration::from_millis(2000)).await;
+    assert!(
+        full.contains(&secret),
+        "After compaction, agent should remember '{}' but got: {}",
+        secret, full
+    );
+    eprintln!("Step 3: agent remembered after compaction: confirmed");
+}
 
-    // Read the compact response
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(120);
-    let mut compact_ok = false;
+async fn wait_events_rpc(rx: &mut mpsc::UnboundedReceiver<String>, timeout_secs: u64, targets: &[&str]) -> Vec<String> {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(timeout_secs);
+    let mut collected = Vec::new();
+    let mut found = std::collections::HashSet::new();
     while std::time::Instant::now() < deadline {
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         while let Ok(line) = rx.try_recv() {
-            if let Ok(resp) = serde_json::from_str::<RpcResponse>(line.trim()) {
-                if resp.command == "compact" {
-                    compact_ok = resp.success;
-                    if compact_ok {
-                        eprintln!("Compaction succeeded: tokens_before={:?}",
-                            resp.data.as_ref().and_then(|d| d.get("tokensBefore")));
-                    }
-                }
+            collected.push(line.clone());
+            for t in targets {
+                if line.contains(t) { found.insert(t.to_string()); }
             }
         }
-        if compact_ok {
-            break;
-        }
-        // If we get an error response, also stop
-        while let Ok(line) = rx.try_recv() {
-            if let Ok(resp) = serde_json::from_str::<RpcResponse>(line.trim()) {
-                if resp.command == "compact" {
-                    compact_ok = true; // success or error, we got a response
-                    eprintln!("Compact response: success={}, error={:?}", resp.success, resp.error);
-                }
-            }
-        }
+        if found.len() == targets.len() { break; }
     }
+    collected
 }

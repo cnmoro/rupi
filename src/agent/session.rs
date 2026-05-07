@@ -638,9 +638,10 @@ impl AgentSession {
             return Err(AgentError::Config("Context not full enough to compact".into()));
         }
 
-        let cut_index = match compaction::find_cut_point(&messages, 20000) {
-            Some(i) if i > 0 => i,
-            _ => {
+        let keep_recent = self.context_window.saturating_div(10).max(1).min(20000);
+        let cut_index = match compaction::find_cut_point(&messages, keep_recent) {
+            Some(i) => i,
+            None => {
                 {
                     let mut compacting = self.is_compacting.lock().await;
                     *compacting = false;
@@ -665,7 +666,7 @@ impl AgentSession {
         *all_messages = keep;
         all_messages.insert(
             0,
-            Message::new("compaction", &format!("[Compaction summary]\n{}", summary)),
+            Message::new("system", &format!("[Compacted conversation history]\n{}", summary)),
         );
 
         {
