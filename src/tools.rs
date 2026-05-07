@@ -545,7 +545,7 @@ mod tests {
 
     #[test]
     fn test_read_file() {
-        let dir = std::env::temp_dir().join(format!("rupi-tools-test-{}", std::process::id()));
+        let dir = std::env::temp_dir().join("rupi-tools-test-read-file".to_string());
         fs::create_dir_all(&dir).unwrap();
         let path = dir.join("test.txt");
         fs::write(&path, "line1\nline2\nline3\n").unwrap();
@@ -559,7 +559,7 @@ mod tests {
 
     #[test]
     fn test_read_file_with_offset() {
-        let dir = std::env::temp_dir().join(format!("rupi-tools-test-{}", std::process::id()));
+        let dir = std::env::temp_dir().join("rupi-tools-test-read-offset".to_string());
         fs::create_dir_all(&dir).unwrap();
         let path = dir.join("test.txt");
         fs::write(&path, "line1\nline2\nline3\nline4\nline5\n").unwrap();
@@ -574,7 +574,7 @@ mod tests {
 
     #[test]
     fn test_write_file() {
-        let dir = std::env::temp_dir().join(format!("rupi-tools-test-{}", std::process::id()));
+        let dir = std::env::temp_dir().join("rupi-tools-test-write-file".to_string());
         fs::create_dir_all(&dir).unwrap();
         let path = dir.join("new_file.txt");
 
@@ -589,7 +589,7 @@ mod tests {
 
     #[test]
     fn test_edit_file() {
-        let dir = std::env::temp_dir().join(format!("rupi-tools-test-{}", std::process::id()));
+        let dir = std::env::temp_dir().join("rupi-tools-test-edit-file".to_string());
         fs::create_dir_all(&dir).unwrap();
         let path = dir.join("edit.txt");
         fs::write(&path, "hello world\n").unwrap();
@@ -604,7 +604,7 @@ mod tests {
 
     #[test]
     fn test_edit_not_found() {
-        let dir = std::env::temp_dir().join(format!("rupi-tools-test-{}", std::process::id()));
+        let dir = std::env::temp_dir().join("rupi-tools-test-edit-not-found".to_string());
         fs::create_dir_all(&dir).unwrap();
         let path = dir.join("edit.txt");
         fs::write(&path, "hello world\n").unwrap();
@@ -617,7 +617,7 @@ mod tests {
 
     #[test]
     fn test_edit_multiple_matches() {
-        let dir = std::env::temp_dir().join(format!("rupi-tools-test-{}", std::process::id()));
+        let dir = std::env::temp_dir().join("rupi-tools-test-edit-multi".to_string());
         fs::create_dir_all(&dir).unwrap();
         let path = dir.join("edit.txt");
         fs::write(&path, "hello hello\n").unwrap();
@@ -630,7 +630,7 @@ mod tests {
 
     #[test]
     fn test_grep() {
-        let dir = std::env::temp_dir().join(format!("rupi-tools-test-{}", std::process::id()));
+        let dir = std::env::temp_dir().join("rupi-tools-test-grep".to_string());
         fs::create_dir_all(&dir).unwrap();
         fs::write(dir.join("test.txt"), "hello world\nfoo bar\n").unwrap();
 
@@ -642,7 +642,7 @@ mod tests {
 
     #[test]
     fn test_ls() {
-        let dir = std::env::temp_dir().join(format!("rupi-tools-test-{}", std::process::id()));
+        let dir = std::env::temp_dir().join("rupi-tools-test-ls".to_string());
         fs::create_dir_all(&dir).unwrap();
         fs::write(dir.join("a.txt"), "a").unwrap();
         fs::write(dir.join("b.txt"), "b").unwrap();
@@ -694,7 +694,7 @@ mod tests {
 
     #[test]
     fn test_write_creates_parent_dirs() {
-        let dir = std::env::temp_dir().join(format!("rupi-tools-test-{}", std::process::id()));
+        let dir = std::env::temp_dir().join("rupi-tools-test-write-parent".to_string());
         let nested = dir.join("nested").join("deep").join("file.txt");
         let args = serde_json::json!({"file_path": nested.to_string_lossy(), "content": "test"});
         let result = execute_write(&args);
