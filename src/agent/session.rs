@@ -1,4 +1,6 @@
 use std::sync::Arc;
+
+pub type ApprovalFn = Arc<dyn Fn(&str, &str) -> bool + Send + Sync>;
 use tokio::sync::{Mutex, RwLock, watch};
 use tokio::sync::mpsc;
 
@@ -142,6 +144,7 @@ pub fn load_context_files(cwd: &str) -> Vec<ContextFile> {
 /// Agent session manages conversation state and model interaction.
 pub struct AgentSession {
     provider: Arc<dyn ChatProvider>,
+    approval_fn: std::sync::RwLock<Option<ApprovalFn>>,
     model: std::sync::RwLock<String>,
     context_window: u64,
     #[allow(dead_code)]
@@ -170,6 +173,7 @@ impl AgentSession {
         let session_path = sessions::create_session(&model).ok();
         AgentSession {
             provider,
+            approval_fn: std::sync::RwLock::new(None),
             model: std::sync::RwLock::new(model),
             context_window,
             cwd,
@@ -534,7 +538,22 @@ impl AgentSession {
                         tc.name.clone(),
                         tc.arguments.clone(),
                     ));
-                    let result = tools::execute_tool(tc);
+
+                    // Check approval callback
+                    let allowed = {
+                        let guard = self.approval_fn.read().unwrap();
+                        guard.as_ref().map(|f| {
+                            let args_str = serde_json::to_string(&tc.arguments).unwrap_or_default();
+                            f(&tc.name, &args_str)
+                        }).unwrap_or(true)
+                    };
+
+                    let result = if allowed {
+                        tools::execute_tool(tc)
+                    } else {
+                        format!("[User denied execution of tool '{}']", tc.name)
+                    };
+
                     let _ = event_tx.send(AgentEvent::tool_execution_end(
                         tc.name.clone(),
                         result.clone(),
@@ -709,6 +728,12 @@ impl AgentSession {
         }
         let mut streaming = self.is_streaming.lock().await;
         *streaming = false;
+    }
+
+    /// Set an approval callback for tool execution.
+    /// Called with (tool_name, args_json) before execution. Return true to allow.
+    pub fn set_approval_fn(&self, f: Option<ApprovalFn>) {
+        *self.approval_fn.write().unwrap() = f;
     }
 
     pub fn provider_model_info(&self) -> ModelInfo {

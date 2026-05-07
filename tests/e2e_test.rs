@@ -551,3 +551,167 @@ async fn wait_events_rpc(rx: &mut mpsc::UnboundedReceiver<String>, timeout_secs:
     }
     collected
 }
+
+#[tokio::test]
+async fn e2e_test_approval_deny_tool() {
+    let config = match load_e2e_config() {
+        Some(c) => c,
+        None => {
+            eprintln!("Skipping e2e test: credentials not set");
+            return;
+        }
+    };
+
+    let openai_config = OpenAIConfig {
+        base_url: config.base_url.clone(),
+        api_key: config.api_key.clone(),
+        model: config.model_tag.clone(),
+        context_window: 128000,
+        reasoning: false,
+    };
+
+    let session = AgentSession::from_config(openai_config);
+    // Set approval callback that denies ALL tool executions
+    use rupi::agent::session::ApprovalFn;
+    use std::sync::Arc;
+    let deny: ApprovalFn = Arc::new(|_, _| false);
+    session.set_approval_fn(Some(deny));
+
+    let (tx, mut rx) = mpsc::unbounded_channel::<AgentEvent>();
+
+    // Send a prompt that explicitly asks to use bash
+    session.prompt("Use bash to check the current date and time.", tx.clone()).await.unwrap();
+
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    let mut saw_denied = false;
+    let mut agent_ended = false;
+
+    while std::time::Instant::now() < deadline {
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        while let Ok(event) = rx.try_recv() {
+            match &event {
+                AgentEvent::ToolExecutionEnd { tool_name, result, .. } => {
+                    if tool_name == "bash" && result.contains("denied") {
+                        saw_denied = true;
+                    }
+                }
+                AgentEvent::AgentEnd { .. } => {
+                    agent_ended = true;
+                }
+                _ => {}
+            }
+        }
+        if saw_denied && agent_ended { break; }
+    }
+
+    assert!(saw_denied, "Should have seen a denied tool execution");
+    assert!(agent_ended, "Agent should complete even with denied tools");
+    eprintln!("Deny test passed: tool was blocked");
+}
+
+#[tokio::test]
+async fn e2e_test_approval_allow_tool() {
+    let config = match load_e2e_config() {
+        Some(c) => c,
+        None => {
+            eprintln!("Skipping e2e test: credentials not set");
+            return;
+        }
+    };
+
+    let openai_config = OpenAIConfig {
+        base_url: config.base_url.clone(),
+        api_key: config.api_key.clone(),
+        model: config.model_tag.clone(),
+        context_window: 128000,
+        reasoning: false,
+    };
+
+    let session = AgentSession::from_config(openai_config);
+    // Set approval callback that ALLOWS all tool executions
+    use rupi::agent::session::ApprovalFn;
+    use std::sync::Arc;
+    let allow: ApprovalFn = Arc::new(|_, _| true);
+    session.set_approval_fn(Some(allow));
+
+    let (tx, mut rx) = mpsc::unbounded_channel::<AgentEvent>();
+
+    session.prompt("Use bash to check the current date.", tx.clone()).await.unwrap();
+
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    let mut saw_allowed = false;
+    let mut agent_ended = false;
+
+    while std::time::Instant::now() < deadline {
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        while let Ok(event) = rx.try_recv() {
+            match &event {
+                AgentEvent::ToolExecutionEnd { tool_name, result, .. } => {
+                    if tool_name == "bash" && !result.contains("denied") {
+                        saw_allowed = true;
+                    }
+                }
+                AgentEvent::AgentEnd { .. } => {
+                    agent_ended = true;
+                }
+                _ => {}
+            }
+        }
+        if saw_allowed && agent_ended { break; }
+    }
+
+    assert!(saw_allowed, "Should have seen an allowed tool execution");
+    assert!(agent_ended, "Agent should complete");
+    eprintln!("Allow test passed: tool was executed");
+}
+
+#[tokio::test]
+async fn e2e_test_approval_yolo_default() {
+    let config = match load_e2e_config() {
+        Some(c) => c,
+        None => {
+            eprintln!("Skipping e2e test: credentials not set");
+            return;
+        }
+    };
+
+    let openai_config = OpenAIConfig {
+        base_url: config.base_url.clone(),
+        api_key: config.api_key.clone(),
+        model: config.model_tag.clone(),
+        context_window: 128000,
+        reasoning: false,
+    };
+
+    let session = AgentSession::from_config(openai_config);
+    // No approval fn set = YOLO mode (tools always allowed)
+    let (tx, mut rx) = mpsc::unbounded_channel::<AgentEvent>();
+
+    session.prompt("Use bash to check the current date.", tx.clone()).await.unwrap();
+
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    let mut saw_tool = false;
+    let mut agent_ended = false;
+
+    while std::time::Instant::now() < deadline {
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        while let Ok(event) = rx.try_recv() {
+            match &event {
+                AgentEvent::ToolExecutionEnd { tool_name, .. } => {
+                    if tool_name == "bash" {
+                        saw_tool = true;
+                    }
+                }
+                AgentEvent::AgentEnd { .. } => {
+                    agent_ended = true;
+                }
+                _ => {}
+            }
+        }
+        if saw_tool && agent_ended { break; }
+    }
+
+    assert!(saw_tool, "Should have seen a bash tool execution in YOLO mode");
+    assert!(agent_ended, "Agent should complete");
+    eprintln!("YOLO test passed: tool ran without approval prompt");
+}

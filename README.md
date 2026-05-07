@@ -42,7 +42,7 @@ Same as interactive but each SSE delta is printed as a separate JSON line to std
 ## How it works
 
 - **Tools**: bash, read, write, edit, grep, find, ls — the agent decides when to use them
-- **YOLO mode**: always active. The agent never asks for permission — it just runs commands and reports back
+- **YOLO mode**: always active by default. The agent never asks for permission — it just runs commands and reports back. Add `--disable-yolo` to prompt for approval on every tool execution. Type `y`/`yes` to allow, anything else to deny.
 - **Skills**: place `.md` files with frontmatter in `~/.config/rupi/skills/` — injected into the system prompt on startup
 - **Context files**: `CLAUDE.md` and `AGENTS.md` from cwd and all ancestor directories are loaded automatically
 - **Compaction**: auto-triggers when context approaches the window limit. Summarizes old messages via LLM. Set the window with `--context-window` (default 128000). Compaction fires at `context_window - 16384` tokens.

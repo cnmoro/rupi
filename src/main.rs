@@ -1,7 +1,7 @@
 use std::sync::Arc;
 use tokio::sync::Mutex;
 
-use rupi::agent::session::{self as agent_session, AgentSession};
+use rupi::agent::session::{self as agent_session, ApprovalFn, AgentSession};
 use rupi::cli::Cli;
 use rupi::config::RupiConfig;
 use rupi::provider::openai::OpenAIConfig;
@@ -73,7 +73,7 @@ async fn main() {
     match cli.mode() {
         "rpc" => run_rpc_mode(openai_config, loaded_skills, context_files).await,
         "raw" => run_raw_mode(openai_config, loaded_skills, context_files).await,
-        _ => run_interactive_mode(openai_config, loaded_skills, context_files).await,
+        _ => run_interactive_mode(openai_config, loaded_skills, context_files, cli.disable_yolo).await,
     }
 }
 
@@ -136,6 +136,7 @@ async fn run_interactive_mode(
     config: OpenAIConfig,
     skills: Vec<Skill>,
     context_files: Vec<agent_session::ContextFile>,
+    disable_yolo: bool,
 ) {
     let cwd = std::env::current_dir()
         .unwrap_or_default()
@@ -144,6 +145,24 @@ async fn run_interactive_mode(
     let session = Arc::new(Mutex::new(AgentSession::from_config_with(
         config, cwd, skills, context_files,
     )));
+
+    if disable_yolo {
+        let sess = session.lock().await;
+        use std::io::Write;
+        let approval: ApprovalFn = Arc::new(|tool_name: &str, args: &str| {
+            let mut line = String::new();
+            let prompt = format!("\n[APPROVAL] Allow tool '{}({})'? [y/N] ", tool_name, args);
+            let _ = std::io::Write::write(&mut std::io::stdout(), prompt.as_bytes());
+            let _ = std::io::stdout().flush();
+            line.clear();
+            match std::io::stdin().read_line(&mut line) {
+                Ok(_) => line.trim().eq_ignore_ascii_case("y") || line.trim().eq_ignore_ascii_case("yes"),
+                Err(_) => false,
+            }
+        });
+        sess.set_approval_fn(Some(approval));
+    }
+
     rupi::modes::interactive::run_interactive(session).await;
 }
 
