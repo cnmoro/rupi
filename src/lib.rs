@@ -1,8 +1,12 @@
 pub mod agent;
+pub mod auth;
 pub mod cli;
+pub mod compaction;
 pub mod config;
 pub mod error;
 pub mod modes;
 pub mod provider;
 pub mod rpc;
+pub mod sessions;
 pub mod skills;
+pub mod tools;

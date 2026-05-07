@@ -1,13 +1,14 @@
 use std::sync::Arc;
 use tokio::sync::Mutex;
 
-use rupi::agent::session::AgentSession;
+use rupi::agent::session::{self as agent_session, AgentSession};
 use rupi::cli::Cli;
 use rupi::config::RupiConfig;
 use rupi::provider::openai::OpenAIConfig;
 use rupi::rpc::handler::RpcHandler;
 use rupi::rpc::types::RpcCommand;
 use rupi::skills;
+use rupi::skills::Skill;
 
 use clap::Parser;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, stdin, stdout};
@@ -25,7 +26,6 @@ async fn main() {
 
     // Load config from file, then override with CLI/env
     let file_config = RupiConfig::load().unwrap_or_else(|_| {
-        // If no config file, require CLI/env args
         if cli.base_url.is_none() || cli.api_key.is_none() || cli.model.is_none() {
             eprintln!(
                 "Error: No config file found at ~/.config/rupi.json and --base-url/--api-key/--model not provided.\n\
@@ -34,7 +34,6 @@ async fn main() {
             );
             std::process::exit(1);
         }
-        // Dummy config - will use CLI values instead
         RupiConfig {
             base_url: String::new(),
             api_key: String::new(),
@@ -60,19 +59,34 @@ async fn main() {
     };
 
     // Load skills
-    let loaded_skills = rupi::config::skills_dir()
+    let loaded_skills: Vec<Skill> = rupi::config::skills_dir()
         .map(|d| skills::load_skills(&d))
         .unwrap_or_default();
 
+    // Load context files
+    let cwd = std::env::current_dir()
+        .unwrap_or_default()
+        .to_string_lossy()
+        .to_string();
+    let context_files = agent_session::load_context_files(&cwd);
+
     match cli.mode() {
-        "rpc" => run_rpc_mode(openai_config, loaded_skills).await,
-        "raw" => run_raw_mode(openai_config, loaded_skills).await,
-        _ => run_interactive_mode(openai_config, loaded_skills).await,
+        "rpc" => run_rpc_mode(openai_config, loaded_skills, context_files).await,
+        "raw" => run_raw_mode(openai_config, loaded_skills, context_files).await,
+        _ => run_interactive_mode(openai_config, loaded_skills, context_files).await,
     }
 }
 
-async fn run_rpc_mode(config: OpenAIConfig, _skills: Vec<skills::Skill>) {
-    let session = AgentSession::from_config(config);
+async fn run_rpc_mode(
+    config: OpenAIConfig,
+    skills: Vec<Skill>,
+    context_files: Vec<agent_session::ContextFile>,
+) {
+    let cwd = std::env::current_dir()
+        .unwrap_or_default()
+        .to_string_lossy()
+        .to_string();
+    let session = AgentSession::from_config_with(config, cwd, skills, context_files);
     let handler = RpcHandler::new(session);
 
     let (output_tx, mut output_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
@@ -118,13 +132,33 @@ async fn run_rpc_mode(config: OpenAIConfig, _skills: Vec<skills::Skill>) {
     }
 }
 
-async fn run_interactive_mode(config: OpenAIConfig, _skills: Vec<skills::Skill>) {
-    let session = Arc::new(Mutex::new(AgentSession::from_config(config)));
+async fn run_interactive_mode(
+    config: OpenAIConfig,
+    skills: Vec<Skill>,
+    context_files: Vec<agent_session::ContextFile>,
+) {
+    let cwd = std::env::current_dir()
+        .unwrap_or_default()
+        .to_string_lossy()
+        .to_string();
+    let session = Arc::new(Mutex::new(AgentSession::from_config_with(
+        config, cwd, skills, context_files,
+    )));
     rupi::modes::interactive::run_interactive(session).await;
 }
 
-async fn run_raw_mode(config: OpenAIConfig, _skills: Vec<skills::Skill>) {
-    let session = Arc::new(Mutex::new(AgentSession::from_config(config)));
+async fn run_raw_mode(
+    config: OpenAIConfig,
+    skills: Vec<Skill>,
+    context_files: Vec<agent_session::ContextFile>,
+) {
+    let cwd = std::env::current_dir()
+        .unwrap_or_default()
+        .to_string_lossy()
+        .to_string();
+    let session = Arc::new(Mutex::new(AgentSession::from_config_with(
+        config, cwd, skills, context_files,
+    )));
     rupi::modes::raw::run_raw(session).await;
 }
 

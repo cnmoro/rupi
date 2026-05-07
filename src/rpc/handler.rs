@@ -86,12 +86,19 @@ impl RpcHandler {
                 write_success(tx, id, "get_messages", Some(serde_json::json!({ "messages": msgs }))).await;
             }
             RpcCommand::Compact { id, .. } => {
-                let data = serde_json::json!({
-                    "summary": "Compaction not implemented in minimal mode",
-                    "tokensBefore": 0,
-                    "tokensAfter": 0,
-                });
-                write_success(tx, id, "compact", Some(data)).await;
+                match session.read().await.compact().await {
+                    Ok(result) => {
+                        let data = serde_json::json!({
+                            "summary": result.summary,
+                            "tokensBefore": result.tokens_before,
+                            "tokensAfter": 0,
+                        });
+                        write_success(tx, id, "compact", Some(data)).await;
+                    }
+                    Err(e) => {
+                        write_error(tx, id, "compact", e.to_string()).await;
+                    }
+                }
             }
             RpcCommand::Abort { id } => {
                 session.read().await.abort().await;
@@ -353,14 +360,17 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_compact() {
+    async fn test_compact_empty_session() {
         let handler = create_test_handler();
         let cmd = RpcCommand::Compact {
             id: Some("req_1".into()),
             custom_instructions: None,
         };
         let responses = handle_and_collect(&handler, cmd).await;
-        assert!(responses[0].success);
+        // Empty session has no tokens to compact
+        assert!(!responses[0].success);
+        assert!(responses[0].error.as_deref().unwrap().contains("not full enough")
+            || responses[0].error.as_deref().unwrap().contains("Nothing to compact"));
     }
 
     #[tokio::test]

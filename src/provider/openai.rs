@@ -6,8 +6,9 @@ use tokio::sync::{mpsc, watch};
 
 use super::{ChatProvider, StreamEvent, StreamResult};
 use crate::agent::session::Message;
-use crate::rpc::types::ModelInfo;
 use crate::error::AgentError;
+use crate::rpc::types::ModelInfo;
+use crate::tools::{self, ToolCall};
 
 /// Configuration for an OpenAI-compatible provider.
 #[derive(Debug, Clone)]
@@ -27,12 +28,34 @@ struct ChatRequest {
     stream: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     max_tokens: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tools: Option<Vec<serde_json::Value>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tool_choice: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Serialize)]
 struct ChatMessage {
     role: String,
     content: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tool_calls: Option<Vec<ToolCallData>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tool_call_id: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct ToolCallData {
+    id: String,
+    #[serde(rename = "type")]
+    call_type: String,
+    function: ToolCallFunction,
+}
+
+#[derive(Debug, Serialize)]
+struct ToolCallFunction {
+    name: String,
+    arguments: String,
 }
 
 /// OpenAI chat completion streaming chunk.
@@ -56,14 +79,45 @@ struct ChunkChoice {
 struct ChunkDelta {
     #[serde(default)]
     content: Option<String>,
+    #[serde(default)]
+    tool_calls: Option<Vec<ChunkToolCall>>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Default, Deserialize)]
+struct ChunkToolCall {
+    #[serde(default)]
+    index: usize,
+    #[serde(default)]
+    id: Option<String>,
+    #[serde(default)]
+    function: Option<ChunkToolCallFunction>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct ChunkToolCallFunction {
+    #[serde(default)]
+    name: Option<String>,
+    #[serde(default)]
+    arguments: Option<String>,
+}
+
+#[derive(Debug, Default, Deserialize)]
 struct ChunkUsage {
     #[serde(default)]
     prompt_tokens: u64,
     #[serde(default)]
     completion_tokens: u64,
+    #[serde(default)]
+    cost: Option<f64>,
+}
+
+/// Accumulated tool call during streaming.
+#[derive(Debug, Default)]
+struct AccumulatedToolCall {
+    index: usize,
+    id: String,
+    name: String,
+    arguments: String,
 }
 
 /// OpenAI-compatible API provider.
@@ -74,10 +128,51 @@ pub struct OpenAIProvider {
 
 impl OpenAIProvider {
     pub fn new(config: OpenAIConfig) -> Self {
+        let client = Client::builder()
+            .timeout(std::time::Duration::from_secs(120))
+            .build()
+            .unwrap_or_else(|_| Client::new());
         OpenAIProvider {
             config,
-            client: Client::new(),
+            client,
         }
+    }
+
+    fn build_messages(messages: &[Message]) -> Vec<ChatMessage> {
+        messages
+            .iter()
+            .map(|m| {
+                let mut chat_msg = ChatMessage {
+                    role: m.role.clone(),
+                    content: m.content.clone(),
+                    tool_calls: None,
+                    tool_call_id: None,
+                };
+
+                // Handle assistant messages with tool calls
+                if let Some(ref calls) = m.tool_calls {
+                    let tool_call_data: Vec<ToolCallData> = calls
+                        .iter()
+                        .map(|tc| ToolCallData {
+                            id: tc.id.clone(),
+                            call_type: "function".to_string(),
+                            function: ToolCallFunction {
+                                name: tc.name.clone(),
+                                arguments: serde_json::to_string(&tc.arguments).unwrap_or_default(),
+                            },
+                        })
+                        .collect();
+                    chat_msg.tool_calls = Some(tool_call_data);
+                }
+
+                // Handle tool result messages
+                if let Some(ref id) = m.tool_call_id {
+                    chat_msg.tool_call_id = Some(id.clone());
+                }
+
+                chat_msg
+            })
+            .collect()
     }
 }
 
@@ -93,22 +188,24 @@ impl ChatProvider for OpenAIProvider {
         let api_key = self.config.api_key.clone();
         let client = self.client.clone();
         let model = model.to_string();
-        let messages: Vec<ChatMessage> = messages
-            .iter()
-            .map(|m| ChatMessage {
-                role: m.role.clone(),
-                content: m.content.clone(),
-            })
-            .collect();
 
-        let (tx, rx) = mpsc::channel(64);
+        // Build messages with proper tool call/result formatting
+        let api_messages = OpenAIProvider::build_messages(messages);
+
+        // Get tool definitions
+        let tools_defs = tools::all_tools();
+        let serialized_tools = tools::serialize_tools(&tools_defs);
+
+        let (tx, rx) = mpsc::channel(256);
 
         tokio::spawn(async move {
             let body = ChatRequest {
                 model: model.clone(),
-                messages,
+                messages: api_messages,
                 stream: true,
                 max_tokens: None,
+                tools: Some(serialized_tools),
+                tool_choice: Some(serde_json::json!("auto")),
             };
 
             let response_result = client
@@ -127,6 +224,13 @@ impl ChatProvider for OpenAIProvider {
                 }
             };
 
+            // Capture X-Generation-Id from response headers before consuming body
+            let gen_id = response
+                .headers()
+                .get("X-Generation-Id")
+                .and_then(|v| v.to_str().ok())
+                .map(|s| s.to_string());
+
             if !response.status().is_success() {
                 let status = response.status().as_u16();
                 let body_text = response.text().await.unwrap_or_default();
@@ -136,9 +240,17 @@ impl ChatProvider for OpenAIProvider {
                 return;
             }
 
+            // Emit generation ID as early as possible
+            if let Some(ref id) = gen_id {
+                let _ = tx.send(StreamEvent::GenerationId(id.clone())).await;
+            }
+
             let mut full_content = String::new();
             let mut input_tokens = 0;
             let mut output_tokens = 0;
+            let mut cost: Option<super::PromptCost> = None;
+            let mut tool_calls: Vec<AccumulatedToolCall> = Vec::new();
+            let mut finish_reason: Option<String> = None;
             let mut stream = response.bytes_stream();
 
             loop {
@@ -168,20 +280,47 @@ impl ChatProvider for OpenAIProvider {
                                                 if let Some(usage) = chunk.usage {
                                                     input_tokens = usage.prompt_tokens;
                                                     output_tokens = usage.completion_tokens;
+                                                    if let Some(c) = usage.cost {
+                                                        cost = Some(super::PromptCost {
+                                                            prompt_cost: c,
+                                                            completion_cost: 0.0,
+                                                            total_cost: c,
+                                                        });
+                                                    }
                                                 }
                                                 for choice in chunk.choices {
-                                                    if let Some(content) = choice.delta.content {
+                                                    if let Some(reason) = choice.finish_reason {
+                                                        finish_reason = Some(reason);
+                                                    }
+                                                    let delta = choice.delta;
+                                                    if let Some(content) = delta.content {
                                                         full_content.push_str(&content);
                                                         let _ = tx.send(StreamEvent::Delta(content)).await;
                                                     }
-                                                    if choice.finish_reason.is_some() {
-                                                        // Stream done
+                                                    if let Some(chunk_tool_calls) = delta.tool_calls {
+                                                        for tc in chunk_tool_calls {
+                                                            let index = tc.index;
+                                                            while tool_calls.len() <= index {
+                                                                tool_calls.push(AccumulatedToolCall::default());
+                                                            }
+                                                            let acc = &mut tool_calls[index];
+                                                            acc.index = index;
+                                                            if let Some(id) = tc.id {
+                                                                acc.id = id;
+                                                            }
+                                                            if let Some(func) = tc.function {
+                                                                if let Some(name) = func.name {
+                                                                    acc.name = name;
+                                                                }
+                                                                if let Some(args) = func.arguments {
+                                                                    acc.arguments.push_str(&args);
+                                                                }
+                                                            }
+                                                        }
                                                     }
                                                 }
                                             }
-                                            Err(_) => {
-                                                // Skip unparseable chunks
-                                            }
+                                            Err(_) => {}
                                         }
                                     }
                                 }
@@ -191,7 +330,6 @@ impl ChatProvider for OpenAIProvider {
                                 return;
                             }
                             None => {
-                                // Stream ended
                                 break;
                             }
                         }
@@ -199,16 +337,86 @@ impl ChatProvider for OpenAIProvider {
                 }
             }
 
+            // Check if there were tool calls
+            if !tool_calls.is_empty() {
+                let calls: Vec<ToolCall> = tool_calls
+                    .into_iter()
+                    .map(|tc| ToolCall {
+                        id: tc.id,
+                        name: tc.name,
+                        arguments: serde_json::from_str(&tc.arguments).unwrap_or_default(),
+                    })
+                    .collect();
+
+                let _ = tx
+                    .send(StreamEvent::ToolCalls {
+                        calls,
+                        content: full_content,
+                        input_tokens,
+                        output_tokens,
+                        cost,
+                        finish_reason,
+                    })
+                    .await;
+                return;
+            }
+
             let _ = tx
                 .send(StreamEvent::Done(StreamResult {
                     content: full_content,
                     input_tokens,
                     output_tokens,
+                    cost,
                 }))
                 .await;
         });
 
         Ok(rx)
+    }
+
+    async fn complete(
+        &self,
+        model: &str,
+        messages: &[Message],
+    ) -> Result<String, AgentError> {
+        let url = format!("{}/chat/completions", self.config.base_url.trim_end_matches('/'));
+        let api_key = self.config.api_key.clone();
+        let client = self.client.clone();
+        let model = model.to_string();
+        let api_messages = OpenAIProvider::build_messages(messages);
+
+        let body = serde_json::json!({
+            "model": model,
+            "messages": api_messages,
+            "stream": false,
+            "max_tokens": 4096,
+        });
+
+        let response = client
+            .post(&url)
+            .header("Authorization", format!("Bearer {}", api_key))
+            .header("Content-Type", "application/json")
+            .json(&body)
+            .send()
+            .await
+            .map_err(AgentError::Http)?;
+
+        if !response.status().is_success() {
+            let status = response.status().as_u16();
+            let body_text = response.text().await.unwrap_or_default();
+            return Err(AgentError::Api {
+                message: body_text,
+                status_code: status,
+            });
+        }
+
+        let data: serde_json::Value = response.json().await.map_err(AgentError::Http)?;
+        let text = data["choices"][0]["message"]["content"]
+            .as_str()
+            .unwrap_or_default()
+            .to_string();
+
+        Ok(text)
     }
 
     fn model_info(&self) -> ModelInfo {
@@ -224,7 +432,6 @@ impl ChatProvider for OpenAIProvider {
 #[cfg(test)]
 mod tests {
     use super::*;
-
 
     #[tokio::test]
     async fn test_openai_provider_model_info() {
@@ -254,9 +461,7 @@ mod tests {
         };
         let provider = OpenAIProvider::new(config);
         let (_tx, rx_signal) = watch::channel(false);
-        let result = provider
-            .stream_chat("gpt-4", &[], rx_signal)
-            .await;
+        let result = provider.stream_chat("gpt-4", &[], rx_signal).await;
         assert!(result.is_ok(), "stream_chat should not fail for empty messages");
     }
 }

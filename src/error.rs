@@ -7,6 +7,7 @@ pub enum AgentError {
     Http(reqwest::Error),
     Api { message: String, status_code: u16 },
     Config(String),
+    Timeout,
     Cancelled,
 }
 
@@ -20,6 +21,7 @@ impl fmt::Display for AgentError {
                 write!(f, "API error ({}): {}", status_code, message)
             }
             AgentError::Config(msg) => write!(f, "Config error: {}", msg),
+            AgentError::Timeout => write!(f, "Request timed out"),
             AgentError::Cancelled => write!(f, "Operation cancelled"),
         }
     }

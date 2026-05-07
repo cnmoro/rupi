@@ -39,6 +39,18 @@ pub struct Usage {
     pub input: u64,
     pub output: u64,
     pub total_tokens: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cost: Option<PromptCostData>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PromptCostData {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub prompt_cost: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub completion_cost: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub total_cost: Option<f64>,
 }
 
 /// Model information.
@@ -191,12 +203,18 @@ pub struct SessionState {
     pub auto_compaction_enabled: bool,
     pub message_count: usize,
     pub pending_message_count: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub session_file: Option<String>,
 }
 
 /// Agent event types streamed during prompt execution.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum AgentEvent {
+    GenerationId {
+        id: String,
+        timestamp: u64,
+    },
     AgentStart {
         timestamp: u64,
     },
@@ -221,6 +239,16 @@ pub enum AgentEvent {
     AgentEnd {
         timestamp: u64,
     },
+    ToolExecutionStart {
+        tool_name: String,
+        arguments: serde_json::Value,
+        timestamp: u64,
+    },
+    ToolExecutionEnd {
+        tool_name: String,
+        result: String,
+        timestamp: u64,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -235,6 +263,13 @@ use super::jsonl::serialize_json_line;
 impl AgentEvent {
     pub fn to_json_line(&self) -> String {
         serialize_json_line(self)
+    }
+
+    pub fn generation_id(id: String) -> Self {
+        AgentEvent::GenerationId {
+            id,
+            timestamp: now_millis(),
+        }
     }
 
     pub fn agent_start() -> Self {
@@ -278,6 +313,22 @@ impl AgentEvent {
 
     pub fn agent_end() -> Self {
         AgentEvent::AgentEnd {
+            timestamp: now_millis(),
+        }
+    }
+
+    pub fn tool_execution_start(tool_name: String, arguments: serde_json::Value) -> Self {
+        AgentEvent::ToolExecutionStart {
+            tool_name,
+            arguments,
+            timestamp: now_millis(),
+        }
+    }
+
+    pub fn tool_execution_end(tool_name: String, result: String) -> Self {
+        AgentEvent::ToolExecutionEnd {
+            tool_name,
+            result,
             timestamp: now_millis(),
         }
     }

@@ -54,9 +54,13 @@ pub fn load_skills(skills_dir: &PathBuf) -> Vec<Skill> {
                     skills.push(skill);
                 }
             }
-        } else if path.file_name().and_then(|n| n.to_str()) == Some("SKILL.md") {
-            if let Some(skill) = load_skill_from_file(&path) {
-                skills.push(skill);
+        } else {
+            // Load any .md file at the root of the skills directory
+            let fname = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+            if fname.ends_with(".md") {
+                if let Some(skill) = load_skill_from_file(&path) {
+                    skills.push(skill);
+                }
             }
         }
     }
@@ -64,23 +68,45 @@ pub fn load_skills(skills_dir: &PathBuf) -> Vec<Skill> {
     skills
 }
 
-/// Load a single skill from a SKILL.md file.
+/// Load a single skill from a file.
+/// Uses frontmatter if present, otherwise derives name from filename.
 fn load_skill_from_file(path: &PathBuf) -> Option<Skill> {
     let contents = std::fs::read_to_string(path).ok()?;
     let (frontmatter, body) = parse_frontmatter(&contents);
 
-    let name = frontmatter.get("name")?.as_str()?.to_string();
-    let description = frontmatter.get("description")?.as_str()?.to_string();
+    // Try frontmatter name/description first
+    let name = frontmatter
+        .get("name")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_string())
+        .unwrap_or_else(|| {
+            // Fallback: use filename stem as the name
+            path.file_stem()
+                .and_then(|s| s.to_str())
+                .unwrap_or("unknown")
+                .to_string()
+        });
 
-    if name.is_empty() || description.is_empty() {
-        return None;
-    }
+    let description = frontmatter
+        .get("description")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+        .unwrap_or("")
+        .to_string();
+
+    let skill_body = if frontmatter.as_mapping().map(|m| m.is_empty()).unwrap_or(true) {
+        // No frontmatter — entire file is the body
+        contents.trim().to_string()
+    } else {
+        body.to_string()
+    };
 
     Some(Skill {
         name,
         description,
         file_path: path.clone(),
-        body: body.to_string(),
+        body: skill_body,
     })
 }
 
@@ -229,13 +255,34 @@ mod tests {
     }
 
     #[test]
-    fn test_skill_missing_description_not_loaded() {
-        let dir = std::env::temp_dir().join(format!("rupi-skill-missing-{}", std::process::id()));
+    fn test_skill_no_frontmatter_uses_filename() {
+        let dir = std::env::temp_dir().join(format!("rupi-skill-nofm-{}", std::process::id()));
         fs::create_dir_all(&dir).unwrap();
-        let content = "---\nname: no-desc\n---\n\nbody";
-        fs::write(dir.join("SKILL.md"), content).unwrap();
+        fs::write(dir.join("my-skill.md"), "# My Skill\n\nThis is the skill content.").unwrap();
         let skills = load_skills(&dir);
-        assert!(skills.is_empty());
+        assert_eq!(skills.len(), 1);
+        assert_eq!(skills[0].name, "my-skill");
+        assert!(skills[0].body.contains("My Skill"));
         fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn test_load_multiple_md_files() {
+        let dir = std::env::temp_dir().join(format!("rupi-skills-multi-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+
+        // Create ONE.md, TWO.md, THREE.md at root
+        for (name, desc) in &[("one", "first skill"), ("two", "second skill"), ("three", "third skill")] {
+            let content = format!("---\nname: {}\ndescription: {}\n---\n\nbody of {}", name, desc, name);
+            fs::write(dir.join(format!("{}.md", name.to_uppercase())), content).unwrap();
+        }
+
+        let skills = load_skills(&dir);
+        assert_eq!(skills.len(), 3);
+        assert!(skills.iter().any(|s| s.name == "one"));
+        assert!(skills.iter().any(|s| s.name == "two"));
+        assert!(skills.iter().any(|s| s.name == "three"));
+
+        fs::remove_dir_all(dir).unwrap();
     }
 }
