@@ -181,7 +181,7 @@ impl AgentSession {
             is_compacting: Mutex::new(false),
             abort_signal: Mutex::new(None),
             thinking_level: RwLock::new("off".to_string()),
-            auto_compaction_enabled: RwLock::new(false),
+            auto_compaction_enabled: RwLock::new(true),
             message_count: RwLock::new(0),
         }
     }
@@ -770,7 +770,7 @@ mod tests {
         assert_eq!(session.model(), "gpt-4");
         assert_eq!(session.thinking_level().await, "off");
         assert_eq!(session.message_count().await, 0);
-        assert!(!session.auto_compaction_enabled().await);
+        assert!(session.auto_compaction_enabled().await);
     }
 
     #[tokio::test]
@@ -793,6 +793,8 @@ mod tests {
     #[tokio::test]
     async fn test_auto_compaction() {
         let session = create_test_session();
+        assert!(session.auto_compaction_enabled().await);
+        session.set_auto_compaction_enabled(false).await;
         assert!(!session.auto_compaction_enabled().await);
         session.set_auto_compaction_enabled(true).await;
         assert!(session.auto_compaction_enabled().await);

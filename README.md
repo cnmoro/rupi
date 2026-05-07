@@ -13,7 +13,7 @@ Minimalistic RPC coding agent. OpenAI-compatible API only. No bloat.
 }
 ```
 
-That's it. Everything else can be overridden via CLI flags (`--base-url`, `--api-key`, `--model`).
+That's it. Everything else can be overridden via CLI flags (`--base-url`, `--api-key`, `--model`, `--context-window`).
 
 ## Modes
 
@@ -45,7 +45,7 @@ Same as interactive but each SSE delta is printed as a separate JSON line to std
 - **YOLO mode**: always active. The agent never asks for permission — it just runs commands and reports back
 - **Skills**: place `.md` files with frontmatter in `~/.config/rupi/skills/` — injected into the system prompt on startup
 - **Context files**: `CLAUDE.md` and `AGENTS.md` from cwd and all ancestor directories are loaded automatically
-- **Compaction**: auto-triggers when context approaches the window limit. Summarizes old messages via LLM
+- **Compaction**: auto-triggers when context approaches the window limit. Summarizes old messages via LLM. Set the window with `--context-window` (default 128000). Compaction fires at `context_window - 16384` tokens.
 - **Session persistence**: conversations are saved as JSONL in `~/.config/rupi_sessions/`
 - **Generation ID**: `X-Generation-Id` from response headers is emitted as an early event — can be used to query OpenRouter stats
 - **Cost**: usage and cost data from the API is included in the `message_end` event
