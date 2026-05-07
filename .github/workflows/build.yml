@@ -60,11 +60,18 @@ jobs:
         env:
           CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc
 
+      - name: Rename binary with target
+        shell: bash
+        run: |
+          src="target/${{ matrix.target }}/release/rupi${{ matrix.ext }}"
+          dst="target/${{ matrix.target }}/release/rupi-${{ matrix.target }}${{ matrix.ext }}"
+          mv "$src" "$dst"
+
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: rupi-${{ matrix.target }}${{ matrix.ext }}
-          path: target/${{ matrix.target }}/release/rupi${{ matrix.ext }}
+          name: rupi-${{ matrix.target }}
+          path: target/${{ matrix.target }}/release/rupi-${{ matrix.target }}${{ matrix.ext }}
           if-no-files-found: error
 
   release:
@@ -78,15 +85,14 @@ jobs:
       - uses: actions/download-artifact@v4
         with:
           pattern: rupi-*
-          merge-multiple: true
           path: artifacts
 
       - name: List artifacts
-        run: ls -lh artifacts/
+        run: find artifacts/ -type f -ls
 
       - uses: softprops/action-gh-release@v2
         with:
-          files: artifacts/*
+          files: artifacts/**/*
           tag_name: ${{ github.ref_name }}
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
