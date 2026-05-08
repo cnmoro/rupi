@@ -359,9 +359,21 @@ impl AgentSession {
                     break;
                 }
 
-                let nudge_msg = Message::new("user", "Continue working toward the goal. Do not stop until the goal is fully achieved. What is your next step?");
+                let nudge_text = format!("Continue working toward the goal. The goal is: {}. Do not stop until this goal is fully achieved. What is your next step?", g);
+                let nudge_msg = Message::new("user", &nudge_text);
                 self.persist_message(&nudge_msg).await;
                 self.messages.write().await.push(nudge_msg);
+                let _ = event_tx.send(AgentEvent::turn_start());
+                let _ = event_tx.send(AgentEvent::message_start(AgentMessage {
+                    role: "user".to_string(),
+                    content: vec![MessageContent {
+                        content_type: "text".to_string(),
+                        text: Some(nudge_text),
+                    }],
+                    model: None,
+                    usage: None,
+                    stop_reason: None,
+                }));
             }
 
             drop(wrapped_tx);
@@ -803,11 +815,13 @@ impl AgentSession {
     /// Returns true if the model confirms the goal is met.
     async fn verify_goal(&self, goal: &str) -> bool {
         let verify_prompt = format!(
-            "I need to check if a goal has been fully achieved.
+            "You are verifying whether a specific CONDITION has been met.
+Read the EXACT GOAL below and check ONLY the assistant's last response.
+Do NOT consider whether the user's request was fulfilled — only check the assistant's output against the exact goal text.
 
-Goal: {}
+GOAL (check assistant output for this): {}
 
-Based on the conversation so far, has this goal been fully achieved and completed? Reply with only YES or NO.",
+Has the assistant's output satisfied this exact condition? Reply with only YES or NO.",
             goal
         );
 
@@ -816,8 +830,7 @@ Based on the conversation so far, has this goal been fully achieved and complete
         let model_name = self.model.read().unwrap().clone();
         match self.provider.complete(&model_name, &[system_msg, verify_msg]).await {
             Ok(response) => {
-                let upper = response.trim().to_uppercase();
-                upper.starts_with("Y")
+                response.trim().to_uppercase().starts_with("Y")
             }
             Err(_) => true, // on error, assume goal met to prevent infinite loop
         }

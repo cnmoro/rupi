@@ -601,7 +601,7 @@ async fn e2e_test_goal_completes() {
 }
 
 #[tokio::test]
-async fn e2e_test_goal_loops_until_complete() {
+async fn e2e_test_goal_nudge_detected() {
     let config = match load_e2e_config() {
         Some(c) => c,
         None => {
@@ -619,28 +619,31 @@ async fn e2e_test_goal_loops_until_complete() {
     };
 
     let session = AgentSession::from_config(openai_config);
-    // Set a verifiable goal
-    session.set_goal(Some("In your final response, include the EXACT phrase 'GOAL_ACHIEVED'.".into())).await;
+    // Goal requires a specific phrase. The prompt does NOT mention this phrase,
+    // so the first response won't satisfy it. Verification fails → nudge → agent tries again.
+    let required_phrase = "nudge_xyz_789";
+    session.set_goal(Some(format!("Your response must include the exact phrase '{}'.", required_phrase))).await;
 
     let (tx, mut rx) = mpsc::unbounded_channel::<AgentEvent>();
 
-    let result = session.prompt("What is the capital of France? Reply briefly.", tx.clone()).await;
+    // Deliberately do NOT mention the required phrase in the prompt
+    let result = session.prompt("Say exactly 'hello world', nothing else.", tx.clone()).await;
     assert!(result.is_ok(), "Goal prompt should complete");
 
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(90);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(120);
     let mut got_agent_end = false;
-    let mut full_text = String::new();
+    let mut msg_count = 0u32;
+    let mut user_message_after_first = false;
 
     while std::time::Instant::now() < deadline {
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
         while let Ok(event) = rx.try_recv() {
             match &event {
-                AgentEvent::MessageUpdate {
-                    assistant_message_event: delta_event,
-                    ..
-                } => {
-                    if let rupi::rpc::types::AssistantMessageEvent::TextDelta { delta } = delta_event {
-                        full_text.push_str(delta);
+                AgentEvent::MessageStart { ref message, .. } => {
+                    msg_count += 1;
+                    // If we see a 2nd+ user message, a nudge occurred
+                    if message.role == "user" && msg_count > 1 {
+                        user_message_after_first = true;
                     }
                 }
                 AgentEvent::AgentEnd { .. } => { got_agent_end = true; }
@@ -651,7 +654,15 @@ async fn e2e_test_goal_loops_until_complete() {
     }
 
     assert!(got_agent_end, "Agent should complete");
-    eprintln!("Goal loop test: completed, full_text={:?}", &full_text[..full_text.len().min(100)]);
+    assert!(
+        user_message_after_first,
+        "Expected a nudge (second user message). msg_count={}",
+        msg_count
+    );
+    eprintln!(
+        "Nudge test PASSED: msg_count={}, nudge detected",
+        msg_count
+    );
 }
 
 #[tokio::test]
