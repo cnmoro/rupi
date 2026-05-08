@@ -35,6 +35,31 @@ pub async fn run_raw(session: Arc<Mutex<AgentSession>>) {
             break;
         }
 
+        // Handle /goal command
+        if input.starts_with("/goal ") || input == "/goal" {
+            let parts: Vec<&str> = input.splitn(2, ' ').collect();
+            if parts.len() == 2 {
+                let goal_text = parts[1].trim().to_string();
+                if !goal_text.is_empty() {
+                    let sess = session.lock().await;
+                    sess.set_goal(Some(goal_text.clone())).await;
+                    let json = crate::rpc::jsonl::serialize_json_line(&serde_json::json!({
+                        "type": "goal_set", "goal": goal_text
+                    }));
+                    let _ = write!(stdout(), "{}", json);
+                }
+            } else {
+                let sess = session.lock().await;
+                let goal = sess.get_goal().await;
+                let json = crate::rpc::jsonl::serialize_json_line(&serde_json::json!({
+                    "type": "goal_info", "goal": goal
+                }));
+                let _ = write!(stdout(), "{}", json);
+            }
+            let _ = stdout().flush();
+            continue;
+        }
+
         // Handle /model command
         if input.starts_with("/model ") || input == "/model" {
             let parts: Vec<&str> = input.splitn(2, ' ').collect();

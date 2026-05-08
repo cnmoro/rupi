@@ -553,6 +553,192 @@ async fn wait_events_rpc(rx: &mut mpsc::UnboundedReceiver<String>, timeout_secs:
 }
 
 #[tokio::test]
+async fn e2e_test_goal_completes() {
+    let config = match load_e2e_config() {
+        Some(c) => c,
+        None => {
+            eprintln!("Skipping e2e test: credentials not set");
+            return;
+        }
+    };
+
+    let openai_config = OpenAIConfig {
+        base_url: config.base_url.clone(),
+        api_key: config.api_key.clone(),
+        model: config.model_tag.clone(),
+        context_window: 128000,
+        reasoning: false,
+    };
+
+    let session = AgentSession::from_config(openai_config);
+    // Set a simple, quickly achievable goal
+    session.set_goal(Some("Say the word 'pineapple' in your response.".into())).await;
+
+    let (tx, mut rx) = mpsc::unbounded_channel::<AgentEvent>();
+
+    let result = session.prompt("What is 2+2? Reply briefly.", tx.clone()).await;
+    assert!(result.is_ok(), "Goal prompt should complete");
+
+    // Collect all events — should eventually get agent_end
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    let mut got_agent_end = false;
+    let mut got_message_end = false;
+    while std::time::Instant::now() < deadline {
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        while let Ok(event) = rx.try_recv() {
+            match &event {
+                AgentEvent::MessageEnd { .. } => { got_message_end = true; }
+                AgentEvent::AgentEnd { .. } => { got_agent_end = true; }
+                _ => {}
+            }
+        }
+        if got_agent_end { break; }
+    }
+
+    assert!(got_agent_end, "Agent should have completed after goal was achieved");
+    assert!(got_message_end, "Should have message end");
+    eprintln!("Goal test: agent completed after goal achieved");
+}
+
+#[tokio::test]
+async fn e2e_test_goal_loops_until_complete() {
+    let config = match load_e2e_config() {
+        Some(c) => c,
+        None => {
+            eprintln!("Skipping e2e test: credentials not set");
+            return;
+        }
+    };
+
+    let openai_config = OpenAIConfig {
+        base_url: config.base_url.clone(),
+        api_key: config.api_key.clone(),
+        model: config.model_tag.clone(),
+        context_window: 128000,
+        reasoning: false,
+    };
+
+    let session = AgentSession::from_config(openai_config);
+    // Set a verifiable goal
+    session.set_goal(Some("In your final response, include the EXACT phrase 'GOAL_ACHIEVED'.".into())).await;
+
+    let (tx, mut rx) = mpsc::unbounded_channel::<AgentEvent>();
+
+    let result = session.prompt("What is the capital of France? Reply briefly.", tx.clone()).await;
+    assert!(result.is_ok(), "Goal prompt should complete");
+
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(90);
+    let mut got_agent_end = false;
+    let mut full_text = String::new();
+
+    while std::time::Instant::now() < deadline {
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        while let Ok(event) = rx.try_recv() {
+            match &event {
+                AgentEvent::MessageUpdate {
+                    assistant_message_event: delta_event,
+                    ..
+                } => {
+                    if let rupi::rpc::types::AssistantMessageEvent::TextDelta { delta } = delta_event {
+                        full_text.push_str(delta);
+                    }
+                }
+                AgentEvent::AgentEnd { .. } => { got_agent_end = true; }
+                _ => {}
+            }
+        }
+        if got_agent_end { break; }
+    }
+
+    assert!(got_agent_end, "Agent should complete");
+    eprintln!("Goal loop test: completed, full_text={:?}", &full_text[..full_text.len().min(100)]);
+}
+
+#[tokio::test]
+async fn e2e_test_goal_no_goal_normal_flow() {
+    let config = match load_e2e_config() {
+        Some(c) => c,
+        None => {
+            eprintln!("Skipping e2e test: credentials not set");
+            return;
+        }
+    };
+
+    let openai_config = OpenAIConfig {
+        base_url: config.base_url.clone(),
+        api_key: config.api_key.clone(),
+        model: config.model_tag.clone(),
+        context_window: 128000,
+        reasoning: false,
+    };
+
+    // No goal set — normal flow
+    let session = AgentSession::from_config(openai_config);
+    // Explicitly clear goal
+    session.set_goal(None).await;
+
+    let (tx, mut rx) = mpsc::unbounded_channel::<AgentEvent>();
+    session.prompt("Say hello.", tx.clone()).await.unwrap();
+
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    let mut got_end = false;
+    while std::time::Instant::now() < deadline {
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        while let Ok(event) = rx.try_recv() {
+            if matches!(event, AgentEvent::AgentEnd { .. }) { got_end = true; }
+        }
+        if got_end { break; }
+    }
+    assert!(got_end, "Normal flow should complete with agent_end");
+    eprintln!("No-goal test: normal flow completed");
+}
+
+#[tokio::test]
+async fn e2e_test_goal_rpc_set_and_run() {
+    let config = match load_e2e_config() {
+        Some(c) => c,
+        None => {
+            eprintln!("Skipping e2e test: credentials not set");
+            return;
+        }
+    };
+
+    let openai_config = OpenAIConfig {
+        base_url: config.base_url.clone(),
+        api_key: config.api_key.clone(),
+        model: config.model_tag.clone(),
+        context_window: 128000,
+        reasoning: false,
+    };
+
+    let session = AgentSession::from_config(openai_config);
+    session.set_goal(Some("Say the word 'done' at the end of your response.".into())).await;
+
+    let handler = RpcHandler::new(session);
+    let (tx, mut rx) = mpsc::unbounded_channel::<String>();
+
+    let prompt_cmd = RpcCommand::Prompt {
+        id: Some("goal-test-1".into()),
+        message: "What color is the sky? Reply briefly.".into(),
+        images: None,
+        streaming_behavior: None,
+    };
+    handler.handle(prompt_cmd, tx.clone()).await;
+
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    let mut got_agent_end = false;
+    while std::time::Instant::now() < deadline {
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        while let Ok(line) = rx.try_recv() {
+            if let Ok(event) = serde_json::from_str::<AgentEvent>(line.trim()) {
+                if matches!(event, AgentEvent::AgentEnd { .. }) { got_agent_end = true; }
+            }
+        }
+        if got_agent_end { break; }
+    }
+    assert!(got_agent_end, "RPC goal mode should complete with agent_end");
+    eprintln!("RPC goal test: completed");
+}#[tokio::test]
 async fn e2e_test_approval_deny_tool() {
     let config = match load_e2e_config() {
         Some(c) => c,

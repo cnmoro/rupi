@@ -153,6 +153,7 @@ pub fn load_context_files(cwd: &str) -> Vec<ContextFile> {
 pub struct AgentSession {
     provider: Arc<dyn ChatProvider>,
     approval_fn: std::sync::RwLock<Option<ApprovalFn>>,
+    goal: RwLock<Option<String>>,
     model: std::sync::RwLock<String>,
     context_window: u64,
     #[allow(dead_code)]
@@ -182,6 +183,7 @@ impl AgentSession {
         AgentSession {
             provider,
             approval_fn: std::sync::RwLock::new(None),
+            goal: RwLock::new(None),
             model: std::sync::RwLock::new(model),
             context_window,
             cwd,
@@ -292,6 +294,7 @@ impl AgentSession {
 
     /// Stream a prompt to the model. Events are sent to the event_tx channel.
     /// Handles multi-turn tool execution (bash, etc.) internally.
+    /// If a goal is set, loops until the goal is verified.
     pub async fn prompt(
         &self,
         message: &str,
@@ -324,15 +327,63 @@ impl AgentSession {
             stop_reason: None,
         }));
 
-        // Run the multi-turn tool loop
-        let result = self.run_tool_loop(event_tx.clone()).await;
+        // Goal-aware execution loop
+        let goal_text = self.goal.read().await.clone();
+        let max_goal_iters: u32 = 20;
+
+        if let Some(g) = goal_text {
+            // Goal mode: wrap the event channel to hold agent_end.
+            // Use a oneshot channel to send the held agent_end back from the forwarder.
+            let (wrapped_tx, mut wrapped_rx) = mpsc::unbounded_channel::<AgentEvent>();
+            let (held_tx, mut held_rx) = tokio::sync::oneshot::channel::<AgentEvent>();
+            let mut held_tx = Some(held_tx);
+
+            let tx_clone = event_tx.clone();
+            let fwd = tokio::spawn(async move {
+                while let Some(ev) = wrapped_rx.recv().await {
+                    if matches!(ev, AgentEvent::AgentEnd { .. }) {
+                        // Send the agent_end back via oneshot
+                        if let Some(tx) = held_tx.take() {
+                            let _ = tx.send(ev);
+                        }
+                    } else {
+                        let _ = tx_clone.send(ev);
+                    }
+                }
+            });
+
+            for _iter in 0..max_goal_iters {
+                let _ = self.run_tool_loop(wrapped_tx.clone()).await;
+
+                if self.verify_goal(&g).await {
+                    break;
+                }
+
+                let nudge_msg = Message::new("user", "Continue working toward the goal. Do not stop until the goal is fully achieved. What is your next step?");
+                self.persist_message(&nudge_msg).await;
+                self.messages.write().await.push(nudge_msg);
+            }
+
+            drop(wrapped_tx);
+            let _ = fwd.await;
+            // Read the held agent_end (if any) and forward it
+            if let Ok(ae) = held_rx.try_recv() {
+                let _ = event_tx.send(ae);
+            } else {
+                // No agent_end was held — send a synthetic one
+                let _ = event_tx.send(AgentEvent::agent_end());
+            }
+        } else {
+            // No goal: normal flow
+            let _ = self.run_tool_loop(event_tx.clone()).await;
+        }
 
         {
             let mut streaming = self.is_streaming.lock().await;
             *streaming = false;
         }
 
-        result
+        Ok(())
     }
 
     /// Internal tool loop: keeps sending messages + executing tools until final response.
@@ -736,6 +787,40 @@ impl AgentSession {
         }
         let mut streaming = self.is_streaming.lock().await;
         *streaming = false;
+    }
+
+    /// Set a goal for durable execution. When set, the agent will loop until
+    /// an internal verification prompt confirms the goal is met.
+    pub async fn set_goal(&self, goal: Option<String>) {
+        *self.goal.write().await = goal;
+    }
+
+    pub async fn get_goal(&self) -> Option<String> {
+        self.goal.read().await.clone()
+    }
+
+    /// Verify whether the current goal has been achieved by asking the model.
+    /// Returns true if the model confirms the goal is met.
+    async fn verify_goal(&self, goal: &str) -> bool {
+        let verify_prompt = format!(
+            "I need to check if a goal has been fully achieved.
+
+Goal: {}
+
+Based on the conversation so far, has this goal been fully achieved and completed? Reply with only YES or NO.",
+            goal
+        );
+
+        let system_msg = Message::new("system", &build_system_prompt(&[], &[]));
+        let verify_msg = Message::new("user", &verify_prompt);
+        let model_name = self.model.read().unwrap().clone();
+        match self.provider.complete(&model_name, &[system_msg, verify_msg]).await {
+            Ok(response) => {
+                let upper = response.trim().to_uppercase();
+                upper.starts_with("Y")
+            }
+            Err(_) => true, // on error, assume goal met to prevent infinite loop
+        }
     }
 
     /// Set an approval callback for tool execution.

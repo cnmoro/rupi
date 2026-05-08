@@ -33,6 +33,28 @@ pub async fn run_interactive(session: Arc<Mutex<AgentSession>>) {
             break;
         }
 
+        // Handle /goal command
+        if input.starts_with("/goal ") || input == "/goal" {
+            let parts: Vec<&str> = input.splitn(2, ' ').collect();
+            if parts.len() == 2 {
+                let goal_text = parts[1].trim().to_string();
+                if !goal_text.is_empty() {
+                    let sess = session.lock().await;
+                    sess.set_goal(Some(goal_text.clone())).await;
+                    let _ = writeln!(stdout(), "Goal set: {}", goal_text);
+                    let _ = writeln!(stdout(), "The agent will continue working until the goal is achieved.");
+                }
+            } else {
+                let sess = session.lock().await;
+                match sess.get_goal().await {
+                    Some(g) => { let _ = writeln!(stdout(), "Current goal: {}", g); }
+                    None => { let _ = writeln!(stdout(), "No goal set."); }
+                }
+            }
+            let _ = stdout().flush();
+            continue;
+        }
+
         // Handle /model command
         if input.starts_with("/model ") || input == "/model" {
             let parts: Vec<&str> = input.splitn(2, ' ').collect();
