@@ -37,7 +37,7 @@ Same event stream as RPC but reads user input from an interactive prompt instead
 
 ### Interactive — `./rupi` (default)
 
-REPL prompt for humans. Supports `/model <name>` to switch models. Exit with `Ctrl+D`, `/exit`, `/quit`, or `exit`.
+REPL prompt for humans. Supports `/model <name>` to switch models. Supports `/goal <description>` for durable sessions — the agent loops until an internal LLM verification confirms the goal is met. Events are held (no `agent_end`) until completion. Exit with `Ctrl+D`, `/exit`, `/quit`, or `exit`.
 
 ## Headless usage
 
