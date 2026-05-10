@@ -596,12 +596,30 @@ impl AgentSession {
                 }
             }
 
-            // If tool calls were made, execute them and continue
-                if !tool_calls.is_empty() {
+            // If tool calls were made, execute them and continue to next turn
+            if !tool_calls.is_empty() {
                 // Add assistant message with tool calls to history
                 let assistant_msg = Message::tool_call(&full_content, tool_calls.clone());
                 self.persist_message(&assistant_msg).await;
                 self.messages.write().await.push(assistant_msg);
+
+                // Emit message_end + turn_end for this turn (matching Pi's event flow)
+                let _ = event_tx.send(AgentEvent::message_end(AgentMessage {
+                    role: "assistant".to_string(),
+                    content: vec![MessageContent {
+                        content_type: "text".to_string(),
+                        text: Some(full_content.clone()),
+                    }],
+                    model: Some(current_model.clone()),
+                    usage: Some(Usage {
+                        input: input_tokens,
+                        output: output_tokens,
+                        total_tokens: input_tokens + output_tokens,
+                        cost: None,
+                    }),
+                    stop_reason: Some("tool_calls".to_string()),
+                }));
+                let _ = event_tx.send(AgentEvent::turn_end());
 
                 // Execute each tool, emit events, and add results to history
                 for tc in &tool_calls {
@@ -610,7 +628,6 @@ impl AgentSession {
                         tc.arguments.clone(),
                     ));
 
-                    // Check approval callback
                     let allowed = {
                         let guard = self.approval_fn.read().unwrap();
                         guard.as_ref().map(|f| {
@@ -634,7 +651,16 @@ impl AgentSession {
                     self.messages.write().await.push(result_msg);
                 }
 
-                // Continue the loop for the next turn
+                // Start a new turn for the next LLM call (matching Pi's flow)
+                let _ = event_tx.send(AgentEvent::turn_start());
+                let _ = event_tx.send(AgentEvent::message_start(AgentMessage {
+                    role: "user".to_string(),
+                    content: vec![],
+                    model: None,
+                    usage: None,
+                    stop_reason: None,
+                }));
+
                 *self.message_count.write().await += 1;
                 continue;
             }

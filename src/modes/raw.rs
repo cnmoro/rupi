@@ -27,7 +27,7 @@ pub async fn run_raw(session: Arc<Mutex<AgentSession>>) {
             Err(_) => break,
         }
 
-        let input = line.trim().to_string();
+        let mut input = line.trim().to_string();
         if input.is_empty() {
             continue;
         }
@@ -35,27 +35,34 @@ pub async fn run_raw(session: Arc<Mutex<AgentSession>>) {
             break;
         }
 
-        // Handle /goal command
-        if input.starts_with("/goal ") || input == "/goal" {
-            let parts: Vec<&str> = input.splitn(2, ' ').collect();
-            if parts.len() == 2 {
-                let goal_text = parts[1].trim().to_string();
-                if !goal_text.is_empty() {
+        // Handle /goal command — set goal AND start working immediately
+        if input.starts_with("/goal ") {
+            let goal_text = input[6..].trim().to_string();
+            if !goal_text.is_empty() {
+                {
                     let sess = session.lock().await;
                     sess.set_goal(Some(goal_text.clone())).await;
-                    let json = crate::rpc::jsonl::serialize_json_line(&serde_json::json!({
-                        "type": "goal_set", "goal": goal_text
-                    }));
-                    let _ = write!(stdout(), "{}", json);
                 }
-            } else {
-                let sess = session.lock().await;
-                let goal = sess.get_goal().await;
                 let json = crate::rpc::jsonl::serialize_json_line(&serde_json::json!({
-                    "type": "goal_info", "goal": goal
+                    "type": "goal_set", "goal": goal_text
                 }));
                 let _ = write!(stdout(), "{}", json);
+                let _ = stdout().flush();
+                input = goal_text; // fall through to prompt handling
+            } else {
+                let _ = write!(stdout(), "{}", crate::rpc::jsonl::serialize_json_line(
+                    &serde_json::json!({"type":"error","message":"Usage: /goal <description>"})
+                ));
+                let _ = stdout().flush();
+                continue;
             }
+        } else if input == "/goal" {
+            let sess = session.lock().await;
+            let goal = sess.get_goal().await;
+            let json = crate::rpc::jsonl::serialize_json_line(&serde_json::json!({
+                "type": "goal_info", "goal": goal
+            }));
+            let _ = write!(stdout(), "{}", json);
             let _ = stdout().flush();
             continue;
         }

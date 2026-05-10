@@ -25,7 +25,7 @@ pub async fn run_interactive(session: Arc<Mutex<AgentSession>>) {
             Err(_) => break,
         }
 
-        let input = line.trim().to_string();
+        let mut input = line.trim().to_string();
         if input.is_empty() {
             continue;
         }
@@ -33,23 +33,27 @@ pub async fn run_interactive(session: Arc<Mutex<AgentSession>>) {
             break;
         }
 
-        // Handle /goal command
-        if input.starts_with("/goal ") || input == "/goal" {
-            let parts: Vec<&str> = input.splitn(2, ' ').collect();
-            if parts.len() == 2 {
-                let goal_text = parts[1].trim().to_string();
-                if !goal_text.is_empty() {
+        // Handle /goal command — sets goal AND starts working immediately
+        if input.starts_with("/goal ") {
+            let goal_text = input[6..].trim().to_string();
+            if !goal_text.is_empty() {
+                {
                     let sess = session.lock().await;
                     sess.set_goal(Some(goal_text.clone())).await;
-                    let _ = writeln!(stdout(), "Goal set: {}", goal_text);
-                    let _ = writeln!(stdout(), "The agent will continue working until the goal is achieved.");
                 }
+                let _ = writeln!(stdout(), "Goal set and starting work: {}", goal_text);
+                let _ = stdout().flush();
+                input = goal_text; // fall through to prompt handling
             } else {
-                let sess = session.lock().await;
-                match sess.get_goal().await {
-                    Some(g) => { let _ = writeln!(stdout(), "Current goal: {}", g); }
-                    None => { let _ = writeln!(stdout(), "No goal set."); }
-                }
+                let _ = writeln!(stdout(), "Usage: /goal <description of what to achieve>");
+                let _ = stdout().flush();
+                continue;
+            }
+        } else if input == "/goal" {
+            let sess = session.lock().await;
+            match sess.get_goal().await {
+                Some(g) => { let _ = writeln!(stdout(), "Current goal: {}", g); }
+                None => { let _ = writeln!(stdout(), "No goal set."); }
             }
             let _ = stdout().flush();
             continue;
