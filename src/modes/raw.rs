@@ -119,6 +119,9 @@ pub async fn run_raw(session: Arc<Mutex<AgentSession>>) {
                         "type": "message_end",
                         "role": message.role,
                     });
+                    if let Some(reason) = &message.stop_reason {
+                        obj["stop_reason"] = serde_json::json!(reason);
+                    }
                     if let Some(usage) = &message.usage {
                         obj["usage"] = serde_json::json!({
                             "input_tokens": usage.input,

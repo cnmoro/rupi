@@ -510,7 +510,8 @@ impl AgentSession {
             let mut total_cost: Option<f64> = None;
 
             let mut tool_calls: Vec<ToolCall> = Vec::new();
-            let mut _finish_reason: Option<String> = None;
+            let mut finish_reason: Option<String> = None;
+            let mut had_stream_events = false;
             loop {
                 let event = match tokio::time::timeout(
                     std::time::Duration::from_secs(120),
@@ -528,10 +529,12 @@ impl AgentSession {
                         let _ = event_tx.send(AgentEvent::generation_id(id));
                     }
                     StreamEvent::Delta(delta) => {
+                        had_stream_events = true;
                         full_content.push_str(&delta);
                         let _ = event_tx.send(AgentEvent::message_update(delta));
                     }
                     StreamEvent::Done(result) => {
+                        had_stream_events = true;
                         full_content = result.content;
                         input_tokens = result.input_tokens;
                         output_tokens = result.output_tokens;
@@ -540,7 +543,7 @@ impl AgentSession {
                             completion_cost = Some(c.completion_cost);
                             total_cost = Some(c.total_cost);
                         }
-                        _finish_reason = Some("stop".to_string());
+                        finish_reason = Some("stop".to_string());
                     }
                     StreamEvent::ToolCalls {
                         calls,
@@ -550,6 +553,7 @@ impl AgentSession {
                         cost,
                         finish_reason: fr,
                     } => {
+                        had_stream_events = true;
                         full_content = content;
                         input_tokens = it;
                         output_tokens = ot;
@@ -558,7 +562,7 @@ impl AgentSession {
                             completion_cost = Some(c.completion_cost);
                             total_cost = Some(c.total_cost);
                         }
-                        _finish_reason = fr;
+                        finish_reason = fr;
                         tool_calls = calls;
                     }
                     StreamEvent::Error(err) => {
@@ -705,7 +709,9 @@ impl AgentSession {
                     total_tokens: input_tokens + output_tokens,
                     cost: cost_data,
                 }),
-                stop_reason: Some("stop".to_string()),
+                stop_reason: Some(finish_reason.unwrap_or_else(|| {
+                    if had_stream_events { "stop".to_string() } else { "error".to_string() }
+                })),
             }));
             let _ = event_tx.send(AgentEvent::turn_end());
             let _ = event_tx.send(AgentEvent::agent_end());

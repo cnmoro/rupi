@@ -86,6 +86,7 @@ pub async fn run_interactive(session: Arc<Mutex<AgentSession>>) {
         });
 
         let _ = stdout().flush();
+        let mut got_text = false;
         while let Some(event) = event_rx.recv().await {
             match &event {
                 AgentEvent::MessageUpdate {
@@ -93,15 +94,40 @@ pub async fn run_interactive(session: Arc<Mutex<AgentSession>>) {
                     ..
                 } => {
                     if let AssistantMessageEvent::TextDelta { delta } = delta_event {
+                        got_text = true;
                         let _ = write!(stdout(), "{}", delta);
                         let _ = stdout().flush();
                     }
+                }
+                AgentEvent::MessageEnd { message, .. } => {
+                    // If no text was streamed, the message content is in message_end
+                    if !got_text {
+                        for c in &message.content {
+                            if let Some(text) = &c.text {
+                                let _ = write!(stdout(), "{}", text);
+                                got_text = true;
+                            }
+                        }
+                    }
+                    // Print error info if present
+                    if let Some(reason) = &message.stop_reason {
+                        if reason == "error" || reason == "timeout" {
+                            let _ = writeln!(stdout(), "\n[Request failed: {}]", reason);
+                        }
+                    }
+                }
+                AgentEvent::ToolExecutionStart { tool_name, .. } => {
+                    let _ = writeln!(stdout(), "\n[Tool: {}]", tool_name);
+                }
+                AgentEvent::ToolExecutionEnd { tool_name, .. } => {
+                    let _ = writeln!(stdout(), "[{} completed]", tool_name);
                 }
                 AgentEvent::AgentEnd { .. } => {
                     break;
                 }
                 _ => {}
             }
+            let _ = stdout().flush();
         }
 
         let _ = prompt_handle.await;
