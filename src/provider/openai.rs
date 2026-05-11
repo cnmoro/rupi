@@ -199,7 +199,8 @@ impl ChatProvider for OpenAIProvider {
 
         let (tx, rx) = mpsc::channel(256);
 
-        tokio::spawn(async move {
+        let tx_catch = tx.clone();
+        let handle: tokio::task::JoinHandle<()> = tokio::spawn(async move {
             let body = ChatRequest {
                 model: model.clone(),
                 messages: api_messages,
@@ -370,6 +371,21 @@ impl ChatProvider for OpenAIProvider {
                     cost,
                 }))
                 .await;
+        });
+
+        // Catch panics in the HTTP task (e.g., TLS/crypto failures on older CPUs)
+        let tx_err = tx_catch;
+        tokio::spawn(async move {
+            if let Err(e) = handle.await {
+                if e.is_panic() {
+                    let panic = e.into_panic();
+                    let msg = panic.downcast_ref::<&str>()
+                        .map(|s| s.to_string())
+                        .or_else(|| panic.downcast_ref::<String>().map(|s| s.clone()))
+                        .unwrap_or_else(|| "unknown panic in HTTP task".to_string());
+                    let _ = tx_err.send(StreamEvent::Error(format!("Internal error: {}", msg))).await;
+                }
+            }
         });
 
         Ok(rx)
