@@ -148,6 +148,7 @@ public class RupiClient {
 - **Skills**: place `.md` files in `~/.config/rupi/skills/` — injected into the system prompt on startup
 - **Context files**: `CLAUDE.md` and `AGENTS.md` from cwd and ancestor directories are loaded automatically
 - **Compaction**: auto-triggers when context approaches the window. Set with `--context-window` (default 128000, fires at `window - 16384` tokens)
+- **No hard limits**: the agent runs indefinitely until the task is done. When context approaches the window limit, auto-compaction summarizes old messages and the agent keeps going. Optionally set `--timeout <secs>` to cap execution time.
 - **Session persistence**: conversations saved as JSONL in `~/.config/rupi_sessions/`
 - **Generation ID**: `X-Generation-Id` from response headers emitted as an early event
 - **Cost**: usage and cost data from the API included in the `message_end` event
