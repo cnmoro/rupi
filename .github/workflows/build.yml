@@ -29,30 +29,37 @@ jobs:
             os: ubuntu-latest
             ext: ""
             label: linux-x86-64
+            linker: ""
           - target: aarch64-unknown-linux-gnu
             os: ubuntu-latest
             ext: ""
             label: linux-arm64
+            linker: aarch64-linux-gnu-gcc
           - target: x86_64-unknown-linux-gnu
             os: ubuntu-22.04
             ext: ""
             label: linux-x86-64-old
+            linker: ""
           - target: aarch64-unknown-linux-gnu
             os: ubuntu-22.04
             ext: ""
             label: linux-arm64-old
+            linker: aarch64-linux-gnu-gcc
           - target: x86_64-apple-darwin
             os: macos-latest
             ext: ""
             label: macos-x86-64
+            linker: ""
           - target: aarch64-apple-darwin
             os: macos-latest
             ext: ""
             label: macos-arm64
+            linker: ""
           - target: x86_64-pc-windows-msvc
             os: windows-latest
             ext: ".exe"
             label: windows-x86-64
+            linker: ""
 
     steps:
       - uses: actions/checkout@v4
@@ -63,15 +70,17 @@ jobs:
           targets: ${{ matrix.target }}
 
       - name: Install cross-compilation deps (Linux ARM64)
-        if: contains(matrix.target, 'aarch64')
+        if: matrix.linker != ''
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y -qq gcc-aarch64-linux-gnu
 
+      - name: Set linker (Linux ARM64)
+        if: matrix.linker != ''
+        run: echo "CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=${{ matrix.linker }}" >> $GITHUB_ENV
+
       - name: Build release binary
         run: cargo build --release --target ${{ matrix.target }}
-        env:
-          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc
 
       - name: Rename binary with label
         shell: bash
