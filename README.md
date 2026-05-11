@@ -114,26 +114,33 @@ readLoop();
 await send({ type: "prompt", message: "Say hello" });
 ```
 
-### Java
+### Java (Gson)
 
 ```java
 import java.io.*;
-import java.util.concurrent.*;
+import com.google.gson.*;
 
 public class RupiClient {
     public static void main(String[] args) throws Exception {
         Process rupi = new ProcessBuilder("./rupi", "--rpc").start();
         var stdin = new BufferedWriter(new OutputStreamWriter(rupi.getOutputStream()));
         var stdout = new BufferedReader(new InputStreamReader(rupi.getInputStream()));
+        var gson = new Gson();
 
-        stdin.write("{\"type\":\"prompt\",\"id\":\"1\",\"message\":\"Say hello\"}\n");
+        var cmd = new JsonObject();
+        cmd.addProperty("type", "prompt");
+        cmd.addProperty("id", "1");
+        cmd.addProperty("message", "Say hello");
+        stdin.write(gson.toJson(cmd) + "\n");
         stdin.flush();
 
         String line;
         while ((line = stdout.readLine()) != null) {
-            if (line.contains("\"agent_end\"")) break;
-            if (line.contains("\"text_delta\"")) {
-                System.out.print(line.replaceAll(".*\"delta\":\"([^\"]+)\".*", "$1"));
+            var event = JsonParser.parseString(line).getAsJsonObject();
+            if (event.get("type").getAsString().equals("agent_end")) break;
+            if (event.get("type").getAsString().equals("message_update")) {
+                var delta = event.getAsJsonObject("assistant_message_event");
+                System.out.print(delta.get("delta").getAsString());
                 System.out.flush();
             }
         }
