@@ -566,16 +566,18 @@ impl AgentSession {
                         tool_calls = calls;
                     }
                     StreamEvent::Error(err) => {
+                        had_stream_events = true;
+                        let error_text = if err == "cancelled" {
+                            "Request cancelled".to_string()
+                        } else {
+                            format!("Error: {}", err)
+                        };
                         let _ = event_tx.send(AgentEvent::message_end(AgentMessage {
                             role: "assistant".to_string(),
-                            content: if full_content.is_empty() {
-                                vec![]
-                            } else {
-                                vec![MessageContent {
-                                    content_type: "text".to_string(),
-                                    text: Some(full_content.clone()),
-                                }]
-                            },
+                            content: vec![MessageContent {
+                                content_type: "text".to_string(),
+                                text: Some(error_text),
+                            }],
                             model: Some(current_model.clone()),
                             usage: Some(Usage {
                                 input: input_tokens,

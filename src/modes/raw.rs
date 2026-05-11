@@ -119,6 +119,14 @@ pub async fn run_raw(session: Arc<Mutex<AgentSession>>) {
                         "type": "message_end",
                         "role": message.role,
                     });
+                    // Include the message text content (especially useful for error messages)
+                    let text_content: Vec<&str> = message.content.iter()
+                        .filter_map(|c| c.text.as_deref())
+                        .collect();
+                    let text_content = text_content.join("\n");
+                    if !text_content.is_empty() {
+                        obj["content"] = serde_json::json!(text_content);
+                    }
                     if let Some(reason) = &message.stop_reason {
                         obj["stop_reason"] = serde_json::json!(reason);
                     }
