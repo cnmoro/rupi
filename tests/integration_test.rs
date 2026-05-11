@@ -77,7 +77,8 @@ async fn test_mock_server_streaming_response() {
         api_key: "test-key".into(),
         model: "gpt-4".into(),
         context_window: 8192,
-        reasoning: false,
+        timeout_secs: 0,
+            reasoning: false,
     };
 
     let provider = OpenAIProvider::new(config);
@@ -96,7 +97,8 @@ async fn test_mock_server_error_response() {
         api_key: "bad-key".into(),
         model: "gpt-4".into(),
         context_window: 8192,
-        reasoning: false,
+        timeout_secs: 0,
+            reasoning: false,
     };
 
     let provider = OpenAIProvider::new(config);
@@ -113,7 +115,8 @@ async fn test_rpc_ping_through_mock_server() {
         api_key: "test-key".into(),
         model: "gpt-4".into(),
         context_window: 8192,
-        reasoning: false,
+        timeout_secs: 0,
+            reasoning: false,
     };
 
     let session = AgentSession::from_config(config);
@@ -145,7 +148,8 @@ async fn test_rpc_get_state_through_mock() {
         api_key: "test-key".into(),
         model: "gpt-4".into(),
         context_window: 128000,
-        reasoning: false,
+        timeout_secs: 0,
+            reasoning: false,
     };
 
     let session = AgentSession::from_config(config);
@@ -180,7 +184,8 @@ async fn test_full_rpc_command_flow() {
         api_key: "test-key".into(),
         model: "gpt-4".into(),
         context_window: 8192,
-        reasoning: false,
+        timeout_secs: 0,
+            reasoning: false,
     };
 
     let session = AgentSession::from_config(config);

@@ -68,7 +68,8 @@ fn make_config(config: &RupiConfig) -> OpenAIConfig {
         api_key: config.api_key.clone(),
         model: config.model_tag.clone(),
         context_window: 128000,
-        reasoning: false,
+        timeout_secs: 0,
+            reasoning: false,
     }
 }
 
@@ -366,7 +367,8 @@ async fn e2e_test_compaction_and_continuation() {
         api_key: config.api_key.clone(),
         model: config.model_tag.clone(),
         context_window: 500,
-        reasoning: false,
+        timeout_secs: 0,
+            reasoning: false,
     };
 
     let session = AgentSession::from_config(openai_config);
@@ -460,7 +462,8 @@ async fn e2e_test_compaction_via_rpc_and_continue() {
         api_key: config.api_key.clone(),
         model: config.model_tag.clone(),
         context_window: 500,
-        reasoning: false,
+        timeout_secs: 0,
+            reasoning: false,
     };
 
     let session = AgentSession::from_config(openai_config);
@@ -567,7 +570,8 @@ async fn e2e_test_goal_completes() {
         api_key: config.api_key.clone(),
         model: config.model_tag.clone(),
         context_window: 128000,
-        reasoning: false,
+        timeout_secs: 0,
+            reasoning: false,
     };
 
     let session = AgentSession::from_config(openai_config);
@@ -615,7 +619,8 @@ async fn e2e_test_goal_nudge_detected() {
         api_key: config.api_key.clone(),
         model: config.model_tag.clone(),
         context_window: 128000,
-        reasoning: false,
+        timeout_secs: 0,
+            reasoning: false,
     };
 
     let session = AgentSession::from_config(openai_config);
@@ -680,7 +685,8 @@ async fn e2e_test_goal_no_goal_normal_flow() {
         api_key: config.api_key.clone(),
         model: config.model_tag.clone(),
         context_window: 128000,
-        reasoning: false,
+        timeout_secs: 0,
+            reasoning: false,
     };
 
     // No goal set — normal flow
@@ -719,7 +725,8 @@ async fn e2e_test_goal_rpc_set_and_run() {
         api_key: config.api_key.clone(),
         model: config.model_tag.clone(),
         context_window: 128000,
-        reasoning: false,
+        timeout_secs: 0,
+            reasoning: false,
     };
 
     let session = AgentSession::from_config(openai_config);
@@ -764,7 +771,8 @@ async fn e2e_test_approval_deny_tool() {
         api_key: config.api_key.clone(),
         model: config.model_tag.clone(),
         context_window: 128000,
-        reasoning: false,
+        timeout_secs: 0,
+            reasoning: false,
     };
 
     let session = AgentSession::from_config(openai_config);
@@ -821,7 +829,8 @@ async fn e2e_test_approval_allow_tool() {
         api_key: config.api_key.clone(),
         model: config.model_tag.clone(),
         context_window: 128000,
-        reasoning: false,
+        timeout_secs: 0,
+            reasoning: false,
     };
 
     let session = AgentSession::from_config(openai_config);
@@ -877,7 +886,8 @@ async fn e2e_test_approval_yolo_default() {
         api_key: config.api_key.clone(),
         model: config.model_tag.clone(),
         context_window: 128000,
-        reasoning: false,
+        timeout_secs: 0,
+            reasoning: false,
     };
 
     let session = AgentSession::from_config(openai_config);

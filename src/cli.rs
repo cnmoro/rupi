@@ -20,6 +20,10 @@ pub struct Cli {
     #[arg(long, default_value_t = 128000)]
     pub context_window: u64,
 
+    /// Maximum execution time in seconds (default: no limit)
+    #[arg(long, default_value_t = 0)]
+    pub timeout: u64,
+
     /// Enable reasoning model
     #[arg(long, default_value_t = false)]
     pub reasoning: bool,

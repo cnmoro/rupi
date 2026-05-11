@@ -200,6 +200,7 @@ mod tests {
             api_key: "test-key".into(),
             model: "gpt-4".into(),
             context_window: 8192,
+            timeout_secs: 0,
             reasoning: false,
         };
         let session = AgentSession::from_config(config);

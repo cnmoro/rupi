@@ -201,6 +201,7 @@ mod tests {
             api_key: "test-key".into(),
             model: "gpt-4".into(),
             context_window: 8192,
+            timeout_secs: 0,
             reasoning: false,
         };
         let session = Arc::new(Mutex::new(AgentSession::from_config(config)));

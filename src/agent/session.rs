@@ -329,7 +329,6 @@ impl AgentSession {
 
         // Goal-aware execution loop
         let goal_text = self.goal.read().await.clone();
-        let max_goal_iters: u32 = 20;
 
         if let Some(g) = goal_text {
             // Goal mode: wrap the event channel to hold agent_end.
@@ -352,7 +351,7 @@ impl AgentSession {
                 }
             });
 
-            for _iter in 0..max_goal_iters {
+            loop {
                 let _ = self.run_tool_loop(wrapped_tx.clone()).await;
 
                 if self.verify_goal(&g).await {
@@ -403,26 +402,7 @@ impl AgentSession {
         &self,
         event_tx: mpsc::UnboundedSender<AgentEvent>,
     ) -> Result<(), AgentError> {
-        let max_turns = 10;
-        let start_time = std::time::Instant::now();
-        let max_duration = std::time::Duration::from_secs(120);
-
-        for _turn in 0..max_turns {
-            if start_time.elapsed() > max_duration {
-                let _ = event_tx.send(AgentEvent::message_end(AgentMessage {
-                    role: "assistant".to_string(),
-                    content: vec![MessageContent {
-                        content_type: "text".to_string(),
-                        text: Some("Request timed out".to_string()),
-                    }],
-                    model: Some(self.model.read().unwrap().clone()),
-                    usage: None,
-                    stop_reason: Some("timeout".to_string()),
-                }));
-                let _ = event_tx.send(AgentEvent::turn_end());
-                let _ = event_tx.send(AgentEvent::agent_end());
-                return Err(AgentError::Timeout);
-            }
+        for _turn_num in 0.. {
             // Check abort signal
             {
                 let signal = self.abort_signal.lock().await;
@@ -732,12 +712,12 @@ impl AgentSession {
             }],
             model: Some(self.model.read().unwrap().clone()),
             usage: None,
-            stop_reason: Some("max_turns".to_string()),
+            stop_reason: Some("timeout".to_string()),
         }));
         let _ = event_tx.send(AgentEvent::turn_end());
         let _ = event_tx.send(AgentEvent::agent_end());
 
-        Err(AgentError::Config("Max iteration depth reached".into()))
+        Err(AgentError::Config("Operation timed out".into()))
     }
 
     /// Run compaction on the conversation history.
@@ -925,6 +905,7 @@ mod tests {
             api_key: "test-key".into(),
             model: "gpt-4".into(),
             context_window: 8192,
+            timeout_secs: 0,
             reasoning: false,
         };
         AgentSession::from_config(config)

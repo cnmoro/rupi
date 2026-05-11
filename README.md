@@ -13,7 +13,7 @@ Minimalistic RPC coding agent. Designed for programmatic use — call it from Py
 }
 ```
 
-All values can be overridden via CLI flags (`--base-url`, `--api-key`, `--model`, `--context-window`).
+All values can be overridden via CLI flags (`--base-url`, `--api-key`, `--model`, `--context-window`, `--timeout`).
 
 ## Modes
 

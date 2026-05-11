@@ -273,6 +273,7 @@ mod tests {
             api_key: "test".into(),
             model: "gpt-4".into(),
             context_window: 128000,
+            timeout_secs: 0,
             reasoning: false,
         };
         let provider: Arc<dyn ChatProvider> = Arc::new(crate::provider::openai::OpenAIProvider::new(config));
@@ -291,6 +292,7 @@ mod tests {
             api_key: "test".into(),
             model: "gpt-4".into(),
             context_window: 128000,
+            timeout_secs: 0,
             reasoning: false,
         };
         let provider: Arc<dyn ChatProvider> = Arc::new(crate::provider::openai::OpenAIProvider::new(config));

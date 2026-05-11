@@ -18,6 +18,7 @@ pub struct OpenAIConfig {
     pub model: String,
     pub context_window: u64,
     pub reasoning: bool,
+    pub timeout_secs: u64,
 }
 
 /// OpenAI chat completion request body.
@@ -128,11 +129,12 @@ pub struct OpenAIProvider {
 
 impl OpenAIProvider {
     pub fn new(config: OpenAIConfig) -> Self {
-        let client = Client::builder()
-            .timeout(std::time::Duration::from_secs(30))
-            .connect_timeout(std::time::Duration::from_secs(10))
-            .build()
-            .unwrap_or_else(|_| Client::new());
+        let mut builder = Client::builder()
+            .connect_timeout(std::time::Duration::from_secs(10));
+        if config.timeout_secs > 0 {
+            builder = builder.timeout(std::time::Duration::from_secs(config.timeout_secs));
+        }
+        let client = builder.build().unwrap_or_else(|_| Client::new());
         OpenAIProvider {
             config,
             client,
@@ -457,6 +459,7 @@ mod tests {
             api_key: "test-key".into(),
             model: "gpt-4".into(),
             context_window: 8192,
+            timeout_secs: 0,
             reasoning: false,
         };
         let provider = OpenAIProvider::new(config);
@@ -474,6 +477,7 @@ mod tests {
             api_key: "test-key".into(),
             model: "gpt-4".into(),
             context_window: 8192,
+            timeout_secs: 0,
             reasoning: false,
         };
         let provider = OpenAIProvider::new(config);

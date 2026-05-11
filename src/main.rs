@@ -56,6 +56,7 @@ async fn main() {
         model: model.to_string(),
         context_window: cli.context_window,
         reasoning: cli.reasoning,
+        timeout_secs: cli.timeout,
     };
 
     // Load skills
