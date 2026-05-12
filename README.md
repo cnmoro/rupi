@@ -1,6 +1,6 @@
 # rupi
 
-Just `./rupi`. A single 7MB binary. No npm install, no pip install, no node_modules, no Python runtime, no JVM. Download it and run it.
+A Rust clone-ish of [pi](https://github.com/cnmoro/pi). Just `./rupi`. A single 7MB binary. No npm install, no pip install, no node_modules, no Python runtime, no JVM. Download it and run it.
 
 Works as an interactive coding agent for humans, or as a headless RPC backend for automation scripts.
 
