@@ -67,6 +67,27 @@ pub async fn run_raw(session: Arc<Mutex<AgentSession>>) {
             continue;
         }
 
+        // Handle /compact command
+        if input == "/compact" {
+            let sess = session.lock().await;
+            match sess.compact().await {
+                Ok(result) => {
+                    let json = crate::rpc::jsonl::serialize_json_line(&serde_json::json!({
+                        "type": "compaction_done", "tokens_before": result.tokens_before
+                    }));
+                    let _ = write!(stdout(), "{}", json);
+                }
+                Err(e) => {
+                    let json = crate::rpc::jsonl::serialize_json_line(&serde_json::json!({
+                        "type": "compaction_error", "error": e.to_string()
+                    }));
+                    let _ = write!(stdout(), "{}", json);
+                }
+            }
+            let _ = stdout().flush();
+            continue;
+        }
+
         // Handle /model command
         if input.starts_with("/model ") || input == "/model" {
             let parts: Vec<&str> = input.splitn(2, ' ').collect();

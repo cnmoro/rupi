@@ -59,6 +59,21 @@ pub async fn run_interactive(session: Arc<Mutex<AgentSession>>) {
             continue;
         }
 
+        // Handle /compact command
+        if input == "/compact" {
+            let sess = session.lock().await;
+            match sess.compact().await {
+                Ok(result) => {
+                    let _ = writeln!(stdout(), "Compaction complete: {} tokens before", result.tokens_before);
+                }
+                Err(e) => {
+                    let _ = writeln!(stdout(), "Compaction skipped: {}", e);
+                }
+            }
+            let _ = stdout().flush();
+            continue;
+        }
+
         // Handle /model command
         if input.starts_with("/model ") || input == "/model" {
             let parts: Vec<&str> = input.splitn(2, ' ').collect();
