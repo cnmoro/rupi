@@ -1,6 +1,8 @@
 # rupi
 
-Minimalistic RPC coding agent. Designed for programmatic use — call it from Python, Node.js, Java, or any language that can spawn a subprocess and read JSON from stdout. Optionally usable by humans via the interactive REPL.
+Just `./rupi`. A single 7MB binary. No npm install, no pip install, no node_modules, no Python runtime, no JVM. Download it and run it.
+
+Works as an interactive coding agent for humans, or as a headless RPC backend for automation scripts.
 
 ## Setup
 
@@ -17,29 +19,41 @@ All values can be overridden via CLI flags (`--base-url`, `--api-key`, `--model`
 
 ## Modes
 
-### RPC — `./rupi --rpc` (recommended for programmatic use)
+### Interactive — `./rupi` (default)
 
-JSONL protocol over stdin/stdout. Send a JSON command on stdin, receive responses and streaming events on stdout.
+REPL prompt for humans. Supports `/goal <desc>` (durable sessions — loops until goal verified), `/model <name>` (switch models), `/compact` (trigger compaction). Multi-line paste supported (lines within 5ms are joined). Exit with `Ctrl+D`, `/exit`, `/quit`, or `exit`.
+
+### RPC — `./rupi --rpc`
+
+JSONL protocol over stdin/stdout. Designed for programmatic use — send JSON commands on stdin, receive events on stdout.
 
 ```json
 {"type":"prompt","id":"1","message":"hello"}
 {"id":"1","type":"response","command":"prompt","success":true}
 {"type":"message_update","assistant_message_event":{"type":"text_delta","delta":"Hello"},"timestamp":...}
 ...
-{"type":"agent_end","timestamp":...}
 ```
 
 Events: `generation_id`, `agent_start`, `turn_start`, `message_start`, `message_update`, `message_end`, `turn_end`, `agent_end`, `tool_execution_start`, `tool_execution_end`.
 
 ### Raw — `./rupi --raw`
 
-Same event stream as RPC but reads user input from an interactive prompt instead of stdin JSON. Useful for debugging or piping to other tools.
+Same event stream as RPC but reads user input interactively. Useful for debugging or piping.
 
-### Interactive — `./rupi` (default)
+## How it works
 
-REPL prompt for humans. Supports `/goal <desc>` (durable sessions — loops until goal verified), `/model <name>` (switch models), `/compact` (trigger compaction). Multi-line paste supported (lines within 5ms are joined). Exit with `Ctrl+D`, `/exit`, `/quit`, or `exit`.
+- **Tools**: bash, read, write, edit, grep, find, ls — the agent decides when to use them. YOLO mode (default): no approval needed. Add `--disable-yolo` to require user confirmation per execution.
+- **Skills**: place `.md` files in `~/.config/rupi/skills/` — injected into the system prompt on startup
+- **Context files**: `CLAUDE.md` and `AGENTS.md` from cwd and ancestor directories are loaded automatically
+- **Compaction**: auto-triggers when context approaches the window. Set with `--context-window` (default 128000, fires at `window - 16384` tokens)
+- **No hard limits**: the agent runs indefinitely until the task is done. When context approaches the window limit, auto-compaction summarizes old messages and the agent keeps going. Optionally set `--timeout <secs>` to cap execution time.
+- **Memory**: add `--memory` to persist key facts across sessions. The agent reads/writes `~/.config/rupi/MEMORY.md` — reads on startup, overwrites with bullet points during execution.
+- **Session persistence**: conversations saved as JSONL in `~/.config/rupi_sessions/`
+- **Error reporting**: `message_end` includes `stop_reason` (`"stop"`, `"error"`, `"tool_calls"`, `"timeout"`) and error text in `content` when applicable.
+- **Generation ID**: `X-Generation-Id` from response headers emitted as an early event
+- **Cost**: usage and cost data from the API included in the `message_end` event
 
-## Headless usage
+## Calling via code (Python / Node.js / Java)
 
 ### Python
 
@@ -148,16 +162,3 @@ public class RupiClient {
     }
 }
 ```
-
-## How it works
-
-- **Tools**: bash, read, write, edit, grep, find, ls — the agent decides when to use them. YOLO mode (default): no approval needed. Add `--disable-yolo` to require user confirmation per execution.
-- **Skills**: place `.md` files in `~/.config/rupi/skills/` — injected into the system prompt on startup
-- **Context files**: `CLAUDE.md` and `AGENTS.md` from cwd and ancestor directories are loaded automatically
-- **Compaction**: auto-triggers when context approaches the window. Set with `--context-window` (default 128000, fires at `window - 16384` tokens)
-- **No hard limits**: the agent runs indefinitely until the task is done. When context approaches the window limit, auto-compaction summarizes old messages and the agent keeps going. Optionally set `--timeout <secs>` to cap execution time.
-- **Session persistence**: conversations saved as JSONL in `~/.config/rupi_sessions/`
-- **Memory**: add `--memory` to persist key facts across sessions. The agent reads/writes `~/.config/rupi/MEMORY.md` — reads on startup, overwrites with bullet points during execution.
-- **Error reporting**: `message_end` includes `stop_reason` (`"stop"`, `"error"`, `"tool_calls"`, `"timeout"`) and error text in `content` when applicable.
-- **Generation ID**: `X-Generation-Id` from response headers emitted as an early event
-- **Cost**: usage and cost data from the API included in the `message_end` event
