@@ -27,12 +27,12 @@ pub async fn run_raw(session: Arc<Mutex<AgentSession>>) {
             Err(_) => break,
         }
 
-        // Support multi-line paste: collect all lines that arrive within 5ms
+        // Support multi-line paste: collect all lines that arrive within 100ms
         let mut input = line.trim_end_matches('\n').trim_end_matches('\r').to_string();
         loop {
             let mut extra = String::new();
             match tokio::time::timeout(
-                std::time::Duration::from_millis(5),
+                std::time::Duration::from_millis(100),
                 stdin_reader.read_line(&mut extra),
             ).await {
                 Ok(Ok(n)) if n > 0 => {
