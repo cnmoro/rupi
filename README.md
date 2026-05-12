@@ -13,7 +13,7 @@ Minimalistic RPC coding agent. Designed for programmatic use — call it from Py
 }
 ```
 
-All values can be overridden via CLI flags (`--base-url`, `--api-key`, `--model`, `--context-window`, `--timeout`).
+All values can be overridden via CLI flags (`--base-url`, `--api-key`, `--model`, `--context-window`, `--timeout`, `--memory`, `--disable-yolo`).
 
 ## Modes
 
@@ -37,7 +37,7 @@ Same event stream as RPC but reads user input from an interactive prompt instead
 
 ### Interactive — `./rupi` (default)
 
-REPL prompt for humans. Supports `/model <name>` to switch models. Supports `/goal <description>` for durable sessions — the agent loops until an internal LLM verification confirms the goal is met. Events are held (no `agent_end`) until completion. Exit with `Ctrl+D`, `/exit`, `/quit`, or `exit`.
+REPL prompt for humans. Supports `/goal <desc>` (durable sessions — loops until goal verified), `/model <name>` (switch models), `/compact` (trigger compaction). Multi-line paste supported (lines within 5ms are joined). Exit with `Ctrl+D`, `/exit`, `/quit`, or `exit`.
 
 ## Headless usage
 
@@ -157,5 +157,7 @@ public class RupiClient {
 - **Compaction**: auto-triggers when context approaches the window. Set with `--context-window` (default 128000, fires at `window - 16384` tokens)
 - **No hard limits**: the agent runs indefinitely until the task is done. When context approaches the window limit, auto-compaction summarizes old messages and the agent keeps going. Optionally set `--timeout <secs>` to cap execution time.
 - **Session persistence**: conversations saved as JSONL in `~/.config/rupi_sessions/`
+- **Memory**: add `--memory` to persist key facts across sessions. The agent reads/writes `~/.config/rupi/MEMORY.md` — reads on startup, overwrites with bullet points during execution.
+- **Error reporting**: `message_end` includes `stop_reason` (`"stop"`, `"error"`, `"tool_calls"`, `"timeout"`) and error text in `content` when applicable.
 - **Generation ID**: `X-Generation-Id` from response headers emitted as an early event
 - **Cost**: usage and cost data from the API included in the `message_end` event
