@@ -32,6 +32,10 @@ pub struct Cli {
     #[arg(long)]
     pub disable_yolo: bool,
 
+    /// Enable persistent memory: the agent reads/writes ~/.config/rupi/MEMORY.md
+    #[arg(long)]
+    pub memory: bool,
+
     /// Run in RPC mode (JSONL protocol over stdin/stdout)
     #[arg(long)]
     pub rpc: bool,

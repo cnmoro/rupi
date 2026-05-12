@@ -52,8 +52,27 @@ use crate::sessions;
 use crate::skills::Skill;
 use crate::tools::{self, ToolCall};
 
-/// Build the system prompt describing available tools, skills, and context files.
-fn build_system_prompt(skills: &[Skill], context_files: &[ContextFile]) -> String {
+fn memory_file_path() -> Option<std::path::PathBuf> {
+    let home = dirs::home_dir()?;
+    let dir = home.join(".config").join("rupi");
+    let _ = std::fs::create_dir_all(&dir);
+    Some(dir.join("MEMORY.md"))
+}
+
+fn ensure_memory_file() -> String {
+    let path = match memory_file_path() {
+        Some(p) => p,
+        None => return String::new(),
+    };
+    if path.exists() {
+        std::fs::read_to_string(&path).unwrap_or_default()
+    } else {
+        String::new()
+    }
+}
+
+/// Build the system prompt describing available tools, skills, context files, and memory.
+fn build_system_prompt(skills: &[Skill], context_files: &[ContextFile], memory_enabled: bool) -> String {
     let now = chrono::Local::now();
     let mut prompt = format!(
         "You are an expert coding assistant operating inside rupi, a coding agent harness. \
@@ -87,6 +106,27 @@ Guidelines:
                 "\n<skill>\n  <name>{}</name>\n  <description>{}</description>\n  <location>{}</location>\n</skill>",
                 skill.name, skill.description, skill.file_path.display()
             ));
+        }
+    }
+
+    // Append memory section if enabled
+    if memory_enabled {
+        if let Some(path) = memory_file_path() {
+            prompt.push_str(&format!(
+                "\n\nPersistent memory: you have a MEMORY.md file at {}. \
+                At the START of each response, read it with the read tool if it exists. \
+                During your work, if you discover important facts, decisions, or progress \
+                that should be remembered across sessions, OVERWRITE the file with an updated version \
+                using the write tool. Keep it concise — bullet points of key facts and decisions only.\n\
+                The file may be empty if nothing has been saved yet.",
+                path.display()
+            ));
+            // Read existing memory content and append it if present
+            let existing = ensure_memory_file();
+            if !existing.is_empty() {
+                prompt.push_str("\n\nCurrent MEMORY.md contents:\n");
+                prompt.push_str(&existing);
+            }
         }
     }
 
@@ -154,6 +194,7 @@ pub struct AgentSession {
     provider: Arc<dyn ChatProvider>,
     approval_fn: std::sync::RwLock<Option<ApprovalFn>>,
     goal: RwLock<Option<String>>,
+    memory_enabled: bool,
     model: std::sync::RwLock<String>,
     context_window: u64,
     #[allow(dead_code)]
@@ -184,6 +225,7 @@ impl AgentSession {
             provider,
             approval_fn: std::sync::RwLock::new(None),
             goal: RwLock::new(None),
+            memory_enabled: false,
             model: std::sync::RwLock::new(model),
             context_window,
             cwd,
@@ -206,6 +248,7 @@ impl AgentSession {
             std::env::current_dir().unwrap_or_default().to_string_lossy().to_string(),
             Vec::new(),
             Vec::new(),
+            false,
         )
     }
 
@@ -214,11 +257,17 @@ impl AgentSession {
         cwd: String,
         skills: Vec<Skill>,
         context_files: Vec<ContextFile>,
+        memory_enabled: bool,
     ) -> Self {
         let context_window = config.context_window;
         let model = config.model.clone();
         let provider = Arc::new(OpenAIProvider::new(config));
-        Self::new(provider as Arc<dyn ChatProvider>, model, context_window, cwd, skills, context_files)
+        let mut session = Self::new(provider as Arc<dyn ChatProvider>, model, context_window, cwd, skills, context_files);
+        session.memory_enabled = memory_enabled;
+        if memory_enabled {
+            ensure_memory_file();
+        }
+        session
     }
 
     /// Get the session file path, if any.
@@ -430,7 +479,7 @@ impl AgentSession {
             }
 
             // Build messages: system prompt with skills + context files, then history
-            let prompt_text = build_system_prompt(&self.skills, &self.context_files);
+            let prompt_text = build_system_prompt(&self.skills, &self.context_files, self.memory_enabled);
             let system_msg = Message::new("system", &prompt_text);
             let mut messages_for_api = vec![system_msg];
             messages_for_api.extend(self.messages.read().await.clone());
@@ -839,7 +888,7 @@ Has the assistant's output satisfied this exact condition? Reply with only YES o
             goal
         );
 
-        let system_msg = Message::new("system", &build_system_prompt(&[], &[]));
+        let system_msg = Message::new("system", &build_system_prompt(&[], &[], self.memory_enabled));
         let verify_msg = Message::new("user", &verify_prompt);
         let model_name = self.model.read().unwrap().clone();
         match self.provider.complete(&model_name, &[system_msg, verify_msg]).await {

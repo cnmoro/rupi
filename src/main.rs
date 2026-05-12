@@ -71,10 +71,12 @@ async fn main() {
         .to_string();
     let context_files = agent_session::load_context_files(&cwd);
 
+    let memory = cli.memory;
+
     match cli.mode() {
         "rpc" => run_rpc_mode(openai_config, loaded_skills, context_files).await,
         "raw" => run_raw_mode(openai_config, loaded_skills, context_files).await,
-        _ => run_interactive_mode(openai_config, loaded_skills, context_files, cli.disable_yolo).await,
+        _ => run_interactive_mode(openai_config, loaded_skills, context_files, cli.disable_yolo, memory).await,
     }
 }
 
@@ -87,7 +89,7 @@ async fn run_rpc_mode(
         .unwrap_or_default()
         .to_string_lossy()
         .to_string();
-    let session = AgentSession::from_config_with(config, cwd, skills, context_files);
+    let session = AgentSession::from_config_with(config, cwd, skills, context_files, false);
     let handler = RpcHandler::new(session);
 
     let (output_tx, mut output_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
@@ -138,13 +140,14 @@ async fn run_interactive_mode(
     skills: Vec<Skill>,
     context_files: Vec<agent_session::ContextFile>,
     disable_yolo: bool,
+    memory: bool,
 ) {
     let cwd = std::env::current_dir()
         .unwrap_or_default()
         .to_string_lossy()
         .to_string();
     let session = Arc::new(Mutex::new(AgentSession::from_config_with(
-        config, cwd, skills, context_files,
+        config, cwd, skills, context_files, memory,
     )));
 
     if disable_yolo {
@@ -177,7 +180,7 @@ async fn run_raw_mode(
         .to_string_lossy()
         .to_string();
     let session = Arc::new(Mutex::new(AgentSession::from_config_with(
-        config, cwd, skills, context_files,
+        config, cwd, skills, context_files, false,
     )));
     rupi::modes::raw::run_raw(session).await;
 }
