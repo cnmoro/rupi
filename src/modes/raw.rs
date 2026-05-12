@@ -27,17 +27,35 @@ pub async fn run_raw(session: Arc<Mutex<AgentSession>>) {
             Err(_) => break,
         }
 
-        let mut input = line.trim().to_string();
-        if input.is_empty() {
+        // Support multi-line paste: collect all lines that arrive within 5ms
+        let mut input = line.trim_end_matches('\n').trim_end_matches('\r').to_string();
+        loop {
+            let mut extra = String::new();
+            match tokio::time::timeout(
+                std::time::Duration::from_millis(5),
+                stdin_reader.read_line(&mut extra),
+            ).await {
+                Ok(Ok(n)) if n > 0 => {
+                    input.push('\n');
+                    input.push_str(extra.trim_end_matches('\n').trim_end_matches('\r'));
+                }
+                _ => break,
+            }
+        }
+
+        let trimmed = input.trim().to_string();
+        if trimmed.is_empty() {
             continue;
         }
-        if input == "exit" || input == "/exit" || input == "/quit" {
+        if trimmed == "exit" || trimmed == "/exit" || trimmed == "/quit" {
             break;
         }
 
+        let mut final_input = trimmed;
+
         // Handle /goal command — set goal AND start working immediately
-        if input.starts_with("/goal ") {
-            let goal_text = input[6..].trim().to_string();
+        if final_input.starts_with("/goal ") {
+            let goal_text = final_input[6..].trim().to_string();
             if !goal_text.is_empty() {
                 {
                     let sess = session.lock().await;
@@ -48,7 +66,7 @@ pub async fn run_raw(session: Arc<Mutex<AgentSession>>) {
                 }));
                 let _ = write!(stdout(), "{}", json);
                 let _ = stdout().flush();
-                input = goal_text; // fall through to prompt handling
+                final_input = goal_text; // fall through to prompt handling
             } else {
                 let _ = write!(stdout(), "{}", crate::rpc::jsonl::serialize_json_line(
                     &serde_json::json!({"type":"error","message":"Usage: /goal <description>"})
@@ -56,7 +74,7 @@ pub async fn run_raw(session: Arc<Mutex<AgentSession>>) {
                 let _ = stdout().flush();
                 continue;
             }
-        } else if input == "/goal" {
+        } else if final_input == "/goal" {
             let sess = session.lock().await;
             let goal = sess.get_goal().await;
             let json = crate::rpc::jsonl::serialize_json_line(&serde_json::json!({
@@ -68,7 +86,7 @@ pub async fn run_raw(session: Arc<Mutex<AgentSession>>) {
         }
 
         // Handle /compact command
-        if input == "/compact" {
+        if final_input == "/compact" {
             let sess = session.lock().await;
             match sess.compact().await {
                 Ok(result) => {
@@ -89,8 +107,8 @@ pub async fn run_raw(session: Arc<Mutex<AgentSession>>) {
         }
 
         // Handle /model command
-        if input.starts_with("/model ") || input == "/model" {
-            let parts: Vec<&str> = input.splitn(2, ' ').collect();
+        if final_input.starts_with("/model ") || final_input == "/model" {
+            let parts: Vec<&str> = final_input.splitn(2, ' ').collect();
             if parts.len() == 2 {
                 let model_spec = parts[1].trim();
                 if !model_spec.is_empty() {
@@ -117,7 +135,7 @@ pub async fn run_raw(session: Arc<Mutex<AgentSession>>) {
 
         let prompt_handle = tokio::spawn(async move {
             let sess = session.lock().await;
-            let _ = sess.prompt(&input, event_tx).await;
+            let _ = sess.prompt(&final_input, event_tx).await;
         });
 
         while let Some(event) = event_rx.recv().await {
