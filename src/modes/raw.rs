@@ -5,7 +5,7 @@ use tokio::sync::Mutex;
 
 use crate::agent::session::AgentSession;
 use crate::rpc::jsonl::serialize_json_line;
-use crate::rpc::types::{AgentEvent, AssistantMessageEvent};
+use crate::rpc::types::{AgentEvent, AgentMessage, AssistantMessageEvent, MessageContent};
 
 /// Run raw mode: prints each SSE delta as a JSON line to stdout,
 /// reads user input from stdin interactively.
@@ -119,7 +119,20 @@ pub async fn run_raw(session: Arc<Mutex<AgentSession>>) {
 
         let prompt_handle = tokio::spawn(async move {
             let sess = session.lock().await;
-            let _ = sess.prompt(&final_input, event_tx).await;
+            if let Err(e) = sess.prompt(&final_input, event_tx.clone()).await {
+                let _ = event_tx.send(AgentEvent::message_end(AgentMessage {
+                    role: "assistant".to_string(),
+                    content: vec![MessageContent {
+                        content_type: "text".to_string(),
+                        text: Some(format!("Error: {}", e)),
+                    }],
+                    model: None,
+                    usage: None,
+                    stop_reason: Some("error".to_string()),
+                }));
+                let _ = event_tx.send(AgentEvent::turn_end());
+                let _ = event_tx.send(AgentEvent::agent_end());
+            }
         });
 
         while let Some(event) = event_rx.recv().await {
