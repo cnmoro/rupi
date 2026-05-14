@@ -20,16 +20,26 @@ pub async fn run_raw(session: Arc<Mutex<AgentSession>>) {
         let _ = write!(stdout(), "> ");
         let _ = stdout().flush();
 
-        line.clear();
-        match stdin_reader.read_line(&mut line).await {
-            Ok(0) => break,
-            Ok(_) => {}
-            Err(_) => break,
-        }
-
-        // Support multi-line paste: collect all lines that arrive within 100ms
-        let mut input = line.trim_end_matches('\n').trim_end_matches('\r').to_string();
+        // Read input, supporting multi-line paste.
+        let mut input = String::new();
         loop {
+            line.clear();
+            match stdin_reader.read_line(&mut line).await {
+                Ok(0) => break,
+                Ok(_) => {}
+                Err(_) => break,
+            }
+
+            let line_trimmed = line.trim_end_matches('\n').trim_end_matches('\r');
+            if input.is_empty() && line_trimmed.is_empty() {
+                continue;
+            }
+
+            if !input.is_empty() {
+                input.push('\n');
+            }
+            input.push_str(line_trimmed);
+
             let mut extra = String::new();
             match tokio::time::timeout(
                 std::time::Duration::from_millis(100),
@@ -38,6 +48,7 @@ pub async fn run_raw(session: Arc<Mutex<AgentSession>>) {
                 Ok(Ok(n)) if n > 0 => {
                     input.push('\n');
                     input.push_str(extra.trim_end_matches('\n').trim_end_matches('\r'));
+                    continue; // keep accumulating
                 }
                 _ => break,
             }
