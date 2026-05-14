@@ -706,6 +706,13 @@ impl AgentSession {
                 continue;
             }
 
+            // No tool calls. If the response is empty (stream failed silently), retry.
+            if full_content.is_empty() && had_stream_events == false {
+                let delay = std::time::Duration::from_secs(1);
+                tokio::time::sleep(delay).await;
+                continue; // retry
+            }
+
             // No tool calls — this is the final response.
             // Run auto-compaction check in background (fire-and-forget)
             let auto_enabled = *self.auto_compaction_enabled.read().await;

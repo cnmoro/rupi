@@ -118,19 +118,21 @@ pub async fn run_interactive(session: Arc<Mutex<AgentSession>>) {
                     }
                 }
                 AgentEvent::MessageEnd { message, .. } => {
-                    // If no text was streamed, the message content is in message_end
-                    if !got_text {
-                        for c in &message.content {
-                            if let Some(text) = &c.text {
-                                let _ = write!(stdout(), "{}", text);
-                                got_text = true;
-                            }
+                    // Print message content (error text, etc.)
+                    for c in &message.content {
+                        if let Some(text) = &c.text {
+                            let _ = write!(stdout(), "{}", text);
+                            got_text = true;
                         }
                     }
-                    // Print error info if present
+                    // Print error info
                     if let Some(reason) = &message.stop_reason {
                         if reason == "error" || reason == "timeout" {
-                            let _ = writeln!(stdout(), "\n[Request failed: {}]", reason);
+                            if !got_text {
+                                let _ = write!(stdout(), "[Request failed: {}]", reason);
+                            } else {
+                                let _ = writeln!(stdout(), "\n[Request failed: {}]", reason);
+                            }
                         }
                     }
                 }
