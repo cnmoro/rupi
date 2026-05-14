@@ -1,6 +1,6 @@
 use std::io::{stdout, Write};
 use std::sync::Arc;
-use tokio::io::{AsyncBufReadExt, AsyncReadExt, BufReader};
+use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::sync::Mutex;
 
 use crate::agent::session::AgentSession;
@@ -18,49 +18,15 @@ pub async fn run_interactive(session: Arc<Mutex<AgentSession>>) {
         let _ = write!(stdout(), "> ");
         let _ = stdout().flush();
 
-        // Read input, supporting multi-line paste.
-        // Single line + Enter → submit immediately.
-        // Pasted multi-line text → accumulate, show prompt, wait for another Enter to submit.
-        let mut input = String::new();
-        loop {
-            line.clear();
-            match stdin_reader.read_line(&mut line).await {
-                Ok(0) => break,
-                Ok(_) => {}
-                Err(_) => break,
-            }
-
-            let line_trimmed = line.trim_end_matches('\n').trim_end_matches('\r');
-            if input.is_empty() && line_trimmed.is_empty() {
-                // Empty line at the start — ignore
-                continue;
-            }
-
-            if !input.is_empty() {
-                input.push('\n');
-            }
-            input.push_str(line_trimmed);
-
-            // If this was a single line (no more data arrives immediately), submit it.
-            // If more data arrives within 100ms (paste), keep accumulating.
-            let mut extra = String::new();
-            match tokio::time::timeout(
-                std::time::Duration::from_millis(100),
-                stdin_reader.read_line(&mut extra),
-            ).await {
-                Ok(Ok(n)) if n > 0 => {
-                    input.push('\n');
-                    input.push_str(extra.trim_end_matches('\n').trim_end_matches('\r'));
-                    // More data arrived — show continuation prompt and keep reading
-                    let _ = write!(stdout(), "… ");
-                    let _ = stdout().flush();
-                    continue;
-                }
-                _ => break, // no more data — submit
-            }
+        // Simple REPL: type a line, press Enter, it sends.
+        line.clear();
+        match stdin_reader.read_line(&mut line).await {
+            Ok(0) => break,
+            Ok(_) => {}
+            Err(_) => break,
         }
 
-        let trimmed = input.trim().to_string();
+        let trimmed = line.trim().to_string();
         if trimmed.is_empty() {
             continue;
         }

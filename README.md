@@ -21,7 +21,7 @@ All values can be overridden via CLI flags (`--base-url`, `--api-key`, `--model`
 
 ### Interactive — `./rupi` (default)
 
-REPL prompt for humans. Supports `/goal <desc>` (durable sessions — loops until goal verified), `/model <name>` (switch models), `/compact` (trigger compaction). Multi-line paste supported: paste code with line breaks, keep typing, then press Enter to submit. Exit with `Ctrl+D`, `/exit`, `/quit`, or `exit`.
+REPL prompt for humans. Supports `/goal <desc>` (durable sessions — loops until goal verified), `/model <name>` (switch models), `/compact` (trigger compaction). Exit with `Ctrl+D`, `/exit`, `/quit`, or `exit`.
 
 ### RPC — `./rupi --rpc`
 

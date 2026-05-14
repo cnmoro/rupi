@@ -501,14 +501,18 @@ impl AgentSession {
                         break;
                     }
                     Err(e) => {
-                        let retryable = matches!(&e, AgentError::Api { status_code, .. }
-                            if *status_code == 429 || *status_code >= 500
-                        );
+                        // Retry on transient errors: timeouts, connection errors, 5xx, 429
+                        let retryable = match &e {
+                            AgentError::Http(_) => true,       // timeouts, connection refused, DNS, TLS
+                            AgentError::Timeout => true,
+                            AgentError::Api { status_code, .. } => *status_code == 429 || *status_code >= 500,
+                            _ => false,
+                        };
                         if !retryable || attempt == 2 {
                             last_error = Some(e);
                             break;
                         }
-                        let delay = std::time::Duration::from_secs(1 << attempt);
+                        let delay = std::time::Duration::from_secs(1 << attempt); // 1s, 2s, 4s
                         tokio::time::sleep(delay).await;
                     }
                 }
@@ -595,6 +599,8 @@ impl AgentSession {
                         tool_calls = calls;
                     }
                     StreamEvent::Error(err) => {
+                        // If the stream failed mid-way, the retry logic at the top of the
+                        // loop will handle it on the next iteration. Report the error.
                         had_stream_events = true;
                         let error_text = if err == "cancelled" {
                             "Request cancelled".to_string()

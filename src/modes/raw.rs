@@ -20,41 +20,14 @@ pub async fn run_raw(session: Arc<Mutex<AgentSession>>) {
         let _ = write!(stdout(), "> ");
         let _ = stdout().flush();
 
-        // Read input, supporting multi-line paste.
-        let mut input = String::new();
-        loop {
-            line.clear();
-            match stdin_reader.read_line(&mut line).await {
-                Ok(0) => break,
-                Ok(_) => {}
-                Err(_) => break,
-            }
-
-            let line_trimmed = line.trim_end_matches('\n').trim_end_matches('\r');
-            if input.is_empty() && line_trimmed.is_empty() {
-                continue;
-            }
-
-            if !input.is_empty() {
-                input.push('\n');
-            }
-            input.push_str(line_trimmed);
-
-            let mut extra = String::new();
-            match tokio::time::timeout(
-                std::time::Duration::from_millis(100),
-                stdin_reader.read_line(&mut extra),
-            ).await {
-                Ok(Ok(n)) if n > 0 => {
-                    input.push('\n');
-                    input.push_str(extra.trim_end_matches('\n').trim_end_matches('\r'));
-                    continue; // keep accumulating
-                }
-                _ => break,
-            }
+        line.clear();
+        match stdin_reader.read_line(&mut line).await {
+            Ok(0) => break,
+            Ok(_) => {}
+            Err(_) => break,
         }
 
-        let trimmed = input.trim().to_string();
+        let trimmed = line.trim().to_string();
         if trimmed.is_empty() {
             continue;
         }
