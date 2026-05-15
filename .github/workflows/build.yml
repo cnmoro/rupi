@@ -89,6 +89,11 @@ jobs:
           dst="target/${{ matrix.target }}/release/rupi-${{ matrix.label }}${{ matrix.ext }}"
           mv "$src" "$dst"
 
+      - name: Set executable permission (Unix)
+        if: matrix.ext == ''
+        shell: bash
+        run: chmod +x "target/${{ matrix.target }}/release/rupi-${{ matrix.label }}"
+
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
