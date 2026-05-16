@@ -35,6 +35,21 @@ pub async fn run_raw(session: Arc<Mutex<AgentSession>>) {
             break;
         }
 
+        // Handle /steer command — interrupts current generation
+        if trimmed.starts_with("/steer ") {
+            let steer_text = trimmed[7..].trim().to_string();
+            if !steer_text.is_empty() {
+                let sess = session.lock().await;
+                sess.steer(&steer_text).await;
+                let json = serialize_json_line(&serde_json::json!({"type": "steer_queued", "message": steer_text}));
+                let _ = write!(stdout(), "{}", json);
+            } else {
+                let _ = write!(stdout(), "{}", serialize_json_line(&serde_json::json!({"type":"error","message":"Usage: /steer <message>"})));
+            }
+            let _ = stdout().flush();
+            continue;
+        }
+
         // Handle /goal command
         if trimmed.starts_with("/goal ") {
             let goal_text = trimmed[6..].trim().to_string();
@@ -148,7 +163,8 @@ async fn process_with_steer_raw(session: &Arc<Mutex<AgentSession>>, initial_inpu
                     let input = buf.trim().to_string();
                     if input.is_empty() { continue; }
                     if stdin_session.lock().await.is_streaming().await {
-                        stdin_session.lock().await.steer(&input).await;
+                        // Normal Enter during streaming → queue as follow-up
+                        stdin_session.lock().await.follow_up(&input).await;
                         let _ = stdin_tx_clone.send(input);
                     } else {
                         let _ = stdin_tx_clone.send(input);

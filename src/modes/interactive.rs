@@ -35,6 +35,20 @@ pub async fn run_interactive(session: Arc<Mutex<AgentSession>>) {
             break;
         }
 
+        // Handle /steer command — interrupts current generation
+        if trimmed.starts_with("/steer ") {
+            let steer_text = trimmed[7..].trim().to_string();
+            if !steer_text.is_empty() {
+                let sess = session.lock().await;
+                sess.steer(&steer_text).await;
+                let _ = writeln!(stdout(), "Steer queued: {}", steer_text);
+            } else {
+                let _ = writeln!(stdout(), "Usage: /steer <message to interrupt with>");
+            }
+            let _ = stdout().flush();
+            continue;
+        }
+
         // Handle /goal command
         if trimmed.starts_with("/goal ") {
             let goal_text = trimmed[6..].trim().to_string();
@@ -144,8 +158,8 @@ async fn process_with_steer(session: &Arc<Mutex<AgentSession>>, initial_input: &
                     }
                     // Check if agent is still streaming
                     if stdin_session.lock().await.is_streaming().await {
-                        // Queue as steer during streaming
-                        stdin_session.lock().await.steer(&input).await;
+                        // Normal Enter during streaming → queue as follow-up
+                        stdin_session.lock().await.follow_up(&input).await;
                         let _ = stdin_tx_clone.send(input);
                     } else {
                         // If not streaming, send to main channel for processing

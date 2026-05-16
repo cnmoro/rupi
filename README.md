@@ -6,7 +6,7 @@ Works as an interactive coding agent for humans, or as a headless RPC backend fo
 
 ## Setup
 
-```json
+```jsonΩ
 // ~/.config/rupi.json
 {
   "base_url": "https://openrouter.ai/api/v1",
@@ -21,7 +21,7 @@ All values can be overridden via CLI flags (`--base-url`, `--api-key`, `--model`
 
 ### Interactive — `./rupi` (default)
 
-REPL prompt for humans. Supports `/goal <desc>` (durable sessions — loops until goal verified), `/model <name>` (switch models), `/compact` (trigger compaction). Type while the agent generates — input is queued as a steer (interrupts the current turn). Exit with `Ctrl+D`, `/exit`, `/quit`, or `exit`.
+REPL prompt for humans. Supports `/goal <desc>` (durable sessions — loops until goal verified), `/model <name>` (switch models), `/compact` (trigger compaction), `/steer <message>` (interrupts current generation). Normal Enter while agent generates queues as follow-up (processed after current turn). Exit with `Ctrl+D`, `/exit`, `/quit`, or `exit`.
 
 ### RPC — `./rupi --rpc`
 
@@ -47,6 +47,7 @@ Same event stream as RPC but reads user input interactively. Useful for debuggin
 - **Context files**: `CLAUDE.md` and `AGENTS.md` from cwd and ancestor directories are loaded automatically
 - **Compaction**: auto-triggers when context approaches the window. Set with `--context-window` (default 128000, fires at `window - 16384` tokens)
 - **No hard limits**: the agent runs indefinitely until the task is done. When context approaches the window limit, auto-compaction summarizes old messages and the agent keeps going. Optionally set `--timeout <secs>` to cap execution time.
+- **Steer / follow-up**: type while the agent generates — normal Enter queues as follow-up (processed after the current turn). Use `/steer <message>` to interrupt immediately. In RPC mode, set `"streamingBehavior": "steer"` or `"followUp"` on the prompt command.
 - **Memory**: add `--memory` to persist key facts across sessions. The agent reads/writes `~/.config/rupi/MEMORY.md` — reads on startup, overwrites with bullet points during execution.
 - **Session persistence**: conversations saved as JSONL in `~/.config/rupi_sessions/`
 - **Error reporting**: `message_end` includes `stop_reason` (`"stop"`, `"error"`, `"tool_calls"`, `"timeout"`) and error text in `content` when applicable.
