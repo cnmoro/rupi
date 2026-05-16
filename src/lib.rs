@@ -1,6 +1,7 @@
 pub mod agent;
 pub mod auth;
 pub mod cli;
+pub mod code_search;
 pub mod compaction;
 pub mod config;
 pub mod error;

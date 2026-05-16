@@ -35,6 +35,7 @@ pub fn all_tools() -> Vec<ToolDef> {
         grep_tool(),
         find_tool(),
         ls_tool(),
+        search_code_tool(),
     ]
 }
 
@@ -144,6 +145,22 @@ fn find_tool() -> ToolDef {
     }
 }
 
+fn search_code_tool() -> ToolDef {
+    ToolDef {
+        name: "search_code",
+        description: "Search code using natural language queries. Finds relevant code across the codebase by understanding what it does, not just matching keywords. Use this instead of grep when you need to find code by its purpose or behavior. Indexes the codebase on first call (takes ~1-2 seconds), subsequent calls are instant.",
+        parameters: serde_json::json!({
+            "type": "object",
+            "properties": {
+                "query": { "type": "string", "description": "A natural language description of the code you want to find (e.g. 'how is authentication handled', 'database connection code', 'the function that saves files')" },
+                "path": { "type": "string", "description": "Directory to search (default: current directory)", "default": "." },
+                "top_k": { "type": "integer", "description": "Number of results to return (default: 5)", "default": 5 }
+            },
+            "required": ["query"]
+        }),
+    }
+}
+
 fn ls_tool() -> ToolDef {
     ToolDef {
         name: "ls",
@@ -185,6 +202,7 @@ pub fn execute_tool(tool_call: &ToolCall) -> String {
         "grep" => execute_grep(&tool_call.arguments),
         "find" => execute_find(&tool_call.arguments),
         "ls" => execute_ls(&tool_call.arguments),
+        "search_code" => execute_search_code(&tool_call.arguments),
         _ => format!("Unknown tool: {}", tool_call.name),
     }
 }
@@ -637,6 +655,55 @@ fn execute_ls(args: &Value) -> String {
     }
 }
 
+// ---- search_code ----
+fn execute_search_code(args: &Value) -> String {
+    let query = match get_arg(args, "query") {
+        Some(q) => q,
+        None => return "Error: missing 'query' argument".to_string(),
+    };
+    let search_path = get_arg(args, "path").unwrap_or(".");
+    let top_k = args.get("top_k").and_then(|v| v.as_u64()).unwrap_or(5).min(50) as usize;
+
+    let path = resolve_path(search_path);
+    if !path.exists() {
+        return format!("Error: path not found: {}", path.display());
+    }
+    if !path.is_dir() {
+        return format!("Error: not a directory: {}", path.display());
+    }
+
+    // Try semantic search first (requires model), fall back to keyword search
+    match crate::code_search::CodeSearchIndex::build(&path) {
+        Ok(index) => {
+            let start = std::time::Instant::now();
+            let results = index.search(query, top_k);
+            let elapsed = start.elapsed();
+            let mut out = crate::code_search::format_results(query, &results);
+            out.push_str(&format!(
+                "[{} chunks indexed, searched in {:?}]",
+                index.len(),
+                elapsed
+            ));
+            out
+        }
+        Err(e) => {
+            // Fall back to keyword search
+            let chunks = crate::code_search::index_path(&path);
+            if chunks.is_empty() {
+                return format!("Error: {}", e);
+            }
+            let results = crate::code_search::search_keyword(&chunks, query, top_k);
+            let mut out = crate::code_search::format_results(query, &results);
+            out.push_str(&format!(
+                "[keyword search, {} chunks, model unavailable: {}]",
+                chunks.len(),
+                e
+            ));
+            out
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -857,7 +924,7 @@ mod tests {
     fn test_serialize_tools() {
         let tools = all_tools();
         let serialized = serialize_tools(&tools);
-        assert_eq!(serialized.len(), 7);
+        assert_eq!(serialized.len(), 8);
         assert_eq!(serialized[0]["function"]["name"], "bash");
         assert_eq!(serialized[1]["function"]["name"], "read");
         assert_eq!(serialized[2]["function"]["name"], "write");
@@ -865,6 +932,7 @@ mod tests {
         assert_eq!(serialized[4]["function"]["name"], "grep");
         assert_eq!(serialized[5]["function"]["name"], "find");
         assert_eq!(serialized[6]["function"]["name"], "ls");
+        assert_eq!(serialized[7]["function"]["name"], "search_code");
     }
 
     #[test]

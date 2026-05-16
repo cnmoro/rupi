@@ -19,6 +19,14 @@ async-trait = "0.1"
 dirs = "5"
 chrono = { version = "0.4", features = ["serde"] }
 regex = "1"
+anyhow = "1"
+half = "2"
+ndarray = "0.15"
+safetensors = "0.5"
+tokenizers = "0.21"
+model2vec-rs = { path = "../model2vec-rs" }
+hf-hub = { version = "0.4", default-features = false, features = ["ureq"] }
+ureq = { version = "2", features = ["json"] }
 
 [dev-dependencies]
 mockito = "1"

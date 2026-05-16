@@ -983,3 +983,141 @@ async fn e2e_test_steer_queues_during_streaming() {
         msgs.iter().map(|m| format!("{}: {}", m.role, &m.content[..m.content.len().min(60)])).collect::<Vec<_>>());
     eprintln!("Steer test: completed, steer was processed");
 }
+
+#[tokio::test]
+async fn e2e_test_code_search_semantic() {
+    // Build a small index with known code and verify semantic search finds the right chunk.
+    let dir = std::env::temp_dir().join("rupi-e2e-code-search");
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+
+    // Create a realistic codebase
+    std::fs::write(
+        dir.join("auth.rs"),
+        r#"
+fn authenticate(username: &str, password: &str) -> bool {
+    // Check credentials against database
+    let user = find_user(username);
+    match user {
+        Some(u) => u.verify_password(password),
+        None => false,
+    }
+}
+
+fn find_user(name: &str) -> Option<User> {
+    // Query the database for a user by name
+    DB.query("SELECT * FROM users WHERE name = ?", &[name])
+}
+"#,
+    )
+    .unwrap();
+
+    std::fs::write(
+        dir.join("db.rs"),
+        r#"
+fn connect(host: &str, port: u16) -> Connection {
+    let url = format!("postgres://{}:{}", host, port);
+    Connection::new(&url)
+}
+
+fn run_migration(conn: &Connection) -> Result<()> {
+    conn.execute("CREATE TABLE IF NOT EXISTS users (id INT, name TEXT)")
+}
+"#,
+    )
+    .unwrap();
+
+    std::fs::write(
+        dir.join("server.rs"),
+        r#"
+fn start_server() {
+    let listener = TcpListener::bind("0.0.0.0:8080").unwrap();
+    for stream in listener.incoming() {
+        handle_connection(stream.unwrap());
+    }
+}
+
+fn handle_connection(mut stream: TcpStream) {
+    let mut buffer = [0; 1024];
+    stream.read(&mut buffer).unwrap();
+    let response = "HTTP/1.1 200 OK\r\n\r\nHello";
+    stream.write(response.as_bytes()).unwrap();
+}
+"#,
+    )
+    .unwrap();
+
+    eprintln!("e2e: code search index built, chunks indexed");
+
+    // Test 1: Build semantic index and search
+    let index_result = rupi::code_search::CodeSearchIndex::build(&dir);
+    assert!(index_result.is_ok(), "Index should build: {:?}", index_result.err());
+    let index = index_result.unwrap();
+    assert!(index.len() >= 3, "Should have at least 3 chunks");
+
+    // Test 2: Search for authentication code
+    let results = index.search("user authentication login", 5);
+    assert!(!results.is_empty(), "Should find auth code");
+    let has_auth = results.iter().any(|r| r.chunk.file_path.contains("auth"));
+    assert!(has_auth, "Should find auth.rs in results: {:?}",
+        results.iter().map(|r| format!("{}:{:.2}", r.chunk.file_path, r.score)).collect::<Vec<_>>());
+    eprintln!("e2e: semantic search found auth.rs (score={:.4})", results[0].score);
+
+    // Test 3: Search for network/server code
+    let results2 = index.search("tcp network server connection", 5);
+    assert!(!results2.is_empty(), "Should find server code");
+    let has_server = results2.iter().any(|r| r.chunk.file_path.contains("server"));
+    assert!(has_server, "Should find server.rs in results");
+    eprintln!("e2e: semantic search found server.rs (score={:.4})", results2[0].score);
+
+    // Test 4: Keyword search fallback
+    let chunks = rupi::code_search::index_path(&dir);
+    let kw_results = rupi::code_search::search_keyword(&chunks, "connect database", 5);
+    assert!(!kw_results.is_empty(), "Keyword search should find database code");
+    let has_db = kw_results.iter().any(|r| r.chunk.file_path.contains("db"));
+    assert!(has_db, "Keyword search should find db.rs");
+    eprintln!("e2e: keyword search found db.rs");
+
+    // Test 5: Format results
+    let formatted = rupi::code_search::format_results("auth", &results);
+    assert!(formatted.contains("auth.rs"));
+
+    std::fs::remove_dir_all(&dir).unwrap();
+    eprintln!("e2e: code search tests passed");
+}
+
+#[tokio::test]
+async fn e2e_test_code_search_via_tool() {
+    // Test the search_code tool through execute_tool
+    let dir = std::env::temp_dir().join("rupi-e2e-code-search-tool");
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+
+    std::fs::write(
+        dir.join("calc.rs"),
+        "fn add(a: i32, b: i32) -> i32 { a + b }",
+    )
+    .unwrap();
+    std::fs::write(
+        dir.join("greet.rs"),
+        "fn greet(name: &str) -> String { format!(\"Hello {}\", name) }",
+    )
+    .unwrap();
+
+    let tc = rupi::tools::ToolCall {
+        id: "e2e_search_1".into(),
+        name: "search_code".into(),
+        arguments: serde_json::json!({
+            "query": "adding numbers together",
+            "path": dir.to_string_lossy(),
+            "top_k": 5,
+        }),
+    };
+    let result = rupi::tools::execute_tool(&tc);
+    assert!(!result.contains("Error:"), "Should not error: {}", result);
+    assert!(result.contains("calc.rs") || result.contains("add"), "Should find add function");
+    eprintln!("e2e: search_code tool result found calc.rs");
+
+    std::fs::remove_dir_all(&dir).unwrap();
+    eprintln!("e2e: search_code tool test passed");
+}
