@@ -1,8 +1,10 @@
 # rupi
 
-A Rust clone-ish of [pi](https://pi.dev/). Just `./rupi`. A single 7MB binary. No npm install, no pip install, no node_modules, no Python runtime, no JVM. Download it and run it.
+A Rust coding agent that borrows concepts from [pi](https://pi.dev/), [little-coder](https://github.com/itayinbarr/little-coder), and [RTK](https://github.com/rtk-ai/rtk) (Rust Token Killer). Just `./rupi`. A single 7MB binary. No npm install, no pip install, no node_modules, no Python runtime, no JVM. Download it and run it.
 
 Works as an interactive coding agent for humans, or as a headless RPC backend for automation scripts.
+
+Output compression: bash command output is automatically filtered to reduce token consumption. Git status/diff/log/add/commit/push, cargo test/build/check, ls, find — each has a specialized filter that strips noise and keeps only what the agent needs. Generic fallback handles ANSI stripping, deduplication, and line capping. Typical savings: 60-90% on common dev commands.
 
 ## Setup
 
