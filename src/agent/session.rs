@@ -903,13 +903,24 @@ impl AgentSession {
         )
         .await?;
 
-        // Replace summarized messages with a compaction summary message
+        // Replace summarized messages with a compaction summary message.
+        // Use role "user" (not "system") because OpenAI-compatible endpoints
+        // expect at most one system message — the one built fresh each turn.
         let mut all_messages = self.messages.write().await;
-        let keep: Vec<Message> = all_messages[cut_index..].to_vec();
+        let mut keep: Vec<Message> = all_messages[cut_index..].to_vec();
+        // Always preserve the very first user message (the original task/goal)
+        // so the agent never loses sight of the objective after compaction.
+        if cut_index > 0 {
+            if let Some(first) = all_messages.get(0) {
+                if first.role == "user" && !keep.iter().any(|m| m.role == "user" && m.content == first.content) {
+                    keep.insert(0, first.clone());
+                }
+            }
+        }
         *all_messages = keep;
         all_messages.insert(
             0,
-            Message::new("system", &format!("[Compacted conversation history]\n{}", summary)),
+            Message::new("user", &format!("[Compacted conversation history]\n{}", summary)),
         );
 
         {

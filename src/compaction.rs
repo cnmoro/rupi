@@ -173,6 +173,9 @@ Your task is to produce a concise structured summary of the conversation history
 Do NOT continue the conversation. Do NOT add new information.
 Output only the summary in the following format:
 
+## Original Task
+<restate the original user request/task verbatim — this is critical>
+
 ## Summary
 <concise summary of what was accomplished>
 
