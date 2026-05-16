@@ -1,3 +1,4 @@
+use std::sync::Arc;
 use tokio::sync::mpsc;
 
 use rupi::agent::session::AgentSession;
@@ -921,4 +922,64 @@ async fn e2e_test_approval_yolo_default() {
     assert!(saw_tool, "Should have seen a bash tool execution in YOLO mode");
     assert!(agent_ended, "Agent should complete");
     eprintln!("YOLO test passed: tool ran without approval prompt");
+}
+
+#[tokio::test]
+async fn e2e_test_steer_queues_during_streaming() {
+    let config = match load_e2e_config() {
+        Some(c) => c,
+        None => {
+            eprintln!("Skipping e2e test: credentials not set");
+            return;
+        }
+    };
+
+    let openai_config = OpenAIConfig {
+        base_url: config.base_url.clone(),
+        api_key: config.api_key.clone(),
+        model: config.model_tag.clone(),
+        context_window: 128000,
+        reasoning: false,
+        timeout_secs: 0,
+    };
+
+    let session = Arc::new(AgentSession::from_config(openai_config));
+    let (tx, mut rx) = mpsc::unbounded_channel::<AgentEvent>();
+
+    // Start a multi-step prompt that keeps the agent busy (multiple bash calls)
+    let session_clone = session.clone();
+    tokio::spawn(async move {
+        session_clone.prompt(
+            "Use bash to: first check the date, then check who you are (whoami), then check the current directory. Do each step one at a time.",
+            tx.clone(),
+        ).await.unwrap();
+    });
+
+    // Queue a steer very soon after starting (before the agent finishes)
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    session.steer("Also, check how long the system has been running (uptime).").await;
+
+    // Wait for completion
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    let mut agent_ended = false;
+    let mut steer_processed = false;
+
+    while std::time::Instant::now() < deadline {
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        while let Ok(event) = rx.try_recv() {
+            if matches!(event, AgentEvent::AgentEnd { .. }) {
+                agent_ended = true;
+            }
+        }
+        if agent_ended { break; }
+    }
+
+    // After completion, check that the steer message is in the conversation history
+    let msgs = session.messages().await;
+    steer_processed = msgs.iter().any(|m| m.content.contains("uptime"));
+
+    assert!(agent_ended, "Agent should complete after steer");
+    assert!(steer_processed, "Steer message should be in conversation history. Messages: {:?}",
+        msgs.iter().map(|m| format!("{}: {}", m.role, &m.content[..m.content.len().min(60)])).collect::<Vec<_>>());
+    eprintln!("Steer test: completed, steer was processed");
 }

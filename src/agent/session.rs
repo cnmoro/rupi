@@ -196,6 +196,8 @@ pub struct AgentSession {
     goal: RwLock<Option<String>>,
     memory_enabled: bool,
     model: std::sync::RwLock<String>,
+    pending_steer: RwLock<Vec<String>>,
+    pending_follow_up: RwLock<Vec<String>>,
     context_window: u64,
     #[allow(dead_code)]
     cwd: String,
@@ -227,6 +229,8 @@ impl AgentSession {
             goal: RwLock::new(None),
             memory_enabled: false,
             model: std::sync::RwLock::new(model),
+            pending_steer: RwLock::new(Vec::new()),
+            pending_follow_up: RwLock::new(Vec::new()),
             context_window,
             cwd,
             skills,
@@ -315,6 +319,11 @@ impl AgentSession {
         *self.auto_compaction_enabled.write().await = enabled;
     }
 
+    /// Whether the agent is currently streaming a response.
+    pub async fn is_streaming(&self) -> bool {
+        *self.is_streaming.lock().await
+    }
+
     pub async fn message_count(&self) -> u64 {
         *self.message_count.read().await
     }
@@ -344,6 +353,7 @@ impl AgentSession {
     /// Stream a prompt to the model. Events are sent to the event_tx channel.
     /// Handles multi-turn tool execution (bash, etc.) internally.
     /// If a goal is set, loops until the goal is verified.
+    /// If streaming and `streaming_behavior` is "steer" or "followUp", queues instead.
     pub async fn prompt(
         &self,
         message: &str,
@@ -353,7 +363,9 @@ impl AgentSession {
         {
             let mut streaming = self.is_streaming.lock().await;
             if *streaming {
-                return Err(AgentError::Config("Already streaming".into()));
+                // Queue as steer or follow-up instead of rejecting
+                self.pending_steer.write().await.push(message.to_string());
+                return Ok(());
             }
             *streaming = true;
         }
@@ -476,6 +488,16 @@ impl AgentSession {
             {
                 let mut signal = self.abort_signal.lock().await;
                 *signal = Some(abort_tx);
+            }
+
+            // Drain queued steer/follow-up messages, persist them, and add to history
+            let drained = self.drain_pending().await;
+            if !drained.is_empty() {
+                eprintln!("rupi: processing {} queued message(s)", drained.len());
+                // Add drained messages to the in-memory conversation and persist
+                for msg in &drained {
+                    self.messages.write().await.push(msg.clone());
+                }
             }
 
             // Build messages: system prompt with skills + context files, then history
@@ -850,6 +872,51 @@ impl AgentSession {
 
     /// Check if auto-compaction is needed and run it.
     /// Called after each prompt completes.
+    /// Queue a steer message (interrupts current generation).
+    pub async fn steer(&self, message: &str) {
+        self.pending_steer.write().await.push(message.to_string());
+    }
+
+    /// Queue a follow-up message (processed after current generation finishes).
+    pub async fn follow_up(&self, message: &str) {
+        self.pending_follow_up.write().await.push(message.to_string());
+    }
+
+    /// Check if there are pending steer messages.
+    pub async fn has_pending_steer(&self) -> bool {
+        !self.pending_steer.read().await.is_empty()
+    }
+
+    /// Check if there are pending follow-up messages.
+    pub async fn has_pending_follow_up(&self) -> bool {
+        !self.pending_follow_up.read().await.is_empty()
+    }
+
+    /// Drain all queued messages for the next LLM turn.
+    /// Steer messages come first, then follow-ups.
+    async fn drain_pending(&self) -> Vec<Message> {
+        let mut all = Vec::new();
+        // Drain steers first (highest priority)
+        {
+            let mut steer = self.pending_steer.write().await;
+            for msg in steer.drain(..) {
+                let m = Message::new("user", &msg);
+                self.persist_message(&m).await;
+                all.push(m);
+            }
+        }
+        // Then drain follow-ups
+        {
+            let mut fu = self.pending_follow_up.write().await;
+            for msg in fu.drain(..) {
+                let m = Message::new("user", &msg);
+                self.persist_message(&m).await;
+                all.push(m);
+            }
+        }
+        all
+    }
+
     pub async fn check_auto_compaction(&self) -> Result<Option<CompactionResult>, AgentError> {
         let enabled = *self.auto_compaction_enabled.read().await;
         if !enabled {

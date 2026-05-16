@@ -6,7 +6,8 @@ use tokio::sync::Mutex;
 use crate::agent::session::AgentSession;
 use crate::rpc::types::{AgentEvent, AgentMessage, AssistantMessageEvent, MessageContent};
 
-/// Run the interactive REPL mode.
+/// Run the interactive REPL mode with concurrent stdin + event reading.
+/// While the agent generates output, the prompt stays active for steer/follow-up.
 pub async fn run_interactive(session: Arc<Mutex<AgentSession>>) {
     let mut stdin_reader = BufReader::new(tokio::io::stdin());
     let mut line = String::new();
@@ -15,10 +16,10 @@ pub async fn run_interactive(session: Arc<Mutex<AgentSession>>) {
     let _ = stdout().flush();
 
     loop {
+        // Read input (blocks until Enter or Ctrl+D)
         let _ = write!(stdout(), "> ");
         let _ = stdout().flush();
 
-        // Simple REPL: type a line, press Enter, it sends.
         line.clear();
         match stdin_reader.read_line(&mut line).await {
             Ok(0) => break,
@@ -34,11 +35,9 @@ pub async fn run_interactive(session: Arc<Mutex<AgentSession>>) {
             break;
         }
 
-        let mut final_input = trimmed;
-
-        // Handle /goal command — sets goal AND starts working immediately
-        if final_input.starts_with("/goal ") {
-            let goal_text = final_input[6..].trim().to_string();
+        // Handle /goal command
+        if trimmed.starts_with("/goal ") {
+            let goal_text = trimmed[6..].trim().to_string();
             if !goal_text.is_empty() {
                 {
                     let sess = session.lock().await;
@@ -46,13 +45,13 @@ pub async fn run_interactive(session: Arc<Mutex<AgentSession>>) {
                 }
                 let _ = writeln!(stdout(), "Goal set and starting work: {}", goal_text);
                 let _ = stdout().flush();
-                final_input = goal_text; // fall through to prompt handling
+                // Fall through — the goal text becomes the prompt
             } else {
                 let _ = writeln!(stdout(), "Usage: /goal <description of what to achieve>");
                 let _ = stdout().flush();
                 continue;
             }
-        } else if final_input == "/goal" {
+        } else if trimmed == "/goal" {
             let sess = session.lock().await;
             match sess.get_goal().await {
                 Some(g) => { let _ = writeln!(stdout(), "Current goal: {}", g); }
@@ -63,7 +62,7 @@ pub async fn run_interactive(session: Arc<Mutex<AgentSession>>) {
         }
 
         // Handle /compact command
-        if final_input == "/compact" {
+        if trimmed == "/compact" {
             let sess = session.lock().await;
             match sess.compact().await {
                 Ok(result) => {
@@ -78,8 +77,8 @@ pub async fn run_interactive(session: Arc<Mutex<AgentSession>>) {
         }
 
         // Handle /model command
-        if final_input.starts_with("/model ") || final_input == "/model" {
-            let parts: Vec<&str> = final_input.splitn(2, ' ').collect();
+        if trimmed.starts_with("/model ") || trimmed == "/model" {
+            let parts: Vec<&str> = trimmed.splitn(2, ' ').collect();
             if parts.len() == 2 {
                 let model_spec = parts[1].trim();
                 if !model_spec.is_empty() {
@@ -95,79 +94,125 @@ pub async fn run_interactive(session: Arc<Mutex<AgentSession>>) {
             continue;
         }
 
-        let session = session.clone();
-        let (event_tx, mut event_rx) = tokio::sync::mpsc::unbounded_channel::<AgentEvent>();
+        // Process the prompt with concurrent input
+        process_with_steer(&session, &trimmed).await;
+    }
+}
 
-        let prompt_handle = tokio::spawn(async move {
-            let sess = session.lock().await;
-            if let Err(e) = sess.prompt(&final_input, event_tx.clone()).await {
-                // Ensure an error event is always sent so the UI doesn't hang
-                let _ = event_tx.send(AgentEvent::message_end(AgentMessage {
-                    role: "assistant".to_string(),
-                    content: vec![MessageContent {
-                        content_type: "text".to_string(),
-                        text: Some(format!("Error: {}", e)),
-                    }],
-                    model: None,
-                    usage: None,
-                    stop_reason: Some("error".to_string()),
-                }));
-                let _ = event_tx.send(AgentEvent::turn_end());
-                let _ = event_tx.send(AgentEvent::agent_end());
-            }
-        });
+async fn process_with_steer(session: &Arc<Mutex<AgentSession>>, initial_input: &str) {
+    let (event_tx, mut event_rx) = tokio::sync::mpsc::unbounded_channel::<AgentEvent>();
+    let (stdin_tx, mut stdin_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
 
-        let _ = stdout().flush();
-        let mut got_text = false;
-        while let Some(event) = event_rx.recv().await {
-            match &event {
-                AgentEvent::MessageUpdate {
-                    assistant_message_event: delta_event,
-                    ..
-                } => {
-                    if let AssistantMessageEvent::TextDelta { delta } = delta_event {
-                        got_text = true;
-                        let _ = write!(stdout(), "{}", delta);
-                        let _ = stdout().flush();
+    // Clone session and send for the main prompt task
+    let sess = session.clone();
+    let tx = event_tx.clone();
+    let prompt_msg = initial_input.to_string();
+
+    // Spawn the main prompt
+    let prompt_handle = tokio::spawn(async move {
+        let sess_lock = sess.lock().await;
+        if let Err(e) = sess_lock.prompt(&prompt_msg, tx.clone()).await {
+            let _ = tx.send(AgentEvent::message_end(AgentMessage {
+                role: "assistant".to_string(),
+                content: vec![MessageContent {
+                    content_type: "text".to_string(),
+                    text: Some(format!("Error: {}", e)),
+                }],
+                model: None,
+                usage: None,
+                stop_reason: Some("error".to_string()),
+            }));
+            let _ = tx.send(AgentEvent::turn_end());
+            let _ = tx.send(AgentEvent::agent_end());
+        }
+    });
+
+    // Spawn stdin reader for steer/follow-up during streaming
+    let stdin_session = session.clone();
+    let stdin_tx_clone = stdin_tx.clone();
+    let _stdin_handle = tokio::spawn(async move {
+        let mut reader = BufReader::new(tokio::io::stdin());
+        let mut buf = String::new();
+        loop {
+            buf.clear();
+            match reader.read_line(&mut buf).await {
+                Ok(0) | Err(_) => break,
+                Ok(_) => {
+                    let input = buf.trim().to_string();
+                    if input.is_empty() {
+                        continue;
+                    }
+                    // Check if agent is still streaming
+                    if stdin_session.lock().await.is_streaming().await {
+                        // Queue as steer during streaming
+                        stdin_session.lock().await.steer(&input).await;
+                        let _ = stdin_tx_clone.send(input);
+                    } else {
+                        // If not streaming, send to main channel for processing
+                        let _ = stdin_tx_clone.send(input);
+                        break; // Exit stdin reader, main loop will restart
                     }
                 }
-                AgentEvent::MessageEnd { message, .. } => {
-                    // Print message content (error text, etc.)
-                    for c in &message.content {
-                        if let Some(text) = &c.text {
-                            let _ = write!(stdout(), "{}", text);
+            }
+        }
+    });
+
+    // Main event loop — reads events AND stdin concurrently
+    let mut got_text = false;
+
+    loop {
+        tokio::select! {
+            event = event_rx.recv() => {
+                match event {
+                    Some(AgentEvent::MessageUpdate { assistant_message_event, .. }) => {
+                        if let AssistantMessageEvent::TextDelta { delta } = &assistant_message_event {
                             got_text = true;
+                            let _ = write!(stdout(), "{}", delta);
+                            let _ = stdout().flush();
                         }
                     }
-                    // Print error info
-                    if let Some(reason) = &message.stop_reason {
-                        if reason == "error" || reason == "timeout" {
-                            if !got_text {
-                                let _ = write!(stdout(), "[Request failed: {}]", reason);
-                            } else {
-                                let _ = writeln!(stdout(), "\n[Request failed: {}]", reason);
+                    Some(AgentEvent::MessageEnd { message, .. }) => {
+                        for c in &message.content {
+                            if let Some(text) = &c.text {
+                                let _ = write!(stdout(), "{}", text);
+                                got_text = true;
+                            }
+                        }
+                        if let Some(reason) = &message.stop_reason {
+                            if reason == "error" || reason == "timeout" {
+                                if !got_text {
+                                    let _ = write!(stdout(), "[Request failed: {}]", reason);
+                                } else {
+                                    let _ = writeln!(stdout(), "\n[Request failed: {}]", reason);
+                                }
                             }
                         }
                     }
+                    Some(AgentEvent::ToolExecutionStart { tool_name, .. }) => {
+                        let _ = writeln!(stdout(), "\n[Tool: {}]", tool_name);
+                    }
+                    Some(AgentEvent::ToolExecutionEnd { tool_name, .. }) => {
+                        let _ = writeln!(stdout(), "[{} completed]", tool_name);
+                    }
+                    Some(AgentEvent::AgentEnd { .. }) | None => {
+                        break;
+                    }
+                    _ => {}
                 }
-                AgentEvent::ToolExecutionStart { tool_name, .. } => {
-                    let _ = writeln!(stdout(), "\n[Tool: {}]", tool_name);
-                }
-                AgentEvent::ToolExecutionEnd { tool_name, .. } => {
-                    let _ = writeln!(stdout(), "[{} completed]", tool_name);
-                }
-                AgentEvent::AgentEnd { .. } => {
-                    break;
-                }
-                _ => {}
+                let _ = stdout().flush();
             }
-            let _ = stdout().flush();
+            _ = stdin_rx.recv() => {
+                // A steer or follow-up was queued during streaming.
+                // Display a brief acknowledgment.
+                let _ = write!(stdout(), "\n[queued]\n");
+                let _ = stdout().flush();
+            }
         }
-
-        let _ = prompt_handle.await;
-        let _ = writeln!(stdout());
-        let _ = stdout().flush();
     }
+
+    let _ = prompt_handle.await;
+    let _ = writeln!(std::io::stdout());
+    let _ = stdout().flush();
 }
 
 #[cfg(test)]
@@ -182,8 +227,8 @@ mod tests {
             api_key: "test-key".into(),
             model: "gpt-4".into(),
             context_window: 8192,
-            timeout_secs: 0,
             reasoning: false,
+            timeout_secs: 0,
         };
         let session = Arc::new(Mutex::new(AgentSession::from_config(config)));
         let sess = session.lock().await;
