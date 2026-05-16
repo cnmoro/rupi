@@ -1,6 +1,6 @@
 # rupi
 
-A Rust coding agent that borrows concepts from [pi](https://pi.dev/), [little-coder](https://github.com/itayinbarr/little-coder), and [RTK](https://github.com/rtk-ai/rtk). Just `./rupi`. A single ~8MB binary. No npm install, no pip install, no node_modules, no Python runtime, no JVM. Download it and run it.
+A Rust coding agent that borrows concepts from [pi](https://pi.dev/), [little-coder](https://github.com/itayinbarr/little-coder), [RTK](https://github.com/rtk-ai/rtk), and [semble](https://github.com/MinishLab/semble). Just `./rupi`. A single ~8MB binary. No npm install, no pip install, no node_modules, no Python runtime, no JVM. Download it and run it.
 
 Works as an interactive coding agent for humans, or as a headless RPC backend for automation scripts.
 
