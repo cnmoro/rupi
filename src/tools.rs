@@ -251,6 +251,17 @@ fn execute_bash(args: &Value) -> String {
                     }
                     if result.trim().is_empty() {
                         result = format!("[command completed with exit code {}]", status.code().unwrap_or(-1));
+                    } else {
+                        // Apply RTK-style output compression
+                        let original_len = result.len();
+                        result = crate::rtk_filter::filter_output(command, &result);
+                        let new_len = result.len();
+                        if new_len < original_len && original_len > 200 {
+                            let pct = (original_len - new_len) * 100 / original_len;
+                            if pct > 0 {
+                                result.push_str(&format!("\n[rtk: {}% token savings]", pct));
+                            }
+                        }
                     }
                     return result;
                 }

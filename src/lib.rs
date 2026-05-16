@@ -8,6 +8,7 @@ pub mod modes;
 pub mod output_parser;
 pub mod provider;
 pub mod quality;
+pub mod rtk_filter;
 pub mod rpc;
 pub mod sessions;
 pub mod skills;
