@@ -21,7 +21,12 @@ All values can be overridden via CLI flags (`--base-url`, `--api-key`, `--model`
 
 ### Interactive — `./rupi` (default)
 
-REPL prompt for humans. Supports `/goal <desc>` (durable sessions — loops until goal verified), `/model <name>` (switch models), `/compact` (trigger compaction), `/steer <message>` (interrupts current generation). Normal Enter while agent generates queues as follow-up (processed after current turn). Exit with `Ctrl+D`, `/exit`, `/quit`, or `exit`.
+REPL prompt for humans. While the agent is generating, you can still type:
+
+- **Press Enter** → queues as **follow-up**: the message is saved and processed after the current response finishes.
+- **`/steer <message>`** → **interrupts immediately**: the agent receives your message right away and pivots.
+
+Commands: `/goal <desc>`, `/model <name>`, `/compact`, `/steer <message>`. Exit with `Ctrl+D`, `/exit`, `/quit`, or `exit`.
 
 ### RPC — `./rupi --rpc`
 
@@ -36,9 +41,19 @@ JSONL protocol over stdin/stdout. Designed for programmatic use — send JSON co
 
 Events: `generation_id`, `agent_start`, `turn_start`, `message_start`, `message_update`, `message_end`, `turn_end`, `agent_end`, `tool_execution_start`, `tool_execution_end`.
 
+**Steer / follow-up in RPC**: add `"streamingBehavior"` to the prompt command:
+
+```json
+{"type":"prompt","id":"2","message":"fix the indentation","streamingBehavior":"steer"}
+{"type":"prompt","id":"3","message":"add error handling","streamingBehavior":"followUp"}
+```
+
+- `"steer"` — interrupts the current generation immediately, like `/steer` in interactive.
+- `"followUp"` — queues the message; the agent processes it after the current turn finishes.
+
 ### Raw — `./rupi --raw`
 
-Same event stream as RPC but reads user input interactively. Useful for debugging or piping.
+Same event stream as RPC but reads user input interactively. Useful for debugging or piping. Supports the same interactive steer/follow-up behavior: **Enter queues as follow-up**, **`/steer <message>` interrupts**.
 
 ## How it works
 
