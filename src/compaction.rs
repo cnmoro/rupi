@@ -4,6 +4,70 @@ use crate::agent::session::Message;
 use crate::error::AgentError;
 use crate::provider::ChatProvider;
 
+/// Default number of recent turns to preserve when snipping old tool results.
+/// Matches little-coder's `preserve_last_n_turns = 6`.
+const SNIP_PRESERVE_TURNS: usize = 6;
+
+/// Snip old tool results: truncates tool-role messages older than the last N turns.
+/// Runs before LLM-based compaction (auto-compact) to reduce token count without API cost.
+/// Keeps first ~40% + last ~30% of each old tool result (preserving beginning and end).
+/// Returns the number of characters removed.
+pub fn snip_old_tool_results(messages: &mut Vec<Message>, preserve_turns: usize) -> u64 {
+    if messages.len() < 4 {
+        return 0;
+    }
+
+    let preserve_turns = if preserve_turns == 0 { SNIP_PRESERVE_TURNS } else { preserve_turns };
+
+    // Count backwards to find the preserve boundary.
+    // When we find user #(preserve_turns+1), everything up to the end of
+    // that exchange (user + assistant + tool results) is eligible for snip.
+    let mut turn_count = 0;
+    let mut boundary = 0usize;
+    let mut found = false;
+    for i in (0..messages.len()).rev() {
+        if messages[i].role == "user" {
+            turn_count += 1;
+            if turn_count > preserve_turns {
+                boundary = i;
+                // Advance boundary past this user exchange (assistant + tool messages)
+                let mut next = boundary + 1;
+                while next < messages.len() && messages[next].role != "user" {
+                    next += 1;
+                }
+                boundary = next;
+                found = true;
+                break;
+            }
+        }
+    }
+
+    if !found {
+        return 0;
+    }
+
+    let mut removed: u64 = 0;
+    for msg in messages.iter_mut().take(boundary) {
+        if msg.role == "tool" && msg.content.len() > 500 {
+            let len = msg.content.len();
+            let first = len / 5 * 2; // ~40% from start
+            let last_start = len - len / 10 * 3; // ~30% from end
+            let first_part = &msg.content[..first];
+            let last_part = &msg.content[last_start..];
+            let truncated = format!(
+                "{}... [snip: {} chars truncated]\n...{}",
+                first_part,
+                len - first - (len - last_start),
+                last_part
+            );
+            removed += (len - truncated.len()) as u64;
+            msg.content = truncated;
+        }
+    }
+
+    removed
+}
+
 /// Default number of tokens to reserve for the prompt + LLM response.
 const RESERVE_TOKENS: u64 = 16384;
 
@@ -282,6 +346,69 @@ mod tests {
         let result = rt.block_on(run_compaction(&provider, "gpt-4", &msgs, false, 128000));
         assert!(result.is_ok());
         assert!(result.unwrap().is_none());
+    }
+
+    #[test]
+    fn test_snip_old_tool_results_short_conversation() {
+        let mut msgs = vec![
+            Message::new("user", "hi"),
+            Message::new("assistant", "hello"),
+        ];
+        let removed = snip_old_tool_results(&mut msgs, 6);
+        assert_eq!(removed, 0);
+        assert_eq!(msgs.len(), 2);
+    }
+
+    #[test]
+    fn test_snip_truncates_long_tool_output() {
+        let mut msgs = vec![
+            Message::new("user", "first msg"),
+            Message::new("assistant", "let me check"),
+            Message::tool_result("call_1", &"x".repeat(2000)),
+            Message::new("user", "second msg"),
+            Message::new("assistant", "a2"),
+            Message::new("user", "third msg"),
+            Message::new("assistant", "a3"),
+        ];
+        let removed = snip_old_tool_results(&mut msgs, 2);
+        assert!(removed > 0);
+        // The first exchange's tool result should have been truncated
+        assert!(msgs[2].content.len() < 1500);
+        assert!(msgs[2].content.contains("[snip:"));
+    }
+
+    #[test]
+    fn test_snip_preserves_recent_tools() {
+        let mut msgs = vec![
+            Message::new("user", "first"),
+            Message::new("assistant", "a1"),
+            Message::tool_result("c1", &"x".repeat(1000)),
+            Message::new("user", "second"),
+            Message::new("assistant", "a2"),
+            Message::tool_result("c2", &"y".repeat(1000)),
+            Message::new("user", "third"),
+            Message::new("assistant", "a3"),
+            Message::tool_result("c3", &"z".repeat(1000)),
+        ];
+        let removed = snip_old_tool_results(&mut msgs, 2);
+        assert!(removed > 0);
+        // First tool result (turn 1 of 3) should be snipped (exceeds preserve_turns=2)
+        assert!(msgs[2].content.contains("[snip:"));
+        // Second and third tool results should NOT be snipped (within last 2 turns)
+        assert!(!msgs[5].content.contains("[snip:"), "second tool should be preserved: {}", msgs[5].content);
+        assert!(!msgs[8].content.contains("[snip:"), "third tool should be preserved: {}", msgs[8].content);
+    }
+
+    #[test]
+    fn test_snip_short_tool_output_not_truncated() {
+        let mut msgs = vec![
+            Message::new("user", "first"),
+            Message::new("assistant", "a1"),
+            Message::tool_result("c1", "short"),
+        ];
+        let removed = snip_old_tool_results(&mut msgs, 6);
+        assert_eq!(removed, 0);
+        assert_eq!(msgs[2].content, "short");
     }
 
     #[test]

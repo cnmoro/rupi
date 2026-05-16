@@ -73,12 +73,12 @@ fn read_tool() -> ToolDef {
 fn write_tool() -> ToolDef {
     ToolDef {
         name: "write",
-        description: "Write or overwrite a file with new content. Creates parent directories if they don't exist. Use this to create new files or completely replace existing ones.",
+        description: "Create a NEW file with the given content. REFUSES if the file already exists — use edit to modify existing files. Creates parent directories automatically.",
         parameters: serde_json::json!({
             "type": "object",
             "properties": {
-                "file_path": { "type": "string", "description": "The absolute or relative path to the file to write" },
-                "content": { "type": "string", "description": "The full content to write to the file" }
+                "file_path": { "type": "string", "description": "The absolute file path for the new file" },
+                "content": { "type": "string", "description": "The full content to write" }
             },
             "required": ["file_path", "content"]
         }),
@@ -88,15 +88,26 @@ fn write_tool() -> ToolDef {
 fn edit_tool() -> ToolDef {
     ToolDef {
         name: "edit",
-        description: "Replace specific text in a file. Uses exact string matching (not regex). The old_text must be found exactly once in the file. Use this for surgical edits rather than rewriting entire files.",
+        description: "Replace exact text in a file. Uses exact string matching (not regex). Each old_text must be found exactly once in the file. Supports batch edits via the edits array. Prefer this over write for any change to an existing file.",
         parameters: serde_json::json!({
             "type": "object",
             "properties": {
                 "file_path": { "type": "string", "description": "The absolute or relative path to the file to edit" },
-                "old_text": { "type": "string", "description": "The exact text to find and replace (must match exactly once)" },
-                "new_text": { "type": "string", "description": "The replacement text" }
-            },
-            "required": ["file_path", "old_text", "new_text"]
+                "old_text": { "type": "string", "description": "(Deprecated) Use edits array instead. The exact text to find and replace (must match exactly once)" },
+                "new_text": { "type": "string", "description": "(Deprecated) Use edits array instead. The replacement text" },
+                "edits": {
+                    "type": "array",
+                    "description": "Array of edits to apply. Each edit's old_text is matched against the ORIGINAL file content (not after other edits). Edits must not overlap.",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "old_text": { "type": "string", "description": "Exact text to find (must match exactly once in the file)" },
+                            "new_text": { "type": "string", "description": "Replacement text" }
+                        },
+                        "required": ["old_text", "new_text"]
+                    }
+                }
+            }
         }),
     }
 }
@@ -298,7 +309,7 @@ fn execute_read(args: &Value) -> String {
     }
 }
 
-// ---- write ----
+// ---- write (with guard) ----
 fn execute_write(args: &Value) -> String {
     let file_path = match get_arg(args, "file_path") {
         Some(p) => p,
@@ -310,6 +321,22 @@ fn execute_write(args: &Value) -> String {
     };
 
     let path = resolve_path(file_path);
+
+    // Write guard: refuse if file already exists
+    if path.exists() {
+        return format!(
+            "Error: Write refused — {} already exists.\n\
+             \n\
+             Write is only for creating NEW files. To change an existing file, use Edit:\n\
+             {{\"name\":\"edit\",\"input\":{{\"file_path\":\"{}\",\"edits\":[{{\"old_text\":\"<exact text>\",\"new_text\":\"<replacement>\"}}]}}}}\n\
+             \n\
+             If you do not already know the file's current content, Read it first to get the exact text. \
+             Do NOT retry Write — it will be refused again.",
+            path.display(),
+            path.display(),
+        );
+    }
+
     if let Some(parent) = path.parent() {
         if !parent.exists() {
             if let Err(e) = std::fs::create_dir_all(parent) {
@@ -327,19 +354,11 @@ fn execute_write(args: &Value) -> String {
     }
 }
 
-// ---- edit ----
+// ---- edit (multi-edit support) ----
 fn execute_edit(args: &Value) -> String {
     let file_path = match get_arg(args, "file_path") {
         Some(p) => p,
         None => return "Error: missing 'file_path' argument".to_string(),
-    };
-    let old_text = match get_arg(args, "old_text") {
-        Some(t) => t,
-        None => return "Error: missing 'old_text' argument".to_string(),
-    };
-    let new_text = match get_arg(args, "new_text") {
-        Some(t) => t,
-        None => return "Error: missing 'new_text' argument".to_string(),
     };
 
     let path = resolve_path(file_path);
@@ -347,18 +366,94 @@ fn execute_edit(args: &Value) -> String {
         return format!("Error: file not found: {}", path.display());
     }
 
+    // Collect edits from either the singular old_text/new_text or the edits array
+    let edits: Vec<(String, String)> = if let Some(edits_val) = args.get("edits").and_then(|v| v.as_array()) {
+        if edits_val.is_empty() {
+            return "Error: edits array is empty".to_string();
+        }
+        edits_val.iter().filter_map(|e| {
+            let old = e.get("old_text")?.as_str()?.to_string();
+            let new = e.get("new_text")?.as_str()?.to_string();
+            Some((old, new))
+        }).collect()
+    } else {
+        let old_text = match get_arg(args, "old_text") {
+            Some(t) => t,
+            None => return "Error: missing 'old_text' argument (or provide 'edits' array)".to_string(),
+        };
+        let new_text = match get_arg(args, "new_text") {
+            Some(t) => t,
+            None => return "Error: missing 'new_text' argument (or provide 'edits' array)".to_string(),
+        };
+        vec![(old_text.to_string(), new_text.to_string())]
+    };
+
+    if edits.is_empty() {
+        return "Error: no valid edits provided".to_string();
+    }
+
     match std::fs::read_to_string(&path) {
         Ok(content) => {
-            let count = content.matches(old_text).count();
-            if count == 0 {
-                return format!("Error: old_text not found in {}", path.display());
+            // Check all old_text exist exactly once in the ORIGINAL content
+            let mut results: Vec<String> = Vec::new();
+            let mut has_error = false;
+
+            for (old_text, _new_text) in &edits {
+                let count = content.matches(old_text).count();
+                if count == 0 {
+                    results.push(format!("old_text not found: {:?}", old_text));
+                    has_error = true;
+                } else if count > 1 {
+                    results.push(format!("old_text found {} times: {:?}", count, old_text));
+                    has_error = true;
+                }
             }
-            if count > 1 {
-                return format!("Error: old_text found {} times in {}. Use a more specific match.", count, path.display());
+
+            if has_error {
+                let mut msg = "Edit failed:\n".to_string();
+                for r in &results {
+                    msg.push_str(&format!("  - {}\n", r));
+                }
+                msg.push_str("\nRecovery: Read the file to get the exact current content, then retry with the exact text.");
+                return msg;
             }
-            let new_content = content.replace(old_text, new_text);
+
+            // Check for overlapping edits by finding positions in original content
+            let mut positions: Vec<(usize, usize, &str, &str)> = Vec::new(); // (start, end, old_text, new_text)
+            for (old_text, new_text) in &edits {
+                if let Some(pos) = content.find(old_text) {
+                    positions.push((pos, pos + old_text.len(), old_text, new_text));
+                }
+            }
+
+            // Sort by position (ascending)
+            positions.sort_by_key(|&(start, _, _, _)| start);
+
+            // Check for overlaps
+            for i in 1..positions.len() {
+                if positions[i].0 < positions[i - 1].1 {
+                    return format!(
+                        "Error: edits overlap. First edit ends at position {} but next edit starts at {}. \
+                         Edits must not overlap — each old_text is matched against the original file content.",
+                        positions[i - 1].1, positions[i].0
+                    );
+                }
+            }
+
+            // Apply edits in reverse position order to preserve positions
+            let mut new_content = content.clone();
+            for &(start, end, _old, new) in positions.iter().rev() {
+                new_content.replace_range(start..end, new);
+            }
+
             match std::fs::write(&path, &new_content) {
-                Ok(_) => format!("Successfully applied edit to {}", path.display()),
+                Ok(_) => {
+                    if positions.len() == 1 {
+                        format!("Successfully applied edit to {}", path.display())
+                    } else {
+                        format!("Successfully applied {} edits to {}", positions.len(), path.display())
+                    }
+                }
                 Err(e) => format!("Error writing file: {}", e),
             }
         }
@@ -573,7 +668,7 @@ mod tests {
     }
 
     #[test]
-    fn test_write_file() {
+    fn test_write_creates_new_file() {
         let dir = std::env::temp_dir().join("rupi-tools-test-write-file".to_string());
         fs::create_dir_all(&dir).unwrap();
         let path = dir.join("new_file.txt");
@@ -588,7 +683,38 @@ mod tests {
     }
 
     #[test]
-    fn test_edit_file() {
+    fn test_write_refuses_on_existing_file() {
+        let dir = std::env::temp_dir().join("rupi-tools-test-write-refuse".to_string());
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("existing.txt");
+        fs::write(&path, "original content").unwrap();
+
+        let args = serde_json::json!({"file_path": path.to_string_lossy(), "content": "new content"});
+        let result = execute_write(&args);
+        assert!(result.contains("Write refused"));
+        // Content should be unchanged
+        let content = fs::read_to_string(&path).unwrap();
+        assert_eq!(content, "original content");
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn test_write_guard_returns_edit_recipe() {
+        let dir = std::env::temp_dir().join("rupi-tools-test-write-recipe".to_string());
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("existing.txt");
+        fs::write(&path, "content").unwrap();
+
+        let args = serde_json::json!({"file_path": path.to_string_lossy(), "content": "new"});
+        let result = execute_write(&args);
+        assert!(result.contains("use Edit"));
+        assert!(result.contains("old_text"));
+        assert!(result.contains("new_text"));
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn test_edit_singular() {
         let dir = std::env::temp_dir().join("rupi-tools-test-edit-file".to_string());
         fs::create_dir_all(&dir).unwrap();
         let path = dir.join("edit.txt");
@@ -599,6 +725,27 @@ mod tests {
         assert!(result.contains("Successfully applied edit"));
         let content = fs::read_to_string(&path).unwrap();
         assert_eq!(content, "goodbye world\n");
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn test_edit_multi_edits() {
+        let dir = std::env::temp_dir().join("rupi-tools-test-edit-multi".to_string());
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("multi.txt");
+        fs::write(&path, "AAA line\nBBB line\nCCC line\n").unwrap();
+
+        let args = serde_json::json!({
+            "file_path": path.to_string_lossy(),
+            "edits": [
+                {"old_text": "AAA", "new_text": "XXX"},
+                {"old_text": "CCC", "new_text": "ZZZ"}
+            ]
+        });
+        let result = execute_edit(&args);
+        assert!(result.contains("2 edits"));
+        let content = fs::read_to_string(&path).unwrap();
+        assert_eq!(content, "XXX line\nBBB line\nZZZ line\n");
         fs::remove_dir_all(&dir).unwrap();
     }
 
@@ -616,15 +763,56 @@ mod tests {
     }
 
     #[test]
-    fn test_edit_multiple_matches() {
-        let dir = std::env::temp_dir().join("rupi-tools-test-edit-multi".to_string());
+    fn test_edit_multiple_matches_singular() {
+        let dir = std::env::temp_dir().join("rupi-tools-test-edit-multi-singular".to_string());
         fs::create_dir_all(&dir).unwrap();
         let path = dir.join("edit.txt");
         fs::write(&path, "hello hello\n").unwrap();
 
         let args = serde_json::json!({"file_path": path.to_string_lossy(), "old_text": "hello", "new_text": "foo"});
         let result = execute_edit(&args);
-        assert!(result.contains("found 2 times"));
+        assert!(result.contains("2 times"));
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn test_edit_multi_overlap_detected() {
+        let dir = std::env::temp_dir().join("rupi-tools-test-edit-overlap".to_string());
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("overlap.txt");
+        fs::write(&path, "hello world foo\n").unwrap();
+
+        let args = serde_json::json!({
+            "file_path": path.to_string_lossy(),
+            "edits": [
+                {"old_text": "hello world", "new_text": "goodbye"},
+                {"old_text": "world foo", "new_text": "moon"}
+            ]
+        });
+        let result = execute_edit(&args);
+        assert!(result.contains("overlap"));
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn test_edit_multi_one_fails_all_fail() {
+        let dir = std::env::temp_dir().join("rupi-tools-test-edit-partial".to_string());
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("partial.txt");
+        fs::write(&path, "AAA line\nBBB line\n").unwrap();
+
+        let args = serde_json::json!({
+            "file_path": path.to_string_lossy(),
+            "edits": [
+                {"old_text": "AAA", "new_text": "XXX"},
+                {"old_text": "NONEXISTENT", "new_text": "YYY"}
+            ]
+        });
+        let result = execute_edit(&args);
+        assert!(result.contains("Edit failed"));
+        // File should be unchanged
+        let content = fs::read_to_string(&path).unwrap();
+        assert_eq!(content, "AAA line\nBBB line\n");
         fs::remove_dir_all(&dir).unwrap();
     }
 
@@ -697,6 +885,17 @@ mod tests {
         let dir = std::env::temp_dir().join("rupi-tools-test-write-parent".to_string());
         let nested = dir.join("nested").join("deep").join("file.txt");
         let args = serde_json::json!({"file_path": nested.to_string_lossy(), "content": "test"});
+        let result = execute_write(&args);
+        assert!(result.contains("Successfully wrote"));
+        assert!(nested.exists());
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn test_write_creates_new_even_if_parent_doesnt_exist() {
+        let dir = std::env::temp_dir().join("rupi-tools-test-write-deep".to_string());
+        let nested = dir.join("a").join("b").join("c").join("f.txt");
+        let args = serde_json::json!({"file_path": nested.to_string_lossy(), "content": "hi"});
         let result = execute_write(&args);
         assert!(result.contains("Successfully wrote"));
         assert!(nested.exists());

@@ -48,6 +48,8 @@ impl Message {
 }
 
 use crate::compaction::{self, CompactionResult};
+use crate::output_parser;
+use crate::quality;
 use crate::sessions;
 use crate::skills::Skill;
 use crate::tools::{self, ToolCall};
@@ -83,8 +85,8 @@ Current date and time: {}
 Available tools:
 - bash: Execute bash commands (ls, grep, find, curl, git, compilers, etc.). Returns stdout and stderr. Optionally provide a timeout in seconds.
 - read: Read file contents with optional line offset/limit.
-- write: Create or overwrite files. Creates parent directories if needed.
-- edit: Replace exact text in a file. Only use when the text to replace is found exactly once.
+- write: Create a NEW file. REFUSES if the file already exists — use edit to modify existing files instead. Creates parent directories if needed.
+- edit: Replace exact text in a file. Supports batch edits via the edits array. Each old_text is matched against the ORIGINAL file content (not after other edits). Edits must not overlap. Prefer this over write for any change to an existing file.
 - grep: Search file contents for patterns (uses ripgrep, respects .gitignore, falls back to grep).
 - find: Find files by glob pattern (uses fd, respects .gitignore, falls back to find).
 - ls: List directory contents.
@@ -211,6 +213,8 @@ pub struct AgentSession {
     thinking_level: RwLock<String>,
     auto_compaction_enabled: RwLock<bool>,
     message_count: RwLock<u64>,
+    recent_tool_calls: RwLock<Vec<Vec<crate::tools::ToolCall>>>,
+    consecutive_quality_issues: RwLock<u32>,
 }
 
 impl AgentSession {
@@ -243,6 +247,8 @@ impl AgentSession {
             thinking_level: RwLock::new("off".to_string()),
             auto_compaction_enabled: RwLock::new(true),
             message_count: RwLock::new(0),
+            recent_tool_calls: RwLock::new(Vec::new()),
+            consecutive_quality_issues: RwLock::new(0),
         }
     }
 
@@ -346,6 +352,8 @@ impl AgentSession {
     pub async fn reset(&self) {
         self.messages.write().await.clear();
         *self.message_count.write().await = 0;
+        self.recent_tool_calls.write().await.clear();
+        *self.consecutive_quality_issues.write().await = 0;
         let new_path = sessions::create_session(&self.model.read().unwrap()).ok();
         *self.session_path.write().await = new_path;
     }
@@ -621,9 +629,6 @@ impl AgentSession {
                         tool_calls = calls;
                     }
                     StreamEvent::Error(err) => {
-                        // If the stream failed mid-way, the retry logic at the top of the
-                        // loop will handle it on the next iteration. Report the error.
-                        had_stream_events = true;
                         let error_text = if err == "cancelled" {
                             "Request cancelled".to_string()
                         } else {
@@ -656,6 +661,47 @@ impl AgentSession {
                             })
                         };
                     }
+                }
+            }
+
+            // If no native tool calls, try to extract embedded tool calls from text
+            if tool_calls.is_empty() && !full_content.is_empty() {
+                let embedded = output_parser::extract_tool_calls_from_text(&full_content);
+                if !embedded.is_empty() {
+                    eprintln!("rupi: output parser extracted {} tool call(s) from text", embedded.len());
+                    tool_calls = embedded;
+                }
+            }
+
+            // Quality check: assess the response before proceeding
+            if !tool_calls.is_empty() || !full_content.is_empty() {
+                let known = quality::known_tool_names();
+                let recent = self.recent_tool_calls.read().await.clone();
+                let verdict = quality::assess_response(&full_content, &tool_calls, &recent, &known);
+                if !verdict.ok {
+                    let issue = verdict.reason.as_ref().unwrap();
+                    let mut cc = self.consecutive_quality_issues.write().await;
+                    let max_corrections: u32 = 2;
+                    if *cc < max_corrections {
+                        let correction = quality::build_correction_message(issue);
+                        eprintln!("rupi: quality issue detected: {:?} — queuing correction", issue);
+                        self.pending_follow_up.write().await.push(correction);
+                        *cc += 1;
+                    } else {
+                        eprintln!("rupi: quality issue suppressed after {} corrections", *cc);
+                    }
+                } else {
+                    // Reset counter on a clean response
+                    *self.consecutive_quality_issues.write().await = 0;
+                }
+            }
+
+            // Update recent tool calls tracking
+            if !tool_calls.is_empty() {
+                let mut recent = self.recent_tool_calls.write().await;
+                recent.push(tool_calls.clone());
+                if recent.len() > 8 {
+                    recent.remove(0);
                 }
             }
 
@@ -813,6 +859,15 @@ impl AgentSession {
                 return Err(AgentError::Config("Already compacting".into()));
             }
             *compacting = true;
+        }
+
+        // Step 1: Snip old tool results on the actual stored messages (rule-based, no API cost)
+        {
+            let mut stored = self.messages.write().await;
+            let snipped = compaction::snip_old_tool_results(&mut stored, 6);
+            if snipped > 0 {
+                eprintln!("rupi: snipped {} chars from old tool results", snipped);
+            }
         }
 
         let messages = self.messages.read().await.clone();

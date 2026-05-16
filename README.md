@@ -58,10 +58,14 @@ Same event stream as RPC but reads user input interactively. Useful for debuggin
 ## How it works
 
 - **Tools**: bash, read, write, edit, grep, find, ls — the agent decides when to use them. YOLO mode (default): no approval needed. Add `--disable-yolo` to require user confirmation per execution.
+- **Write guard**: `write` refuses if the file already exists, returning an error with the exact `edit` call-shape. This prevents accidental whole-file rewrites of existing code. Use `edit` for any change to an existing file.
+- **Multi-edit**: `edit` accepts an `edits` array for batch changes in a single call. Each edit's `old_text` is matched against the **original** file content (not after other edits). Edits must not overlap.
+- **Output parser**: when the model emits tool calls inside text (fenced ` ```tool ``` blocks, `<tool_call>` tags, or bare JSON), the parser extracts and executes them as if they were native tool calls.
+- **Quality monitor**: detects empty responses, hallucinated tool names, and repeated identical tool calls (loops). Queues correction messages to nudge the model back on track (capped at 2 per session to avoid correction loops).
 - **Skills**: place `.md` files in `~/.config/rupi/skills/` — injected into the system prompt on startup
 - **Context files**: `CLAUDE.md` and `AGENTS.md` from cwd and ancestor directories are loaded automatically
-- **Compaction**: auto-triggers when context approaches the window. Set with `--context-window` (default 128000, fires at `window - 16384` tokens)
-- **No hard limits**: the agent runs indefinitely until the task is done. When context approaches the window limit, auto-compaction summarizes old messages and the agent keeps going. Optionally set `--timeout <secs>` to cap execution time.
+- **Compaction**: two-layer context management. First, **snip** truncates long tool-role messages older than the last 6 turns (rule-based, no API cost). Then, if still over threshold, **auto-compact** calls the LLM to summarize old messages. Set with `--context-window` (default 128000, fires at `window - 16384` tokens).
+- **No hard limits**: the agent runs indefinitely until the task is done. When context approaches the window limit, snip + auto-compact keeps the agent going. Optionally set `--timeout <secs>` to cap execution time.
 - **Steer / follow-up**: type while the agent generates — normal Enter queues as follow-up (processed after the current turn). Use `/steer <message>` to interrupt immediately. In RPC mode, set `"streamingBehavior": "steer"` or `"followUp"` on the prompt command.
 - **Memory**: add `--memory` to persist key facts across sessions. The agent reads/writes `~/.config/rupi/MEMORY.md` — reads on startup, overwrites with bullet points during execution.
 - **Session persistence**: conversations saved as JSONL in `~/.config/rupi_sessions/`
