@@ -198,7 +198,7 @@ async fn run_interactive_mode(
                 Err(_) => false,
             }
         });
-        sess.set_approval_fn(Some(approval));
+        sess.set_approval_fn(Some(approval)).await;
     }
 
     rupi::modes::interactive::run_interactive(session).await;

@@ -195,7 +195,7 @@ pub fn load_context_files(cwd: &str) -> Vec<ContextFile> {
 /// Agent session manages conversation state and model interaction.
 pub struct AgentSession {
     provider: Arc<dyn ChatProvider>,
-    approval_fn: std::sync::RwLock<Option<ApprovalFn>>,
+    approval_fn: RwLock<Option<ApprovalFn>>,
     goal: RwLock<Option<String>>,
     memory_enabled: bool,
     model: std::sync::RwLock<String>,
@@ -208,12 +208,13 @@ pub struct AgentSession {
     context_files: Vec<ContextFile>,
     messages: RwLock<Vec<Message>>,
     session_path: RwLock<Option<std::path::PathBuf>>,
-    is_streaming: Mutex<bool>,
+    is_streaming: std::sync::atomic::AtomicBool,
     is_compacting: Mutex<bool>,
     abort_signal: Mutex<Option<watch::Sender<bool>>>,
+    abort_requested: Mutex<bool>,
+    empty_response_retries: Mutex<u32>,
     thinking_level: RwLock<String>,
     auto_compaction_enabled: RwLock<bool>,
-    message_count: RwLock<u64>,
     recent_tool_calls: RwLock<Vec<Vec<crate::tools::ToolCall>>>,
     consecutive_quality_issues: RwLock<u32>,
 }
@@ -227,10 +228,24 @@ impl AgentSession {
         skills: Vec<Skill>,
         context_files: Vec<ContextFile>,
     ) -> Self {
-        let session_path = sessions::create_session(&model).ok();
+        Self::new_with_session_path(
+            provider, model, context_window, cwd, skills, context_files, None,
+        )
+    }
+
+    fn new_with_session_path(
+        provider: Arc<dyn ChatProvider>,
+        model: String,
+        context_window: u64,
+        cwd: String,
+        skills: Vec<Skill>,
+        context_files: Vec<ContextFile>,
+        existing_path: Option<std::path::PathBuf>,
+    ) -> Self {
+        let session_path = existing_path.or_else(|| sessions::create_session(&model).ok());
         AgentSession {
             provider,
-            approval_fn: std::sync::RwLock::new(None),
+            approval_fn: RwLock::new(None),
             goal: RwLock::new(None),
             memory_enabled: false,
             model: std::sync::RwLock::new(model),
@@ -242,12 +257,13 @@ impl AgentSession {
             context_files,
             messages: RwLock::new(Vec::new()),
             session_path: RwLock::new(session_path),
-            is_streaming: Mutex::new(false),
+            is_streaming: std::sync::atomic::AtomicBool::new(false),
             is_compacting: Mutex::new(false),
             abort_signal: Mutex::new(None),
+            abort_requested: Mutex::new(false),
+            empty_response_retries: Mutex::new(0),
             thinking_level: RwLock::new("off".to_string()),
             auto_compaction_enabled: RwLock::new(true),
-            message_count: RwLock::new(0),
             recent_tool_calls: RwLock::new(Vec::new()),
             consecutive_quality_issues: RwLock::new(0),
         }
@@ -295,7 +311,9 @@ impl AgentSession {
         let context_window = config.context_window;
         let model = config.model.clone();
         let provider = Arc::new(OpenAIProvider::new(config));
-        let mut session = Self::new(provider as Arc<dyn ChatProvider>, model, context_window, cwd, skills, context_files);
+        let mut session = Self::new_with_session_path(
+            provider as Arc<dyn ChatProvider>, model, context_window, cwd, skills, context_files, Some(session_path.clone()),
+        );
         session.memory_enabled = memory_enabled;
         if memory_enabled {
             ensure_memory_file();
@@ -304,7 +322,6 @@ impl AgentSession {
         for msg in &messages {
             session.messages.write().await.push(msg.clone());
         }
-        *session.message_count.write().await = messages.len() as u64;
         *session.session_path.write().await = Some(session_path);
         Ok(session)
     }
@@ -358,31 +375,42 @@ impl AgentSession {
 
     /// Whether the agent is currently streaming a response.
     pub async fn is_streaming(&self) -> bool {
-        *self.is_streaming.lock().await
+        self.is_streaming.load(std::sync::atomic::Ordering::SeqCst)
     }
 
     pub async fn message_count(&self) -> u64 {
-        *self.message_count.read().await
+        self.messages.read().await.len() as u64
     }
 
     /// Persist a message to the session file.
     async fn persist_message(&self, msg: &Message) {
         if let Some(ref path) = *self.session_path.read().await {
-            let _ = sessions::append_message(path, msg);
+            if let Err(e) = sessions::append_message(path, msg) {
+                eprintln!("rupi: failed to persist message: {}", e);
+            }
         }
     }
 
     /// Persist a compaction record to the session file.
     async fn persist_compaction(&self, summary: &str, tokens_before: u64) {
         if let Some(ref path) = *self.session_path.read().await {
-            let _ = sessions::append_compaction(path, summary, tokens_before);
+            if let Err(e) = sessions::append_compaction(path, summary, tokens_before) {
+                eprintln!("rupi: failed to persist compaction: {}", e);
+            }
         }
     }
 
     /// Reset the session (clear messages, create new session file).
     pub async fn reset(&self) {
+        // Wait for any in-progress compaction to finish
+        loop {
+            let c = *self.is_compacting.lock().await;
+            if !c { break; }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        self.is_streaming.store(false, std::sync::atomic::Ordering::SeqCst);
+        *self.is_compacting.lock().await = false;
         self.messages.write().await.clear();
-        *self.message_count.write().await = 0;
         self.recent_tool_calls.write().await.clear();
         *self.consecutive_quality_issues.write().await = 0;
         self.pending_steer.write().await.clear();
@@ -390,6 +418,7 @@ impl AgentSession {
         self.set_goal(None).await;
         *self.auto_compaction_enabled.write().await = true;
         *self.thinking_level.write().await = "off".to_string();
+        *self.abort_signal.lock().await = None;
         let new_path = sessions::create_session(&self.model()).ok();
         *self.session_path.write().await = new_path;
     }
@@ -403,15 +432,15 @@ impl AgentSession {
         message: &str,
         event_tx: mpsc::UnboundedSender<AgentEvent>,
     ) -> Result<(), AgentError> {
-        // Check if already streaming
-        {
-            let mut streaming = self.is_streaming.lock().await;
-            if *streaming {
-                // Queue as steer or follow-up instead of rejecting
-                self.pending_steer.write().await.push(message.to_string());
-                return Ok(());
-            }
-            *streaming = true;
+        // Check if already streaming (atomically set to true if currently false)
+        if self.is_streaming.compare_exchange(
+            false, true,
+            std::sync::atomic::Ordering::SeqCst,
+            std::sync::atomic::Ordering::SeqCst,
+        ).is_err() {
+            // Already streaming — queue as steer
+            self.pending_steer.write().await.push(message.to_string());
+            return Ok(());
         }
 
         // Add user message to history
@@ -436,20 +465,17 @@ impl AgentSession {
         let goal_text = self.goal.read().await.clone();
 
         if let Some(g) = goal_text {
-            // Goal mode: wrap the event channel to hold agent_end.
-            // Use a oneshot channel to send the held agent_end back from the forwarder.
+            // Goal mode: suppress agent_end events during the loop.
+            // Collect them and only forward the last one after completion.
             let (wrapped_tx, mut wrapped_rx) = mpsc::unbounded_channel::<AgentEvent>();
-            let (held_tx, mut held_rx) = tokio::sync::oneshot::channel::<AgentEvent>();
-            let mut held_tx = Some(held_tx);
+            let (held_tx, mut held_rx) = tokio::sync::mpsc::unbounded_channel::<AgentEvent>();
 
             let tx_clone = event_tx.clone();
             let fwd = tokio::spawn(async move {
                 while let Some(ev) = wrapped_rx.recv().await {
                     if matches!(ev, AgentEvent::AgentEnd { .. }) {
-                        // Send the agent_end back via oneshot
-                        if let Some(tx) = held_tx.take() {
-                            let _ = tx.send(ev);
-                        }
+                        // Suppress agent_end during loop; save it
+                        let _ = held_tx.send(ev);
                     } else {
                         let _ = tx_clone.send(ev);
                     }
@@ -458,7 +484,10 @@ impl AgentSession {
 
             let max_goal_iterations: u32 = 5;
             for goal_iter in 0..max_goal_iterations {
-                let _ = self.run_tool_loop(wrapped_tx.clone()).await;
+                if let Err(e) = self.run_tool_loop(wrapped_tx.clone()).await {
+                    eprintln!("rupi: tool loop error in goal iteration {}: {}", goal_iter, e);
+                    break;
+                }
 
                 if self.verify_goal(&g).await {
                     break;
@@ -487,8 +516,12 @@ impl AgentSession {
 
             drop(wrapped_tx);
             let _ = fwd.await;
-            // Read the held agent_end (if any) and forward it
-            if let Ok(ae) = held_rx.try_recv() {
+            // Forward the LAST saved agent_end (if any)
+            let mut last_ae = None;
+            while let Ok(ae) = held_rx.try_recv() {
+                last_ae = Some(ae);
+            }
+            if let Some(ae) = last_ae {
                 let _ = event_tx.send(ae);
             } else {
                 // No agent_end was held — send a synthetic one
@@ -496,13 +529,37 @@ impl AgentSession {
             }
         } else {
             // No goal: normal flow
-            let _ = self.run_tool_loop(event_tx.clone()).await;
+            if let Err(e) = self.run_tool_loop(event_tx.clone()).await {
+                eprintln!("rupi: tool loop error: {}", e);
+            }
         }
 
-        {
-            let mut streaming = self.is_streaming.lock().await;
-            *streaming = false;
+        // Drain any messages queued during streaming (e.g., steer that aborted the loop)
+        loop {
+            let pending = self.drain_pending().await;
+            if pending.is_empty() {
+                break;
+            }
+            for msg in &pending {
+                self.persist_message(msg).await;
+                self.messages.write().await.push(msg.clone());
+            }
+            // Send turn_start + message_start for the queued messages
+            let _ = event_tx.send(AgentEvent::turn_start());
+            let _ = event_tx.send(AgentEvent::message_start(AgentMessage {
+                role: "user".to_string(),
+                content: vec![],
+                model: None,
+                usage: None,
+                stop_reason: None,
+            }));
+            // Run tool loop to process queued messages
+            if let Err(e) = self.run_tool_loop(event_tx.clone()).await {
+                eprintln!("rupi: tool loop error after drain: {}", e);
+            }
         }
+
+        self.is_streaming.store(false, std::sync::atomic::Ordering::SeqCst);
 
         Ok(())
     }
@@ -513,23 +570,31 @@ impl AgentSession {
         event_tx: mpsc::UnboundedSender<AgentEvent>,
     ) -> Result<(), AgentError> {
         for _turn_num in 0.. {
-            // Check abort signal
-            {
+            // Check abort signal; also check persistent abort_requested flag
+            let abort_now = {
                 let signal = self.abort_signal.lock().await;
                 if let Some(ref tx) = *signal {
                     if *tx.borrow() {
-                        let _ = event_tx.send(AgentEvent::message_end(AgentMessage {
-                            role: "assistant".to_string(),
-                            content: vec![],
-                            model: None,
-                            usage: None,
-                            stop_reason: Some("aborted".to_string()),
-                        }));
-                        let _ = event_tx.send(AgentEvent::turn_end());
-                        let _ = event_tx.send(AgentEvent::agent_end());
-                        return Err(AgentError::Cancelled);
+                        true
+                    } else {
+                        false
                     }
+                } else {
+                    // Signal is None — check the persistent flag (abort was called between iterations)
+                    *self.abort_requested.lock().await
                 }
+            };
+            if abort_now {
+                let _ = event_tx.send(AgentEvent::message_end(AgentMessage {
+                    role: "assistant".to_string(),
+                    content: vec![],
+                    model: None,
+                    usage: None,
+                    stop_reason: Some("aborted".to_string()),
+                }));
+                let _ = event_tx.send(AgentEvent::turn_end());
+                let _ = event_tx.send(AgentEvent::agent_end());
+                return Err(AgentError::Cancelled);
             }
 
             // Create abort signal for this round
@@ -747,6 +812,26 @@ impl AgentSession {
                 }
             }
 
+            // If quality corrections were queued but no tool calls, process them inline
+            if tool_calls.is_empty() && !self.pending_follow_up.read().await.is_empty() {
+                let drained = self.drain_pending().await;
+                for msg in &drained {
+                    self.messages.write().await.push(msg.clone());
+                    let _ = event_tx.send(AgentEvent::turn_start());
+                    let _ = event_tx.send(AgentEvent::message_start(AgentMessage {
+                        role: "user".to_string(),
+                        content: vec![MessageContent {
+                            content_type: "text".to_string(),
+                            text: Some(msg.content.clone()),
+                        }],
+                        model: None,
+                        usage: None,
+                        stop_reason: None,
+                    }));
+                }
+                continue;
+            }
+
             // If tool calls were made, execute them and continue to next turn
             if !tool_calls.is_empty() {
                 // Add assistant message with tool calls to history
@@ -780,12 +865,10 @@ impl AgentSession {
                     ));
 
                     let allowed = {
-                        let guard = self.approval_fn.read();
-                        guard.ok().and_then(|g| {
-                            g.as_ref().map(|f| {
-                                let args_str = serde_json::to_string(&tc.arguments).unwrap_or_default();
-                                f(&tc.name, &args_str)
-                            })
+                        let guard = self.approval_fn.read().await;
+                        guard.as_ref().map(|f| {
+                            let args_str = serde_json::to_string(&tc.arguments).unwrap_or_default();
+                            f(&tc.name, &args_str)
                         }).unwrap_or(true)
                     };
 
@@ -814,18 +897,27 @@ impl AgentSession {
                     stop_reason: None,
                 }));
 
-                *self.message_count.write().await += 1;
                 continue;
             }
 
-            // No tool calls. If the response is empty (stream failed silently), retry.
+            // No tool calls. If the response is empty (stream failed silently), retry with cap.
             if full_content.is_empty() && had_stream_events == false {
-                let delay = std::time::Duration::from_secs(1);
-                tokio::time::sleep(delay).await;
-                continue; // retry
+                let mut retries = self.empty_response_retries.lock().await;
+                if *retries >= 5 {
+                    return Err(AgentError::Api {
+                        message: "Model returned empty response 5 consecutive times".to_string(),
+                        status_code: 0,
+                    });
+                }
+                let delay = 500u64 * (1 << *retries);
+                *retries += 1;
+                tokio::time::sleep(std::time::Duration::from_millis(delay)).await;
+                continue;
             }
 
             // No tool calls — this is the final response.
+            // Reset empty response retry counter on success
+            *self.empty_response_retries.lock().await = 0;
             // Run auto-compaction check in background (fire-and-forget)
             let auto_enabled = *self.auto_compaction_enabled.read().await;
             if auto_enabled {
@@ -872,26 +964,9 @@ impl AgentSession {
             let _ = event_tx.send(AgentEvent::turn_end());
             let _ = event_tx.send(AgentEvent::agent_end());
 
-            *self.message_count.write().await += 2;
-
             return Ok(());
         }
-
-        // Max turns exceeded
-        let _ = event_tx.send(AgentEvent::message_end(AgentMessage {
-            role: "assistant".to_string(),
-            content: vec![MessageContent {
-                content_type: "text".to_string(),
-                text: Some("Max iteration depth reached. Try breaking your request into smaller steps.".to_string()),
-            }],
-            model: Some(self.model()),
-            usage: None,
-            stop_reason: Some("timeout".to_string()),
-        }));
-        let _ = event_tx.send(AgentEvent::turn_end());
-        let _ = event_tx.send(AgentEvent::agent_end());
-
-        Err(AgentError::Config("Operation timed out".into()))
+        unreachable!()
     }
 
     /// Run compaction on the conversation history.
@@ -939,13 +1014,20 @@ impl AgentSession {
 
         let messages_to_summarize = &messages[..cut_index];
         let compact_model = self.model();
-        let summary = compaction::generate_summary(
+        let summary = match compaction::generate_summary(
             &self.provider,
             &compact_model,
             messages_to_summarize,
             None,
         )
-        .await?;
+        .await
+        {
+            Ok(s) => s,
+            Err(e) => {
+                *self.is_compacting.lock().await = false;
+                return Err(e);
+            }
+        };
 
         // Replace summarized messages with a compaction summary message.
         // Use role "user" (not "system") because OpenAI-compatible endpoints
@@ -976,6 +1058,7 @@ impl AgentSession {
     /// Queue a steer message (interrupts current generation).
     pub async fn steer(&self, message: &str) {
         self.pending_steer.write().await.push(message.to_string());
+        self.abort().await;
     }
 
     /// Queue a follow-up message (processed after current generation finishes).
@@ -1041,6 +1124,7 @@ impl AgentSession {
     /// where is_streaming=false lets a new prompt() start before the old tool
     /// loop has finished cleaning up.
     pub async fn abort(&self) {
+        *self.abort_requested.lock().await = true;
         let mut signal = self.abort_signal.lock().await;
         if let Some(tx) = signal.take() {
             let _ = tx.send(true);
@@ -1099,20 +1183,26 @@ Has the assistant's output satisfied this exact condition? Reply with only YES o
         let system_msg = Message::new("system", &simple_system);
         let verify_msg = Message::new("user", &verify_prompt);
         let model_name = self.model();
-        match self.provider.complete(&model_name, &[system_msg, verify_msg]).await {
-            Ok(response) => {
-                response.trim().to_uppercase().starts_with("Y")
+        for attempt in 0..3 {
+            let sys = Message::new("system", &simple_system);
+            let vfy = Message::new("user", &verify_prompt);
+            match self.provider.complete(&model_name, &[sys, vfy]).await {
+                Ok(response) => {
+                    return response.trim().to_uppercase().starts_with("Y");
+                }
+                Err(_) if attempt < 2 => {
+                    tokio::time::sleep(std::time::Duration::from_secs(1 << attempt)).await;
+                }
+                _ => return false,
             }
-            Err(_) => true, // on error, assume goal met to prevent infinite loop
         }
+        false
     }
 
     /// Set an approval callback for tool execution.
     /// Called with (tool_name, args_json) before execution. Return true to allow.
-    pub fn set_approval_fn(&self, f: Option<ApprovalFn>) {
-        if let Ok(mut guard) = self.approval_fn.write() {
-            *guard = f;
-        }
+    pub async fn set_approval_fn(&self, f: Option<ApprovalFn>) {
+        *self.approval_fn.write().await = f;
     }
 
     pub fn provider_model_info(&self) -> ModelInfo {
@@ -1125,7 +1215,7 @@ Has the assistant's output satisfied this exact condition? Reply with only YES o
         SessionState {
             model: Some(info),
             thinking_level: self.thinking_level.read().await.clone(),
-            is_streaming: *self.is_streaming.lock().await,
+            is_streaming: self.is_streaming.load(std::sync::atomic::Ordering::SeqCst),
             is_compacting: *self.is_compacting.lock().await,
             steering_mode: "all".to_string(),
             follow_up_mode: "all".to_string(),
@@ -1241,7 +1331,6 @@ mod tests {
             .write()
             .await
             .push(Message::new("user", "hello"));
-        *session.message_count.write().await = 1;
 
         assert_eq!(session.messages().await.len(), 1);
         session.reset().await;

@@ -781,7 +781,7 @@ async fn e2e_test_approval_deny_tool() {
     use rupi::agent::session::ApprovalFn;
     use std::sync::Arc;
     let deny: ApprovalFn = Arc::new(|_, _| false);
-    session.set_approval_fn(Some(deny));
+    session.set_approval_fn(Some(deny)).await;
 
     let (tx, mut rx) = mpsc::unbounded_channel::<AgentEvent>();
 
@@ -839,7 +839,7 @@ async fn e2e_test_approval_allow_tool() {
     use rupi::agent::session::ApprovalFn;
     use std::sync::Arc;
     let allow: ApprovalFn = Arc::new(|_, _| true);
-    session.set_approval_fn(Some(allow));
+    session.set_approval_fn(Some(allow)).await;
 
     let (tx, mut rx) = mpsc::unbounded_channel::<AgentEvent>();
 
