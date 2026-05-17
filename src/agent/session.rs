@@ -384,7 +384,7 @@ impl AgentSession {
         *self.message_count.write().await = 0;
         self.recent_tool_calls.write().await.clear();
         *self.consecutive_quality_issues.write().await = 0;
-        let new_path = sessions::create_session(&self.model.read().unwrap()).ok();
+        let new_path = sessions::create_session(&self.model()).ok();
         *self.session_path.write().await = new_path;
     }
 
@@ -549,7 +549,7 @@ impl AgentSession {
             let mut messages_for_api = vec![system_msg];
             messages_for_api.extend(self.messages.read().await.clone());
 
-            let current_model = self.model.read().unwrap().clone();
+            let current_model = self.model();
 
             // Retry loop with exponential backoff
             let mut last_error = None;
@@ -773,10 +773,12 @@ impl AgentSession {
                     ));
 
                     let allowed = {
-                        let guard = self.approval_fn.read().unwrap();
-                        guard.as_ref().map(|f| {
-                            let args_str = serde_json::to_string(&tc.arguments).unwrap_or_default();
-                            f(&tc.name, &args_str)
+                        let guard = self.approval_fn.read();
+                        guard.ok().and_then(|g| {
+                            g.as_ref().map(|f| {
+                                let args_str = serde_json::to_string(&tc.arguments).unwrap_or_default();
+                                f(&tc.name, &args_str)
+                            })
                         }).unwrap_or(true)
                     };
 
@@ -875,7 +877,7 @@ impl AgentSession {
                 content_type: "text".to_string(),
                 text: Some("Max iteration depth reached. Try breaking your request into smaller steps.".to_string()),
             }],
-            model: Some(self.model.read().unwrap().clone()),
+            model: Some(self.model()),
             usage: None,
             stop_reason: Some("timeout".to_string()),
         }));
@@ -929,7 +931,7 @@ impl AgentSession {
         };
 
         let messages_to_summarize = &messages[..cut_index];
-        let compact_model = self.model.read().unwrap().clone();
+        let compact_model = self.model();
         let summary = compaction::generate_summary(
             &self.provider,
             &compact_model,
@@ -1089,7 +1091,7 @@ Has the assistant's output satisfied this exact condition? Reply with only YES o
         );
         let system_msg = Message::new("system", &simple_system);
         let verify_msg = Message::new("user", &verify_prompt);
-        let model_name = self.model.read().unwrap().clone();
+        let model_name = self.model();
         match self.provider.complete(&model_name, &[system_msg, verify_msg]).await {
             Ok(response) => {
                 response.trim().to_uppercase().starts_with("Y")
@@ -1101,7 +1103,9 @@ Has the assistant's output satisfied this exact condition? Reply with only YES o
     /// Set an approval callback for tool execution.
     /// Called with (tool_name, args_json) before execution. Return true to allow.
     pub fn set_approval_fn(&self, f: Option<ApprovalFn>) {
-        *self.approval_fn.write().unwrap() = f;
+        if let Ok(mut guard) = self.approval_fn.write() {
+            *guard = f;
+        }
     }
 
     pub fn provider_model_info(&self) -> ModelInfo {
@@ -1109,8 +1113,10 @@ Has the assistant's output satisfied this exact condition? Reply with only YES o
     }
 
     pub async fn get_state(&self) -> SessionState {
+        let mut info = self.provider_model_info();
+        info.id = self.model();
         SessionState {
-            model: Some(self.provider_model_info()),
+            model: Some(info),
             thinking_level: self.thinking_level.read().await.clone(),
             is_streaming: *self.is_streaming.lock().await,
             is_compacting: *self.is_compacting.lock().await,

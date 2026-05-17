@@ -46,23 +46,32 @@ impl RpcHandler {
                     )
                     .await;
                 } else {
+                    // Actually set the model on the session
+                    session.read().await.set_model(model_id.clone());
+                    let info = session.read().await.provider_model_info();
                     let data = serde_json::json!({
                         "provider": provider,
                         "id": model_id,
-                        "context_window": 128000,
-                        "reasoning": false,
+                        "context_window": info.context_window,
+                        "reasoning": info.reasoning,
                     });
                     write_success(tx, id, "set_model", Some(data)).await;
                 }
             }
             RpcCommand::CycleModel { id } => {
-                write_success::<()>(tx, id, "cycle_model", None).await;
+                // With only one provider, cycling does nothing
+                let data = serde_json::json!({
+                    "model": session.read().await.model(),
+                });
+                write_success(tx, id, "cycle_model", Some(data)).await;
             }
             RpcCommand::GetAvailableModels { id } => {
-                let info = session.read().await.provider_model_info();
+                let sess = session.read().await;
+                let info = sess.provider_model_info();
+                let current = sess.model();
                 let models = vec![serde_json::json!({
                     "provider": info.provider,
-                    "id": info.id,
+                    "id": current,
                     "context_window": info.context_window,
                     "reasoning": info.reasoning,
                 })];
