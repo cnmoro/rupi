@@ -59,7 +59,7 @@ Same event stream as RPC but reads user input interactively. Useful for debuggin
 
 ## How it works
 
-- **Tools**: bash, read, write, edit, grep, find, ls — the agent decides when to use them. YOLO mode (default): no approval needed. Add `--disable-yolo` to require user confirmation per execution.
+- **Tools**: bash, read, write, edit, grep, find, ls, search_code — the agent decides when to use them. `search_code` uses a local Model2Vec semantic code search model (potion-code-16M) to find code by natural language description — no grep patterns needed. YOLO mode (default): no approval needed. Add `--disable-yolo` to require user confirmation per execution.
 - **Write guard**: `write` refuses if the file already exists, returning an error with the exact `edit` call-shape. This prevents accidental whole-file rewrites of existing code. Use `edit` for any change to an existing file.
 - **Multi-edit**: `edit` accepts an `edits` array for batch changes in a single call. Each edit's `old_text` is matched against the **original** file content (not after other edits). Edits must not overlap.
 - **Output parser**: when the model emits tool calls inside text (fenced ` ```tool ``` blocks, `<tool_call>` tags, or bare JSON), the parser extracts and executes them as if they were native tool calls.
