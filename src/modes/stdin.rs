@@ -107,7 +107,7 @@ fn cbreak_reader(tx: tokio::sync::mpsc::UnboundedSender<String>) {
             Ok(_) => {
                 let b = byte[0];
                 match b {
-                    // ── Escape key ────────────────────────────────────
+                    // ── Escape / escape sequences (arrows, home, end, etc.) ─
                     0x1b => {
                         let now = std::time::Instant::now();
                         if now.duration_since(last_esc) < Duration::from_millis(500)
@@ -117,11 +117,15 @@ fn cbreak_reader(tx: tokio::sync::mpsc::UnboundedSender<String>) {
                             let _ = tx.send(CANCEL_LOOP_SIG.to_string());
                             esc_count = 0;
                             buf.clear();
-                        } else {
-                            esc_count += 1;
-                            // Don't add Esc to buffer, don't echo it
+                            last_esc = now;
+                            continue;
                         }
+                        esc_count = 1;
                         last_esc = now;
+                        // The escape byte is not added to buffer. Peek for more
+                        // bytes that form a complete escape sequence and consume
+                        // them silently (arrow keys, home, end, etc.)
+                        consume_escape_seq(&mut stdin);
                     }
 
                     // ── Enter ─────────────────────────────────────────
@@ -182,6 +186,44 @@ fn cbreak_reader(tx: tokio::sync::mpsc::UnboundedSender<String>) {
         }
     }
     restore_termios();
+}
+
+// ── Escape sequence consumer ──────────────────────────────────────────────
+
+#[cfg(unix)]
+fn consume_escape_seq(stdin: &mut std::io::Stdin) {
+    use std::os::unix::io::AsRawFd;
+    let fd = stdin.as_raw_fd();
+    let mut pfd = libc::pollfd { fd, events: libc::POLLIN, revents: 0 };
+    // Wait up to 50ms for the rest of the escape sequence
+    let ret = unsafe { libc::poll(&mut pfd, 1, 50) };
+    if ret <= 0 {
+        return; // timeout — lone Esc, consume nothing
+    }
+    // Read the continuation byte
+    let mut byte = [0u8; 1];
+    if stdin.read(&mut byte).ok() != Some(1) {
+        return;
+    }
+    match byte[0] {
+        b'[' => {
+            // CSI sequence (ESC [ ... ): read until terminating byte (0x40-0x7e)
+            loop {
+                let ret = unsafe { libc::poll(&mut pfd, 1, 30) };
+                if ret <= 0 { break; }
+                if stdin.read(&mut byte).ok() != Some(1) { break; }
+                if byte[0] >= 0x40 && byte[0] <= 0x7e { break; }
+            }
+        }
+        b'O' => {
+            // SS3 sequence (ESC O ...): read one more byte
+            if unsafe { libc::poll(&mut pfd, 1, 30) } > 0 {
+                let _ = stdin.read(&mut byte);
+            }
+        }
+        // Anything else (including another ESC) — consume the single byte
+        _ => {}
+    }
 }
 
 // ── Fallback line reader ───────────────────────────────────────────────────
