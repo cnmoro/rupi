@@ -456,20 +456,14 @@ impl ChatProvider for OpenAIProvider {
 
         let data: serde_json::Value = response.json().await.map_err(AgentError::Http)?;
         let msg = &data["choices"][0]["message"];
-        // Prefer content field, fall back to tool_calls name if model returned one
-        let text = msg["content"]
-            .as_str()
-            .filter(|s| !s.is_empty())
-            .or_else(|| {
-                msg["tool_calls"]
-                    .as_array()
-                    .and_then(|calls| calls.first())
-                    .and_then(|tc| tc["function"]["name"].as_str())
+        if let Some(content) = msg["content"].as_str().filter(|s| !s.is_empty()) {
+            Ok(content.to_string())
+        } else {
+            Err(AgentError::Api {
+                message: "model returned tool call instead of text".to_string(),
+                status_code: 0,
             })
-            .unwrap_or("")
-            .to_string();
-
-        Ok(text)
+        }
     }
 
     fn model_info(&self) -> ModelInfo {

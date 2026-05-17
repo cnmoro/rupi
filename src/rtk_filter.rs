@@ -512,8 +512,9 @@ fn filter_cargo_build(output: &str) -> String {
     let mut crate_count = 0u32;
     let mut error_count = 0u32;
     let mut warning_count = 0u32;
-    let mut in_error = false;
-    let mut error_block = String::new();
+    let mut shown_warnings = 0u32;
+    let mut block = String::new();
+    let mut block_type: &str = "";
 
     for line in output.lines() {
         let trimmed = line.trim();
@@ -521,83 +522,85 @@ fn filter_cargo_build(output: &str) -> String {
         // Count compiled crates
         if trimmed.starts_with("Compiling ") || trimmed.starts_with("   Compiling ") {
             crate_count += 1;
-            continue; // skip Compiling lines
+            continue;
         }
         if trimmed.starts_with("Checking ") || trimmed.starts_with("   Checking ") {
             crate_count += 1;
-            continue; // skip Checking lines
+            continue;
         }
 
-        // Skip Finished, Downloading
         if trimmed.starts_with("Finished ") || trimmed.starts_with("Downloading ") || trimmed.starts_with("   Downloading") {
             continue;
         }
 
-        // Capture error blocks
         if trimmed.starts_with("error[") || trimmed.starts_with("error:") {
-            in_error = true;
-            error_block.clear();
-            error_block.push_str(line);
-            error_block.push('\n');
+            if !block.is_empty() && block_type == "error" && error_count <= 10 {
+                result.push_str(&block);
+                result.push('\n');
+            }
+            block = format!("{}\n", line);
+            block_type = "error";
             error_count += 1;
             continue;
         }
 
-        if in_error {
-            if trimmed.starts_with("error[") || trimmed.starts_with("error:") || trimmed.starts_with("warning[") || trimmed.starts_with("warning:") || trimmed.is_empty() || trimmed.starts_with("   ") {
+        if !block.is_empty() {
+            let ends = trimmed.starts_with("error[") || trimmed.starts_with("error:") || trimmed.starts_with("warning[") || trimmed.starts_with("warning:") || (trimmed.is_empty() && block.lines().count() > 1);
+            if ends {
+                if block_type == "error" && error_count <= 10 {
+                    result.push_str(&block);
+                    result.push('\n');
+                } else if block_type == "warning" && shown_warnings < 5 {
+                    result.push_str(&block);
+                    result.push('\n');
+                    shown_warnings += 1;
+                }
                 if trimmed.starts_with("error[") || trimmed.starts_with("error:") {
-                    // Flush previous error block
-                    if error_count <= 10 {
-                        result.push_str(&error_block);
-                        result.push('\n');
-                    }
-                    error_block.clear();
-                    error_block.push_str(line);
-                    error_block.push('\n');
+                    block = format!("{}\n", line);
+                    block_type = "error";
                     error_count += 1;
-                    continue;
-                }
-                if trimmed.starts_with("warning[") || trimmed.starts_with("warning:") {
-                    // End of error block
-                    if error_count <= 10 {
-                        result.push_str(&error_block);
-                        result.push('\n');
-                    }
-                    in_error = false;
+                } else if trimmed.starts_with("warning[") || trimmed.starts_with("warning:") {
+                    block = format!("{}\n", line);
+                    block_type = "warning";
                     warning_count += 1;
-                    continue;
+                } else {
+                    block.clear();
+                    block_type = "";
                 }
-                error_block.push_str(line);
-                error_block.push('\n');
                 continue;
             }
-            // Not an error continuation — flush
-            if error_count <= 10 {
-                result.push_str(&error_block);
-                result.push('\n');
-            }
-            in_error = false;
+            block.push_str(line);
+            block.push('\n');
+            continue;
         }
 
-        // Count warnings
         if trimmed.starts_with("warning[") || trimmed.starts_with("warning:") {
+            block = format!("{}\n", line);
+            block_type = "warning";
             warning_count += 1;
             continue;
         }
     }
 
-    // Flush last error block
-    if in_error && error_count <= 10 {
-        result.push_str(&error_block);
-        result.push('\n');
+    if !block.is_empty() {
+        if block_type == "error" && error_count <= 10 {
+            result.push_str(&block);
+            result.push('\n');
+        } else if block_type == "warning" && shown_warnings < 5 {
+            result.push_str(&block);
+            result.push('\n');
+            shown_warnings += 1;
+        }
     }
 
-    // Prepend summary
     let mut summary = format!("cargo build ({} crates)\n", crate_count);
     if error_count > 0 {
-        summary.push_str(&format!("{} error(s), ", error_count));
+        summary.push_str(&format!("{} error(s)", error_count));
     }
     if warning_count > 0 {
+        if error_count > 0 {
+            summary.push_str(", ");
+        }
         summary.push_str(&format!("{} warning(s)\n", warning_count));
     }
     if error_count == 0 && warning_count == 0 {
@@ -606,6 +609,9 @@ fn filter_cargo_build(output: &str) -> String {
 
     if error_count > 10 {
         summary.push_str(&format!("[+ {} more errors not shown]\n", error_count - 10));
+    }
+    if warning_count > shown_warnings {
+        summary.push_str(&format!("[+ {} more warnings not shown]\n", warning_count - shown_warnings));
     }
 
     result = summary + &result;

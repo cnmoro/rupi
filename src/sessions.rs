@@ -220,10 +220,12 @@ pub fn list_sessions() -> Result<Vec<SessionInfo>, String> {
             }
         }
 
-        let created = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs();
+        let created = std::fs::metadata(&path)
+            .and_then(|m| m.created().or_else(|_| m.modified()))
+            .ok()
+            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
 
         sessions.push(SessionInfo {
             id,
@@ -235,7 +237,7 @@ pub fn list_sessions() -> Result<Vec<SessionInfo>, String> {
         });
     }
 
-    // Sort by creation time (newest first based on file modification time)
+    // Sort by creation time (newest first)
     sessions.sort_by(|a, b| b.created_at.cmp(&a.created_at));
     Ok(sessions)
 }

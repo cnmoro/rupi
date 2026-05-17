@@ -104,9 +104,9 @@ pub fn build_correction_message(issue: &QualityIssue) -> String {
         }
         QualityIssue::Hallucinated(name) => {
             format!(
-                "Your previous response included a call to tool '{}', which is not a valid tool. \
-                 Available tools are: bash, read, write, edit, grep, find, ls. \
-                 Please re-issue your response using only these tools.",
+                 "Your previous response included a call to tool '{}', which is not a valid tool. \
+                  Available tools are: bash, read, write, edit, grep, find, ls, search_code. \
+                  Please re-issue your response using only these tools.",
                 name
             )
         }
@@ -123,7 +123,7 @@ pub fn build_correction_message(issue: &QualityIssue) -> String {
 }
 
 pub fn known_tool_names() -> Vec<&'static str> {
-    vec!["bash", "read", "write", "edit", "grep", "find", "ls"]
+    vec!["bash", "read", "write", "edit", "grep", "find", "ls", "search_code"]
 }
 
 #[cfg(test)]
@@ -220,6 +220,7 @@ mod tests {
         let names = known_tool_names();
         assert!(names.contains(&"bash"));
         assert!(names.contains(&"edit"));
-        assert_eq!(names.len(), 7);
+        assert!(names.contains(&"search_code"));
+        assert_eq!(names.len(), 8);
     }
 }
