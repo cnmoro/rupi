@@ -642,14 +642,13 @@ impl AgentSession {
             let abort_now = {
                 let signal = self.abort_signal.lock().await;
                 if let Some(ref tx) = *signal {
-                    if *tx.borrow() {
-                        true
-                    } else {
-                        false
-                    }
+                    *tx.borrow()
                 } else {
                     // Signal is None — check the persistent flag (abort was called between iterations)
-                    *self.abort_requested.lock().await
+                    let requested = *self.abort_requested.lock().await;
+                    // Reset the flag so subsequent iterations aren't cancelled too
+                    *self.abort_requested.lock().await = false;
+                    requested
                 }
             };
             if abort_now {
