@@ -1,5 +1,4 @@
 use std::sync::Arc;
-use tokio::sync::Mutex;
 
 use rupi::agent::session::{self as agent_session, ApprovalFn, AgentSession};
 use rupi::cli::Cli;
@@ -226,12 +225,11 @@ async fn run_interactive_mode(
         .unwrap_or_default()
         .to_string_lossy()
         .to_string();
-    let session = Arc::new(Mutex::new(
+    let session = Arc::new(
         resolve_session(&config, session_id, &cwd, &skills, &context_files, memory).await,
-    ));
+    );
 
     if disable_yolo {
-        let sess = session.lock().await;
         use std::io::Write;
         let approval: ApprovalFn = Arc::new(|tool_name: &str, args: &str| {
             let mut line = String::new();
@@ -244,7 +242,7 @@ async fn run_interactive_mode(
                 Err(_) => false,
             }
         });
-        sess.set_approval_fn(Some(approval)).await;
+        session.set_approval_fn(Some(approval)).await;
     }
 
     rupi::modes::interactive::run_interactive(session).await;
@@ -260,9 +258,9 @@ async fn run_raw_mode(
         .unwrap_or_default()
         .to_string_lossy()
         .to_string();
-    let session = Arc::new(Mutex::new(
+    let session = Arc::new(
         resolve_session(&config, session_id, &cwd, &skills, &context_files, false).await,
-    ));
+    );
     rupi::modes::raw::run_raw(session).await;
 }
 
