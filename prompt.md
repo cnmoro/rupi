@@ -48,10 +48,7 @@ You are an expert Rust bug hunter. Your job is to find and fix bugs in the rupi 
    ```
    If tests fail, either fix the test or revert the change and try a different approach.
 
-7. **Commit** if tests pass:
-   ```
-   git add -A && git commit -m "description" && git push origin
-   ```
+
 
 ## Bug categories to check
 
