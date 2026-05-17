@@ -940,13 +940,12 @@ impl AgentSession {
         // Use role "user" (not "system") because OpenAI-compatible endpoints
         // expect at most one system message — the one built fresh each turn.
         // Relies on the summary's ## Goal section to retain the task objective.
+        let summary_msg = Message::new("user", &format!("[Compacted conversation history]\n{}", summary));
+        self.persist_message(&summary_msg).await;
         let mut all_messages = self.messages.write().await;
         let keep: Vec<Message> = all_messages[cut_index..].to_vec();
         *all_messages = keep;
-        all_messages.insert(
-            0,
-            Message::new("user", &format!("[Compacted conversation history]\n{}", summary)),
-        );
+        all_messages.insert(0, summary_msg);
 
         {
             let mut compacting = self.is_compacting.lock().await;
@@ -1051,12 +1050,20 @@ impl AgentSession {
     /// Returns true if the model confirms the goal is met.
     async fn verify_goal(&self, goal: &str) -> bool {
         // Include recent conversation so the model can actually check the assistant's output.
+        // Truncate long tool results to avoid overflowing the verify context window.
         let msgs = self.messages.read().await.clone();
         let last_few: String = msgs
             .iter()
             .rev()
             .take(6)
-            .map(|m| format!("<{}>\n{}\n</{}>", m.role.to_uppercase(), m.content, m.role.to_uppercase()))
+            .map(|m| {
+                let content = if m.content.len() > 1000 {
+                    format!("{}... [truncated: {} chars]", &m.content[..1000], m.content.len())
+                } else {
+                    m.content.clone()
+                };
+                format!("<{}>\n{}\n</{}>", m.role.to_uppercase(), content, m.role.to_uppercase())
+            })
             .collect::<Vec<_>>()
             .join("\n");
 
