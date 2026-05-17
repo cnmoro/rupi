@@ -489,16 +489,12 @@ fn filter_cargo_test(output: &str) -> String {
         }
     }
 
-    // If only summary, prepend a notice
-    if has_summary && failure_count == 0 {
-        let counts = format!("cargo test: {} passed, {} failed",
-            passed, failed);
-        let s = if passed > 0 && failed == 0 {
-            " [savings: ~90%]"
-        } else {
-            ""
-        };
-        result = format!("{}{}", counts, s);
+    // If all passed and result is just the summary (no failures), add savings note
+    if has_summary && failure_count == 0 && passed > 0 && failed == 0 {
+        if !result.is_empty() && !result.ends_with('\n') {
+            result.push('\n');
+        }
+        result.push_str("[savings: ~90%]\n");
     }
 
     if result.is_empty() {
