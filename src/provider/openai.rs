@@ -269,6 +269,8 @@ impl ChatProvider for OpenAIProvider {
             let mut tool_calls: Vec<AccumulatedToolCall> = Vec::new();
             let mut finish_reason: Option<String> = None;
             let mut stream = response.bytes_stream();
+            // SSE reassembly buffer: accumulates partial lines across chunk boundaries
+            let mut sse_buf = String::new();
 
             loop {
                 tokio::select! {
@@ -282,11 +284,16 @@ impl ChatProvider for OpenAIProvider {
                     chunk_result = stream.next() => {
                         match chunk_result {
                             Some(Ok(bytes)) => {
-                                let text = String::from_utf8_lossy(&bytes);
-                                for line in text.lines() {
-                                    let line = line.trim();
+                                sse_buf.push_str(&String::from_utf8_lossy(&bytes));
+                                // Process complete lines from the buffer
+                                loop {
+                                    let line_end = match sse_buf.find('\n') {
+                                        Some(pos) => pos,
+                                        None => break, // wait for more data
+                                    };
+                                    let line = sse_buf[..line_end].trim().to_string();
+                                    sse_buf.drain(..=line_end);
                                     if line.is_empty() || line.starts_with(':') {
-                                        // Skip empty lines and SSE comments
                                         continue;
                                     }
                                     if line == "data: [DONE]" || line == "data:[DONE]" {

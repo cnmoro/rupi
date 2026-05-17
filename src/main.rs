@@ -43,7 +43,9 @@ async fn main() {
     });
 
     let base_url = cli.base_url.as_deref().unwrap_or(&file_config.base_url);
-    let api_key = cli.api_key.as_deref().unwrap_or(&file_config.api_key);
+    let api_key = rupi::auth::resolve_api_key(
+        cli.api_key.as_deref().unwrap_or(&file_config.api_key)
+    );
     let model = cli.model.as_deref().unwrap_or(&file_config.model_tag);
 
     if base_url.is_empty() || api_key.is_empty() || model.is_empty() {
