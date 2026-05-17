@@ -36,6 +36,8 @@ This uses opencode.ai's API directly — no separate base URL or model tag neede
 - **Opencode Go** (`"opencode_provider": "go"`, default) — `https://opencode.ai/zen/go/v1`. Models: deepseek-v4-flash, deepseek-v4-pro, kimi-k2.5, minimax-m2.7, glm-5, mimo-v2.5-pro.
 - **Opencode Zen** (`"opencode_provider": "zen"`) — `https://opencode.ai/zen/v1`. Models: gpt-5.1-codex-max, claude-sonnet-4-6, gemini-3.1-pro, gpt-5-nano, claude-haiku-4-5.
 
+Default model is `deepseek-v4-flash` for both providers. Override with `--model` or set `model_tag` in config.
+
 List available models with:
 
 ```

@@ -81,11 +81,8 @@ async fn main() {
     };
 
     let model = if file_config.opencode_api_key.is_some() {
-        // Default model for opencode: deepseek-v4-flash for Go, gpt-5-nano for Zen
-        match file_config.opencode_provider.as_deref() {
-            Some("zen") => "gpt-5-nano",
-            _ => cli.model.as_deref().unwrap_or("deepseek-v4-flash"),
-        }
+        // Default to deepseek-v4-flash for both Go and Zen
+        cli.model.as_deref().unwrap_or("deepseek-v4-flash")
     } else {
         cli.model.as_deref().unwrap_or(&file_config.model_tag)
     };
