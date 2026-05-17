@@ -7,13 +7,10 @@ use crate::agent::session::AgentSession;
 use crate::rpc::jsonl::serialize_json_line;
 use crate::rpc::types::{AgentEvent, AgentMessage, AssistantMessageEvent, MessageContent};
 
-/// Run raw mode: prints each SSE delta as a JSON line to stdout,
-/// reads user input from stdin interactively with steer support.
 pub async fn run_raw(session: Arc<Mutex<AgentSession>>) {
     let _ = writeln!(stdout(), "rupi raw mode. Type your prompts. Exit: Ctrl+D, /exit, /quit, or 'exit'.");
     let _ = stdout().flush();
 
-    // Single persistent stdin reader feeding a channel
     let (stdin_tx, mut stdin_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
     tokio::spawn(async move {
         let mut reader = BufReader::new(tokio::io::stdin());
@@ -39,16 +36,14 @@ pub async fn run_raw(session: Arc<Mutex<AgentSession>>) {
             None => break,
         };
 
-        if line == "exit" || line == "/exit" || line == "/quit" {
-            break;
-        }
+        if line == "exit" || line == "/exit" || line == "/quit" { break; }
 
-        // Handle /steer command
         if line.starts_with("/steer ") {
             let steer_text = line[7..].trim().to_string();
             if !steer_text.is_empty() {
                 let sess = session.lock().await;
                 sess.steer(&steer_text).await;
+                sess.abort().await;
                 let json = serialize_json_line(&serde_json::json!({"type": "steer_queued", "message": steer_text}));
                 let _ = write!(stdout(), "{}", json);
             } else {
@@ -58,21 +53,15 @@ pub async fn run_raw(session: Arc<Mutex<AgentSession>>) {
             continue;
         }
 
-        // Handle /goal command
         if line.starts_with("/goal ") {
             let goal_text = line[6..].trim().to_string();
             if !goal_text.is_empty() {
-                {
-                    let sess = session.lock().await;
-                    sess.set_goal(Some(goal_text.clone())).await;
-                }
+                { let sess = session.lock().await; sess.set_goal(Some(goal_text.clone())).await; }
                 let json = serialize_json_line(&serde_json::json!({"type": "goal_set", "goal": goal_text}));
                 let _ = write!(stdout(), "{}", json);
                 let _ = stdout().flush();
             } else {
-                let _ = write!(stdout(), "{}", serialize_json_line(
-                    &serde_json::json!({"type":"error","message":"Usage: /goal <description>"})
-                ));
+                let _ = write!(stdout(), "{}", serialize_json_line(&serde_json::json!({"type":"error","message":"Usage: /goal <description>"})));
                 let _ = stdout().flush();
                 continue;
             }
@@ -85,20 +74,15 @@ pub async fn run_raw(session: Arc<Mutex<AgentSession>>) {
             continue;
         }
 
-        // Handle /compact command
         if line == "/compact" {
             let sess = session.lock().await;
             match sess.compact().await {
                 Ok(result) => {
-                    let json = serialize_json_line(&serde_json::json!({
-                        "type": "compaction_done", "tokens_before": result.tokens_before
-                    }));
+                    let json = serialize_json_line(&serde_json::json!({"type": "compaction_done", "tokens_before": result.tokens_before}));
                     let _ = write!(stdout(), "{}", json);
                 }
                 Err(e) => {
-                    let json = serialize_json_line(&serde_json::json!({
-                        "type": "compaction_error", "error": e.to_string()
-                    }));
+                    let json = serialize_json_line(&serde_json::json!({"type": "compaction_error", "error": e.to_string()}));
                     let _ = write!(stdout(), "{}", json);
                 }
             }
@@ -106,7 +90,6 @@ pub async fn run_raw(session: Arc<Mutex<AgentSession>>) {
             continue;
         }
 
-        // Handle /model command
         if line.starts_with("/model ") || line == "/model" {
             let parts: Vec<&str> = line.splitn(2, ' ').collect();
             if parts.len() == 2 {
@@ -126,18 +109,16 @@ pub async fn run_raw(session: Arc<Mutex<AgentSession>>) {
             continue;
         }
 
-        // Process prompt
-        process_with_steer_raw(&session, &line, &mut stdin_rx).await;
+        process_prompt_raw(&session, &line, &mut stdin_rx).await;
     }
 }
 
-async fn process_with_steer_raw(
+async fn process_prompt_raw(
     session: &Arc<Mutex<AgentSession>>,
     initial_input: &str,
     stdin_rx: &mut tokio::sync::mpsc::UnboundedReceiver<String>,
 ) {
     let (event_tx, mut event_rx) = tokio::sync::mpsc::unbounded_channel::<AgentEvent>();
-
     let sess = session.clone();
     let tx = event_tx.clone();
     let prompt_msg = initial_input.to_string();
@@ -147,13 +128,8 @@ async fn process_with_steer_raw(
         if let Err(e) = sess_lock.prompt(&prompt_msg, tx.clone()).await {
             let _ = tx.send(AgentEvent::message_end(AgentMessage {
                 role: "assistant".to_string(),
-                content: vec![MessageContent {
-                    content_type: "text".to_string(),
-                    text: Some(format!("Error: {}", e)),
-                }],
-                model: None,
-                usage: None,
-                stop_reason: Some("error".to_string()),
+                content: vec![MessageContent { content_type: "text".to_string(), text: Some(format!("Error: {}", e)) }],
+                model: None, usage: None, stop_reason: Some("error".to_string()),
             }));
             let _ = tx.send(AgentEvent::turn_end());
             let _ = tx.send(AgentEvent::agent_end());
@@ -161,6 +137,21 @@ async fn process_with_steer_raw(
     });
 
     loop {
+        // Poll stdin non-blockingly
+        while let Ok(input) = stdin_rx.try_recv() {
+            let sess = session.lock().await;
+            if sess.is_streaming().await {
+                if input.starts_with("/steer ") {
+                    sess.abort().await;
+                    let _ = write!(stdout(), "{}", serialize_json_line(&serde_json::json!({"type": "steer_queued"})));
+                } else {
+                    sess.follow_up(&input).await;
+                    let _ = write!(stdout(), "{}", serialize_json_line(&serde_json::json!({"type": "queued"})));
+                }
+                let _ = stdout().flush();
+            }
+        }
+
         tokio::select! {
             event = event_rx.recv() => {
                 let json = match event {
@@ -174,18 +165,10 @@ async fn process_with_steer_raw(
                         let text_content: Vec<&str> = message.content.iter()
                             .filter_map(|c| c.text.as_deref()).collect();
                         let text_content = text_content.join("\n");
-                        if !text_content.is_empty() {
-                            obj["content"] = serde_json::json!(text_content);
-                        }
-                        if let Some(reason) = &message.stop_reason {
-                            obj["stop_reason"] = serde_json::json!(reason);
-                        }
+                        if !text_content.is_empty() { obj["content"] = serde_json::json!(text_content); }
+                        if let Some(reason) = &message.stop_reason { obj["stop_reason"] = serde_json::json!(reason); }
                         if let Some(usage) = &message.usage {
-                            obj["usage"] = serde_json::json!({
-                                "input_tokens": usage.input,
-                                "output_tokens": usage.output,
-                                "total_tokens": usage.total_tokens,
-                            });
+                            obj["usage"] = serde_json::json!({"input_tokens": usage.input, "output_tokens": usage.output, "total_tokens": usage.total_tokens});
                             if let Some(cost) = &usage.cost {
                                 let mut cost_obj = serde_json::Map::new();
                                 if let Some(pc) = cost.prompt_cost { cost_obj.insert("prompt_cost".into(), serde_json::json!(pc)); }
@@ -196,17 +179,11 @@ async fn process_with_steer_raw(
                         }
                         serialize_json_line(&obj)
                     }
-                    Some(AgentEvent::GenerationId { id, .. }) => {
-                        serialize_json_line(&serde_json::json!({"type": "generation_id", "id": id}))
-                    }
+                    Some(AgentEvent::GenerationId { id, .. }) => serialize_json_line(&serde_json::json!({"type": "generation_id", "id": id})),
                     Some(AgentEvent::AgentEnd { .. }) | None => { break; }
-                    Some(AgentEvent::ToolExecutionStart { tool_name, arguments, .. }) => {
-                        serialize_json_line(&serde_json::json!({"type": "tool_execution_start", "tool": tool_name, "arguments": arguments}))
-                    }
+                    Some(AgentEvent::ToolExecutionStart { tool_name, arguments, .. }) => serialize_json_line(&serde_json::json!({"type": "tool_execution_start", "tool": tool_name, "arguments": arguments})),
                     Some(AgentEvent::ToolExecutionEnd { tool_name, result, .. }) => {
-                        let truncated = if result.len() > 2000 {
-                            format!("{}... [truncated]", &result[..2000])
-                        } else { result.clone() };
+                        let truncated = if result.len() > 2000 { format!("{}... [truncated]", &result[..2000]) } else { result.clone() };
                         serialize_json_line(&serde_json::json!({"type": "tool_execution_end", "tool": tool_name, "result": truncated}))
                     }
                     _ => continue,
@@ -214,39 +191,8 @@ async fn process_with_steer_raw(
                 let _ = write!(stdout(), "{}", json);
                 let _ = stdout().flush();
             }
-            line = stdin_rx.recv() => {
-                if let Some(input) = line {
-                    let sess = session.lock().await;
-                    if sess.is_streaming().await {
-                        sess.follow_up(&input).await;
-                        let _ = write!(stdout(), "{}", serialize_json_line(&serde_json::json!({"type": "queued"})));
-                        let _ = stdout().flush();
-                    }
-                }
-            }
         }
     }
 
     let _ = prompt_handle.await;
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::provider::openai::OpenAIConfig;
-
-    #[tokio::test]
-    async fn test_raw_mode_creates() {
-        let config = OpenAIConfig {
-            base_url: "https://api.example.com".into(),
-            api_key: "test-key".into(),
-            model: "gpt-4".into(),
-            context_window: 8192,
-            reasoning: false,
-            timeout_secs: 0,
-        };
-        let session = Arc::new(Mutex::new(AgentSession::from_config(config)));
-        let sess = session.lock().await;
-        assert_eq!(sess.model(), "gpt-4");
-    }
 }

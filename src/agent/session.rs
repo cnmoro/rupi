@@ -448,11 +448,16 @@ impl AgentSession {
                 }
             });
 
-            loop {
+            let max_goal_iterations: u32 = 5;
+            for goal_iter in 0..max_goal_iterations {
                 let _ = self.run_tool_loop(wrapped_tx.clone()).await;
 
                 if self.verify_goal(&g).await {
                     break;
+                }
+
+                if goal_iter == max_goal_iterations - 1 {
+                    break; // Last iteration, don't nudge
                 }
 
                 let nudge_text = format!("Continue working toward the goal. The goal is: {}. Do not stop until this goal is fully achieved. What is your next step?", g);
@@ -1043,15 +1048,27 @@ impl AgentSession {
     /// Verify whether the current goal has been achieved by asking the model.
     /// Returns true if the model confirms the goal is met.
     async fn verify_goal(&self, goal: &str) -> bool {
+        // Include recent conversation so the model can actually check the assistant's output.
+        let msgs = self.messages.read().await.clone();
+        let last_few: String = msgs
+            .iter()
+            .rev()
+            .take(6)
+            .map(|m| format!("<{}>\n{}\n</{}>", m.role.to_uppercase(), m.content, m.role.to_uppercase()))
+            .collect::<Vec<_>>()
+            .join("\n");
+
         let verify_prompt = format!(
             "You are verifying whether a specific CONDITION has been met.
-Read the EXACT GOAL below and check ONLY the assistant's last response.
-Do NOT consider whether the user's request was fulfilled — only check the assistant's output against the exact goal text.
+Read the EXACT GOAL below and check the assistant's most recent response(s) in the conversation shown.
 
-GOAL (check assistant output for this): {}
+GOAL: {}
+
+CONVERSATION (most recent first):
+{}
 
 Has the assistant's output satisfied this exact condition? Reply with only YES or NO.",
-            goal
+            goal, last_few
         );
 
         let system_msg = Message::new("system", &build_system_prompt(&[], &[], self.memory_enabled));
