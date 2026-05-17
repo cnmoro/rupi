@@ -127,26 +127,26 @@ impl RpcHandler {
                 let session = session.clone();
                 let tx = output_tx.clone();
                 tokio::spawn(async move {
-                    handle_async_prompt(session, tx, id, &message).await;
+                    handle_async_prompt(session, tx, id, &message, "prompt").await;
                 });
             }
             RpcCommand::Steer { id, message, .. } => {
                 let session = session.clone();
                 let tx = output_tx.clone();
                 tokio::spawn(async move {
-                    handle_async_prompt(session, tx, id, &message).await;
+                    handle_async_prompt(session, tx, id, &message, "steer").await;
                 });
-            }
-            RpcCommand::ListSessions { id } => {
-                let sessions = crate::sessions::list_sessions().unwrap_or_default();
-                write_success(tx, id, "list_sessions", Some(serde_json::json!({ "sessions": sessions }))).await;
             }
             RpcCommand::FollowUp { id, message, .. } => {
                 let session = session.clone();
                 let tx = output_tx.clone();
                 tokio::spawn(async move {
-                    handle_async_prompt(session, tx, id, &message).await;
+                    handle_async_prompt(session, tx, id, &message, "follow_up").await;
                 });
+            }
+            RpcCommand::ListSessions { id } => {
+                let sessions = crate::sessions::list_sessions().unwrap_or_default();
+                write_success(tx, id, "list_sessions", Some(serde_json::json!({ "sessions": sessions }))).await;
             }
         }
     }
@@ -158,9 +158,10 @@ async fn handle_async_prompt(
     tx: mpsc::UnboundedSender<String>,
     id: Option<String>,
     message: &str,
+    command_name: &str,
 ) {
     // Send immediate success response
-    let resp = RpcResponse::success(id.clone(), "prompt", None);
+    let resp = RpcResponse::success(id.clone(), command_name, None);
     let _ = tx.send(resp.to_json_line());
 
     let (event_tx, mut event_rx) = mpsc::unbounded_channel::<AgentEvent>();

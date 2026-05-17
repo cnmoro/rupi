@@ -385,6 +385,11 @@ impl AgentSession {
         *self.message_count.write().await = 0;
         self.recent_tool_calls.write().await.clear();
         *self.consecutive_quality_issues.write().await = 0;
+        self.pending_steer.write().await.clear();
+        self.pending_follow_up.write().await.clear();
+        self.set_goal(None).await;
+        *self.auto_compaction_enabled.write().await = true;
+        *self.thinking_level.write().await = "off".to_string();
         let new_path = sessions::create_session(&self.model()).ok();
         *self.session_path.write().await = new_path;
     }
