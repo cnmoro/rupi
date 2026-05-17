@@ -10,10 +10,20 @@ pub const EOF_SIG: &str = "\x04";
 /// Uses rustyline for proper handling of arrows, home, end, etc.
 /// Returns `None` on EOF/Ctrl+D.
 pub fn read_line_edited(prompt: &str) -> Option<String> {
-    let mut rl = match rustyline::DefaultEditor::new() {
+    use rustyline::{Cmd, DefaultEditor, KeyCode, KeyEvent, Modifiers};
+
+    let config = rustyline::config::Builder::new()
+        .build();
+    let mut rl = match DefaultEditor::with_config(config) {
         Ok(rl) => rl,
         Err(_) => return None,
     };
+    // Bind Alt+Enter to insert a newline
+    rl.bind_sequence(
+        KeyEvent(KeyCode::Enter, Modifiers::ALT),
+        Cmd::Newline,
+    );
+
     match rl.readline(prompt) {
         Ok(line) => {
             if line.is_empty() {

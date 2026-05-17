@@ -8,7 +8,7 @@ use crate::rpc::types::{AgentEvent, AgentMessage, AssistantMessageEvent, Message
 /// Run the interactive REPL mode with concurrent stdin + event reading.
 /// While the agent generates output, the prompt stays active for steer/follow-up.
 pub async fn run_interactive(session: Arc<AgentSession>) {
-    let _ = writeln!(stdout(), "rupi interactive mode. Type your prompts. Exit: Ctrl+D, /exit, /quit, or 'exit'. Double-Esc to cancel loop.");
+    let _ = writeln!(stdout(), "rupi interactive mode. Type your prompts. Enter to submit, Alt+Enter for multi-line. Exit: Ctrl+D, /exit, /quit, or 'exit'. Double-Esc to cancel loop.");
     let _ = stdout().flush();
 
     // Inline helper to run interact_text on a blocking thread
