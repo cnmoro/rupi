@@ -6,27 +6,31 @@ pub const CANCEL_LOOP_SIG: &str = "\x1b\x1b";
 /// A special string sent when Ctrl+D (EOF) is pressed.
 pub const EOF_SIG: &str = "\x04";
 
-/// Read a line from the terminal with full editing (arrows, home, end, etc.).
-/// Uses dialoguer which provides a full readline-like experience.
+/// Read a line from the terminal with full readline editing.
+/// Uses rustyline for proper handling of arrows, home, end, etc.
 /// Returns `None` on EOF/Ctrl+D.
 pub fn read_line_edited(prompt: &str) -> Option<String> {
-    use dialoguer::Input;
-    let line: String = Input::new()
-        .with_prompt(prompt)
-        .allow_empty(true)
-        .interact_text()
-        .ok()?;
-    if line.is_empty() {
-        None
-    } else {
-        Some(line)
+    let mut rl = match rustyline::DefaultEditor::new() {
+        Ok(rl) => rl,
+        Err(_) => return None,
+    };
+    match rl.readline(prompt) {
+        Ok(line) => {
+            if line.is_empty() {
+                None
+            } else {
+                Some(line)
+            }
+        }
+        Err(rustyline::error::ReadlineError::Eof) => None,
+        Err(rustyline::error::ReadlineError::Interrupted) => None,
+        Err(_) => None,
     }
 }
 
 /// Spawn a temporary stdin reader for the duration of streaming.
 /// Reads bytes one at a time, sends complete lines through the channel,
 /// and detects double-Esc for loop cancellation.
-/// The thread exits when `stop` becomes true or stdin reaches EOF.
 pub fn spawn_streaming_reader(
     tx: tokio::sync::mpsc::UnboundedSender<String>,
     stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
@@ -42,9 +46,6 @@ pub fn spawn_streaming_reader(
                 break;
             }
             let mut byte = [0u8; 1];
-            // Use a blocking read with 100ms timeout via polling
-            // Actually, just block — if the thread blocks, it'll be woken by
-            // incoming data and check the stop flag on each iteration.
             match stdin.read(&mut byte) {
                 Ok(0) => {
                     let _ = tx.send(EOF_SIG.to_string());
@@ -66,7 +67,6 @@ pub fn spawn_streaming_reader(
                             }
                             esc_count += 1;
                             last_esc = now;
-                            // Not a double-Esc — consume the escape sequence
                             let _ = read_escape_seq(&stdin);
                         }
                         b'\n' | b'\r' => {
@@ -98,10 +98,6 @@ pub fn spawn_streaming_reader(
     });
 }
 
-/// Read and discard a terminal escape sequence following ESC.
-/// CSI sequences start with `[` and end with a byte in 0x40-0x7e.
-/// SS3 sequences start with `O` and are 1 more byte.
-/// Single bytes (e.g. lone `[`) are consumed as-is.
 fn read_escape_seq(stdin: &std::io::Stdin) -> std::io::Result<()> {
     let mut byte = [0u8; 1];
     let mut handle = stdin.lock();
