@@ -285,13 +285,18 @@ impl ChatProvider for OpenAIProvider {
                                 let text = String::from_utf8_lossy(&bytes);
                                 for line in text.lines() {
                                     let line = line.trim();
-                                    if line.is_empty() {
+                                    if line.is_empty() || line.starts_with(':') {
+                                        // Skip empty lines and SSE comments
                                         continue;
                                     }
-                                    if line == "data: [DONE]" {
+                                    if line == "data: [DONE]" || line == "data:[DONE]" {
                                         break;
                                     }
-                                    if let Some(data) = line.strip_prefix("data: ") {
+                                    // Handle both "data: " and "data:" prefixes
+                                    let data = line.strip_prefix("data: ")
+                                        .or_else(|| line.strip_prefix("data:"))
+                                        .unwrap_or("");
+                                    if !data.is_empty() {
                                         match serde_json::from_str::<ChatChunk>(data) {
                                             Ok(chunk) => {
                                                 if let Some(usage) = chunk.usage {
