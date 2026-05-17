@@ -252,12 +252,23 @@ async fn process_prompt(
                         }
                         let _ = stdout().flush();
                     }
-                    Some(AgentEvent::ToolExecutionStart { tool_name, .. }) => {
-                        let _ = writeln!(stdout(), "\n[Tool: {}]", tool_name);
+                    Some(AgentEvent::ToolExecutionStart { tool_name, arguments, .. }) => {
+                        let args_str = serde_json::to_string(&arguments).unwrap_or_default();
+                        let cmd = if args_str.len() > 120 {
+                            format!("{}...", &args_str[..117])
+                        } else {
+                            args_str
+                        };
+                        let _ = writeln!(stdout(), "\n[Tool: {} {}]", tool_name, cmd);
                         let _ = stdout().flush();
                     }
-                    Some(AgentEvent::ToolExecutionEnd { tool_name, .. }) => {
-                        let _ = writeln!(stdout(), "[{} completed]", tool_name);
+                    Some(AgentEvent::ToolExecutionEnd { tool_name, result, .. }) => {
+                        let truncated = if result.len() > 800 {
+                            format!("{}...\n[+ {} more chars]", &result[..797], result.len() - 797)
+                        } else {
+                            result.clone()
+                        };
+                        let _ = writeln!(stdout(), "[{} completed]\n---\n{}\n---", tool_name, truncated);
                         let _ = stdout().flush();
                     }
                     Some(AgentEvent::AgentEnd { .. }) | None => {
