@@ -20,13 +20,11 @@ dirs = "5"
 chrono = { version = "0.4", features = ["serde"] }
 regex = "1"
 anyhow = "1"
-libc = "0.2"
 half = "2"
 ndarray = "0.15"
 safetensors = "0.5"
 tokenizers = "0.21"
 model2vec-rs = "0.2"
-
 
 [dev-dependencies]
 mockito = "1"
