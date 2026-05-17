@@ -7,6 +7,7 @@ use rupi::config::RupiConfig;
 use rupi::provider::openai::OpenAIConfig;
 use rupi::rpc::handler::RpcHandler;
 use rupi::rpc::types::RpcCommand;
+use rupi::sessions;
 use rupi::skills;
 use rupi::skills::Skill;
 
@@ -72,24 +73,54 @@ async fn main() {
     let context_files = agent_session::load_context_files(&cwd);
 
     let memory = cli.memory;
+    let session_id = cli.session.as_deref();
 
     match cli.mode() {
-        "rpc" => run_rpc_mode(openai_config, loaded_skills, context_files).await,
-        "raw" => run_raw_mode(openai_config, loaded_skills, context_files).await,
-        _ => run_interactive_mode(openai_config, loaded_skills, context_files, cli.disable_yolo, memory).await,
+        "rpc" => run_rpc_mode(openai_config, loaded_skills, context_files, session_id).await,
+        "raw" => run_raw_mode(openai_config, loaded_skills, context_files, session_id).await,
+        _ => run_interactive_mode(openai_config, loaded_skills, context_files, cli.disable_yolo, memory, session_id).await,
     }
+}
+
+async fn resolve_session(
+    config: &OpenAIConfig,
+    session_id: Option<&str>,
+    cwd: &str,
+    skills: &[Skill],
+    context_files: &[agent_session::ContextFile],
+    memory: bool,
+) -> AgentSession {
+    if let Some(sid) = session_id {
+        let sid = sid.trim();
+        if !sid.is_empty() {
+            if let Some(path) = sessions::find_session_path(sid) {
+                eprintln!("rupi: resuming session {}", sid);
+                match AgentSession::from_session(
+                    config.clone(), path, cwd.to_string(),
+                    skills.to_vec(), context_files.to_vec(), memory,
+                ).await {
+                    Ok(session) => return session,
+                    Err(e) => eprintln!("rupi: failed to resume session: {}", e),
+                }
+            } else {
+                eprintln!("rupi: session '{}' not found, starting fresh", sid);
+            }
+        }
+    }
+    AgentSession::from_config_with(config.clone(), cwd.to_string(), skills.to_vec(), context_files.to_vec(), memory)
 }
 
 async fn run_rpc_mode(
     config: OpenAIConfig,
     skills: Vec<Skill>,
     context_files: Vec<agent_session::ContextFile>,
+    session_id: Option<&str>,
 ) {
     let cwd = std::env::current_dir()
         .unwrap_or_default()
         .to_string_lossy()
         .to_string();
-    let session = AgentSession::from_config_with(config, cwd, skills, context_files, false);
+    let session = resolve_session(&config, session_id, &cwd, &skills, &context_files, false).await;
     let handler = RpcHandler::new(session);
 
     let (output_tx, mut output_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
@@ -141,14 +172,15 @@ async fn run_interactive_mode(
     context_files: Vec<agent_session::ContextFile>,
     disable_yolo: bool,
     memory: bool,
+    session_id: Option<&str>,
 ) {
     let cwd = std::env::current_dir()
         .unwrap_or_default()
         .to_string_lossy()
         .to_string();
-    let session = Arc::new(Mutex::new(AgentSession::from_config_with(
-        config, cwd, skills, context_files, memory,
-    )));
+    let session = Arc::new(Mutex::new(
+        resolve_session(&config, session_id, &cwd, &skills, &context_files, memory).await,
+    ));
 
     if disable_yolo {
         let sess = session.lock().await;
@@ -174,14 +206,15 @@ async fn run_raw_mode(
     config: OpenAIConfig,
     skills: Vec<Skill>,
     context_files: Vec<agent_session::ContextFile>,
+    session_id: Option<&str>,
 ) {
     let cwd = std::env::current_dir()
         .unwrap_or_default()
         .to_string_lossy()
         .to_string();
-    let session = Arc::new(Mutex::new(AgentSession::from_config_with(
-        config, cwd, skills, context_files, false,
-    )));
+    let session = Arc::new(Mutex::new(
+        resolve_session(&config, session_id, &cwd, &skills, &context_files, false).await,
+    ));
     rupi::modes::raw::run_raw(session).await;
 }
 

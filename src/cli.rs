@@ -43,6 +43,10 @@ pub struct Cli {
     /// Run in raw mode (print SSE chunks as JSON lines to stdout)
     #[arg(long)]
     pub raw: bool,
+
+    /// Resume a session by ID (loads ~/.config/rupi_sessions/<ID>.jsonl)
+    #[arg(long)]
+    pub session: Option<String>,
 }
 
 impl Cli {

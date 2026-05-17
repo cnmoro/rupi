@@ -280,6 +280,34 @@ impl AgentSession {
         session
     }
 
+    /// Resume a session from an existing session file.
+    /// Loads all messages from the file and reuses it for further appends.
+    pub async fn from_session(
+        config: OpenAIConfig,
+        session_path: std::path::PathBuf,
+        cwd: String,
+        skills: Vec<Skill>,
+        context_files: Vec<ContextFile>,
+        memory_enabled: bool,
+    ) -> Result<Self, String> {
+        let messages = crate::sessions::load_session(&session_path)?;
+        let context_window = config.context_window;
+        let model = config.model.clone();
+        let provider = Arc::new(OpenAIProvider::new(config));
+        let mut session = Self::new(provider as Arc<dyn ChatProvider>, model, context_window, cwd, skills, context_files);
+        session.memory_enabled = memory_enabled;
+        if memory_enabled {
+            ensure_memory_file();
+        }
+        // Load existing messages into the session
+        for msg in &messages {
+            session.messages.write().await.push(msg.clone());
+        }
+        *session.message_count.write().await = messages.len() as u64;
+        *session.session_path.write().await = Some(session_path);
+        Ok(session)
+    }
+
     /// Get the session file path, if any.
     pub async fn session_path(&self) -> Option<std::path::PathBuf> {
         self.session_path.read().await.clone()

@@ -17,7 +17,7 @@ Output compression: bash command output is automatically filtered to reduce toke
 }
 ```
 
-All values can be overridden via CLI flags (`--base-url`, `--api-key`, `--model`, `--context-window`, `--timeout`, `--memory`, `--disable-yolo`).
+All values can be overridden via CLI flags (`--base-url`, `--api-key`, `--model`, `--context-window`, `--timeout`, `--memory`, `--disable-yolo`, `--session`).
 
 ## Modes
 
@@ -70,7 +70,8 @@ Same event stream as RPC but reads user input interactively. Useful for debuggin
 - **No hard limits**: the agent runs indefinitely until the task is done. When context approaches the window limit, snip + auto-compact keeps the agent going. Optionally set `--timeout <secs>` to cap execution time.
 - **Steer / follow-up**: type while the agent generates — normal Enter queues as follow-up (processed after the current turn). Use `/steer <message>` to interrupt immediately. In RPC mode, set `"streamingBehavior": "steer"` or `"followUp"` on the prompt command.
 - **Memory**: add `--memory` to persist key facts across sessions. The agent reads/writes `~/.config/rupi/MEMORY.md` — reads on startup, overwrites with bullet points during execution.
-- **Session persistence**: conversations saved as JSONL in `~/.config/rupi_sessions/`
+- **Session persistence**: conversations saved as JSONL in `~/.config/rupi_sessions/` with UUID filenames
+- **Session resumption**: use `--session <id>` to resume a previous conversation from where you left off. The agent remembers all prior messages. Works in interactive, raw, and RPC modes.
 - **Error reporting**: `message_end` includes `stop_reason` (`"stop"`, `"error"`, `"tool_calls"`, `"timeout"`) and error text in `content` when applicable.
 - **Generation ID**: `X-Generation-Id` from response headers emitted as an early event
 - **Cost**: usage and cost data from the API included in the `message_end` event

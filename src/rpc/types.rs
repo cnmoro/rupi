@@ -145,6 +145,10 @@ pub enum RpcCommand {
         #[serde(skip_serializing_if = "Option::is_none")]
         id: Option<String>,
     },
+    ListSessions {
+        #[serde(skip_serializing_if = "Option::is_none")]
+        id: Option<String>,
+    },
 }
 
 /// RPC responses emitted to stdout.

@@ -128,6 +128,10 @@ impl RpcHandler {
                     handle_async_prompt(session, tx, id, &message).await;
                 });
             }
+            RpcCommand::ListSessions { id } => {
+                let sessions = crate::sessions::list_sessions().unwrap_or_default();
+                write_success(tx, id, "list_sessions", Some(serde_json::json!({ "sessions": sessions }))).await;
+            }
             RpcCommand::FollowUp { id, message, .. } => {
                 let session = session.clone();
                 let tx = output_tx.clone();
