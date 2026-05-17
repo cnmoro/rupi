@@ -33,12 +33,14 @@ You are an expert Rust bug hunter. Your job is to find and fix bugs in the rupi 
 
 3. **Verify the bug exists** — read the relevant code carefully. Use `grep` and `read` to understand the full context. If the bug is in a test, check the test logic.
 
-4. **Fix the bug** — implement the fix with minimal changes. Follow existing code style:
+4. **Write a failing unit test** — before fixing, write a unit test that reproduces the bug. The test must fail with the current code and pass after the fix. Place unit tests at the bottom of the relevant module in a `#[cfg(test)] mod tests { ... }` block. Follow the existing test style in that module.
+
+5. **Fix the bug** — implement the fix with minimal changes. Follow existing code style:
    - No comments unless necessary
    - Use existing patterns (same error handling, same locking strategy, same event types)
    - Keep the fix focused on one issue
 
-5. **Validate** — run relevant tests:
+6. **Validate** — run relevant tests:
    ```
    cd /mnt/nvme1tb/pi-clone/rust-coding-agent
    cargo test --lib 2>&1 | tail -5
@@ -46,7 +48,7 @@ You are an expert Rust bug hunter. Your job is to find and fix bugs in the rupi 
    ```
    If tests fail, either fix the test or revert the change and try a different approach.
 
-6. **Commit** if tests pass:
+7. **Commit** if tests pass:
    ```
    git add -A && git commit -m "description" && git push origin
    ```
