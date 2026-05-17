@@ -32,6 +32,8 @@ pub async fn run_raw(session: Arc<Mutex<AgentSession>>) {
     });
 
     loop {
+        let _ = write!(stdout(), "> ");
+        let _ = stdout().flush();
         let line = match stdin_rx.recv().await {
             Some(l) => l,
             None => break,
