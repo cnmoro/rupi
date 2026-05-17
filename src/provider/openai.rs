@@ -448,9 +448,18 @@ impl ChatProvider for OpenAIProvider {
         }
 
         let data: serde_json::Value = response.json().await.map_err(AgentError::Http)?;
-        let text = data["choices"][0]["message"]["content"]
+        let msg = &data["choices"][0]["message"];
+        // Prefer content field, fall back to tool_calls name if model returned one
+        let text = msg["content"]
             .as_str()
-            .unwrap_or_default()
+            .filter(|s| !s.is_empty())
+            .or_else(|| {
+                msg["tool_calls"]
+                    .as_array()
+                    .and_then(|calls| calls.first())
+                    .and_then(|tc| tc["function"]["name"].as_str())
+            })
+            .unwrap_or("")
             .to_string();
 
         Ok(text)

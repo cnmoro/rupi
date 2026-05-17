@@ -1082,7 +1082,12 @@ Has the assistant's output satisfied this exact condition? Reply with only YES o
             goal, last_few
         );
 
-        let system_msg = Message::new("system", &build_system_prompt(&[], &[], self.memory_enabled));
+        // Minimal system prompt — no tool descriptions needed for YES/NO verification
+        let simple_system = format!(
+            "You are a verification assistant. Current date: {}",
+            chrono::Local::now().format("%A, %B %d, %Y")
+        );
+        let system_msg = Message::new("system", &simple_system);
         let verify_msg = Message::new("user", &verify_prompt);
         let model_name = self.model.read().unwrap().clone();
         match self.provider.complete(&model_name, &[system_msg, verify_msg]).await {

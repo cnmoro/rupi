@@ -131,36 +131,7 @@ pub fn format_skills_for_prompt(skills: &[Skill]) -> String {
     result
 }
 
-/// Build a system prompt with skills included.
-pub fn build_system_prompt(skills: &[Skill], cwd: &str) -> String {
-    let mut prompt = format!(
-        "You are rupi, an AI coding assistant.\n\
-        Current date: {}\n\
-        Current working directory: {}\n",
-        chrono_now(),
-        cwd
-    );
 
-    let skills_xml = format_skills_for_prompt(skills);
-    if !skills_xml.is_empty() {
-        prompt.push_str(&format!(
-            "\nThe following skills are available. \
-            Use them to perform specialized tasks.\n{}",
-            skills_xml
-        ));
-    }
-
-    prompt
-}
-
-fn chrono_now() -> String {
-    use std::time::{SystemTime, UNIX_EPOCH};
-    let duration = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default();
-    let secs = duration.as_secs();
-    format!("{}", secs)
-}
 
 #[cfg(test)]
 mod tests {
