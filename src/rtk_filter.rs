@@ -246,13 +246,15 @@ fn filter_git_diff(output: &str) -> String {
         // Keep hunk headers and +/- lines (strip context lines)
         if line.starts_with("@@ ") {
             result.push_str(line);
+            result.push('\n');
         } else if line.starts_with('+') && !line.starts_with("+++") {
             result.push_str(line);
+            result.push('\n');
         } else if line.starts_with('-') && !line.starts_with("---") {
             result.push_str(line);
+            result.push('\n');
         }
-        // Context lines (starting with ' ') are stripped
-        result.push('\n');
+        // Context lines (starting with ' ') are stripped — no newline added
     }
     // Append recovery hint if output was large
     if result.len() < output.len() {

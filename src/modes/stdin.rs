@@ -1,4 +1,4 @@
-use std::io::Read;
+use std::io::{Read, Write};
 
 /// A special string sent through the stdin channel when double-Esc is detected.
 pub const CANCEL_LOOP_SIG: &str = "\x1b\x1b";
@@ -46,6 +46,9 @@ pub fn spawn_streaming_reader(
     stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
 ) {
     std::thread::spawn(move || {
+        // Ensure terminal is in sane mode (cooked + echo)
+        #[cfg(unix)]
+        ensure_cooked_mode();
         let mut stdin = std::io::stdin();
         let mut buf: Vec<u8> = Vec::new();
         let mut last_esc = std::time::Instant::now();
@@ -95,6 +98,9 @@ pub fn spawn_streaming_reader(
                         }
                         0x7f | 0x08 => {
                             buf.pop();
+                            // Erase the character on screen (terminal might be in raw mode)
+                            let _ = std::io::stdout().write_all(b"\x08 \x08");
+                            let _ = std::io::stdout().flush();
                             esc_count = 0;
                         }
                         _ => {
@@ -107,6 +113,27 @@ pub fn spawn_streaming_reader(
         }
     });
 }
+
+#[cfg(unix)]
+fn ensure_cooked_mode() {
+    use std::os::unix::io::AsRawFd;
+    let fd = std::io::stdin().as_raw_fd();
+    if let Ok(mut termios) = unsafe {
+        let mut t: libc::termios = std::mem::zeroed();
+        if libc::tcgetattr(fd, &mut t) == 0 { Ok(t) } else { Err(()) }
+    } {
+        // Only restore if terminal is in non-canonical mode
+        if termios.c_lflag & libc::ICANON == 0 {
+            termios.c_lflag |= libc::ICANON | libc::ECHO | libc::ISIG;
+            termios.c_iflag |= libc::BRKINT | libc::ICRNL | libc::IXON;
+            termios.c_oflag |= libc::OPOST | libc::ONLCR;
+            let _ = unsafe { libc::tcsetattr(fd, libc::TCSAFLUSH, &termios) };
+        }
+    }
+}
+
+#[cfg(not(unix))]
+fn ensure_cooked_mode() {}
 
 fn read_escape_seq(stdin: &std::io::Stdin) -> std::io::Result<()> {
     let mut byte = [0u8; 1];

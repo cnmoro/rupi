@@ -21,6 +21,7 @@ chrono = { version = "0.4", features = ["serde"] }
 regex = "1"
 anyhow = "1"
 rustyline = "14"
+libc = "0.2"
 half = "2"
 ndarray = "0.15"
 safetensors = "0.5"
