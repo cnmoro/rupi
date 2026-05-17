@@ -81,9 +81,9 @@ fn enable_raw_mode() -> Result<std::os::unix::io::RawFd, ()> {
     }
     let mut raw = termios;
     raw.c_iflag &= !(libc::BRKINT | libc::ICRNL | libc::INPCK | libc::ISTRIP | libc::IXON);
-    raw.c_oflag &= !libc::OPOST;
+    raw.c_oflag |= libc::OPOST | libc::ONLCR;
     raw.c_cflag |= libc::CS8;
-    raw.c_lflag &= !(libc::ECHO | libc::ICANON | libc::IEXTEN | libc::ISIG);
+    raw.c_lflag &= !(libc::ICANON | libc::IEXTEN | libc::ISIG);
     raw.c_cc[libc::VMIN] = 1;
     raw.c_cc[libc::VTIME] = 0;
     if unsafe { libc::tcsetattr(fd, libc::TCSAFLUSH, &raw) } != 0 {
@@ -100,7 +100,7 @@ fn disable_raw_mode(_fd: std::os::unix::io::RawFd) {
     if unsafe { libc::tcgetattr(fd, &mut termios) } == 0 {
         termios.c_lflag |= libc::ECHO | libc::ICANON | libc::ISIG;
         termios.c_iflag |= libc::BRKINT | libc::ICRNL | libc::IXON;
-        termios.c_oflag |= libc::OPOST;
+        termios.c_oflag |= libc::OPOST | libc::ONLCR;
         let _ = unsafe { libc::tcsetattr(fd, libc::TCSAFLUSH, &termios) };
     }
 }
