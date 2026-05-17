@@ -493,13 +493,12 @@ fn filter_cargo_test(output: &str) -> String {
     if has_summary && failure_count == 0 {
         let counts = format!("cargo test: {} passed, {} failed",
             passed, failed);
-        result = format!("{}\n{savings}",
-            counts,
-            savings = if passed > 0 && failed == 0 {
-                " [savings: ~90%]"
-            } else {
-                ""
-            });
+        let s = if passed > 0 && failed == 0 {
+            " [savings: ~90%]"
+        } else {
+            ""
+        };
+        result = format!("{}{}", counts, s);
     }
 
     if result.is_empty() {

@@ -1026,13 +1026,15 @@ impl AgentSession {
     }
 
     /// Abort the current streaming operation.
+    /// Signals the tool loop to stop. Does NOT clear is_streaming — the tool
+    /// loop itself sets is_streaming=false when it exits. This prevents a race
+    /// where is_streaming=false lets a new prompt() start before the old tool
+    /// loop has finished cleaning up.
     pub async fn abort(&self) {
         let mut signal = self.abort_signal.lock().await;
         if let Some(tx) = signal.take() {
             let _ = tx.send(true);
         }
-        let mut streaming = self.is_streaming.lock().await;
-        *streaming = false;
     }
 
     /// Set a goal for durable execution. When set, the agent will loop until

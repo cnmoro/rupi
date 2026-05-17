@@ -989,4 +989,62 @@ mod tests {
             assert!(tool.parameters.get("properties").is_some() || tool.parameters.get("type").is_some());
         }
     }
+
+    #[test]
+    fn test_edit_empty_edits_array() {
+        let dir = std::env::temp_dir().join("rupi-tools-test-empty-edits".to_string());
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("file.txt");
+        fs::write(&path, "content").unwrap();
+
+        let args = serde_json::json!({"file_path": path.to_string_lossy(), "edits": []});
+        let result = execute_edit(&args);
+        assert!(result.contains("empty"));
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn test_edit_missing_file_path() {
+        let args = serde_json::json!({"old_text": "foo", "new_text": "bar"});
+        let result = execute_edit(&args);
+        assert!(result.contains("missing"));
+    }
+
+    #[test]
+    fn test_edit_file_not_found() {
+        let args = serde_json::json!({"file_path": "/tmp/rupi-nonexistent-12345", "edits": [{"old_text": "foo", "new_text": "bar"}]});
+        let result = execute_edit(&args);
+        assert!(result.contains("not found"));
+    }
+
+    #[test]
+    fn test_write_missing_args() {
+        let args = serde_json::json!({});
+        let result = execute_write(&args);
+        assert!(result.contains("missing"));
+    }
+
+    #[test]
+    fn test_bash_missing_command() {
+        let args = serde_json::json!({});
+        let result = execute_bash(&args);
+        assert!(result.contains("missing"));
+    }
+
+    #[test]
+    fn test_ls_nonexistent_dir() {
+        let args = serde_json::json!({"path": "/tmp/rupi-nonexistent-dir-99999"});
+        let result = execute_ls(&args);
+        assert!(result.contains("not found"));
+    }
+
+    #[test]
+    fn test_search_code_missing_query() {
+        let tc = ToolCall {
+            id: "e1".into(), name: "search_code".into(),
+            arguments: serde_json::json!({"path": "."}),
+        };
+        let result = execute_tool(&tc);
+        assert!(result.contains("missing"));
+    }
 }

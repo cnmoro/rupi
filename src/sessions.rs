@@ -2,6 +2,7 @@ use std::path::PathBuf;
 
 use crate::agent::session::Message;
 use crate::rpc::jsonl::serialize_json_line;
+use crate::tools::ToolCall;
 
 const SESSIONS_DIR: &str = "rupi_sessions";
 
@@ -34,10 +35,14 @@ pub struct SessionEntry<'a> {
     pub session_id: Option<&'a str>,
 }
 
-#[derive(Debug, Clone, serde::Serialize)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct SessionMessageEntry {
     pub role: String,
     pub content: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_calls: Option<Vec<serde_json::Value>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_call_id: Option<String>,
 }
 
 /// Info about a saved session.
@@ -73,12 +78,23 @@ pub fn create_session(model: &str) -> Result<PathBuf, String> {
 
 /// Append a message entry to a session file.
 pub fn append_message(path: &PathBuf, msg: &Message) -> Result<(), String> {
+    let tool_calls = msg.tool_calls.as_ref().map(|calls| {
+        calls.iter().map(|tc| {
+            serde_json::json!({
+                "id": tc.id,
+                "name": tc.name,
+                "arguments": tc.arguments,
+            })
+        }).collect()
+    });
     let entry = SessionEntry {
         entry_type: "message",
         model: None,
         message: Some(&SessionMessageEntry {
             role: msg.role.clone(),
             content: msg.content.clone(),
+            tool_calls,
+            tool_call_id: msg.tool_call_id.clone(),
         }),
         summary: None,
         tokens_before: None,
@@ -134,7 +150,28 @@ pub fn load_session(path: &PathBuf) -> Result<Vec<Message>, String> {
                 if let Some(msg_val) = val.get("message") {
                     let role = msg_val["role"].as_str().unwrap_or("user");
                     let content = msg_val["content"].as_str().unwrap_or("");
-                    messages.push(Message::new(role, content));
+
+                    // Try to deserialize with optional tool_calls and tool_call_id
+                    if let Ok(entry) = serde_json::from_value::<SessionMessageEntry>(msg_val.clone()) {
+                        let mut msg = Message::new(&entry.role, &entry.content);
+                        msg.tool_call_id = entry.tool_call_id;
+                        if let Some(calls) = entry.tool_calls {
+                            let tool_calls: Vec<crate::tools::ToolCall> = calls.into_iter()
+                                .filter_map(|v| {
+                                    let id = v.get("id")?.as_str()?.to_string();
+                                    let name = v.get("name")?.as_str()?.to_string();
+                                    let args = v.get("arguments").cloned().unwrap_or_default();
+                                    Some(crate::tools::ToolCall { id, name, arguments: args })
+                                })
+                                .collect();
+                            if !tool_calls.is_empty() {
+                                msg.tool_calls = Some(tool_calls);
+                            }
+                        }
+                        messages.push(msg);
+                    } else {
+                        messages.push(Message::new(role, content));
+                    }
                 }
             }
         }
@@ -380,5 +417,79 @@ mod tests {
         // May be None since sessions_dir points to home
         // Just verify no crash
         assert!(result.is_none() || result.as_ref().map_or(false, |p| p.exists()));
+    }
+
+    #[test]
+    fn test_session_tool_call_roundtrip() {
+        let dir = std::env::temp_dir().join(format!("rupi-sessions-tc-{}", std::process::id()));
+        let _ = fs::create_dir_all(&dir);
+        let path = dir.join("tc_test.jsonl");
+        let mut file = fs::File::create(&path).unwrap();
+        use std::io::Write;
+        writeln!(file, "{}", serialize_json_line(&serde_json::json!({"type":"session","model":"gpt-4","session_id":"tc1"})).trim()).unwrap();
+        drop(file);
+
+        // Create a message with tool calls
+        let mut msg = Message::new("assistant", "let me check");
+        msg.tool_calls = Some(vec![
+            ToolCall { id: "call_1".into(), name: "bash".into(), arguments: serde_json::json!({"command": "ls"}) },
+            ToolCall { id: "call_2".into(), name: "read".into(), arguments: serde_json::json!({"file_path": "/tmp/x"}) },
+        ]);
+        append_message(&path, &msg).unwrap();
+
+        // Create a tool result
+        let mut tr = Message::tool_result("call_1", "file1.txt\nfile2.txt");
+        tr.tool_call_id = Some("call_1".into());
+        append_message(&path, &tr).unwrap();
+
+        // Load and verify
+        let loaded = load_session(&path).unwrap();
+        assert_eq!(loaded.len(), 2);
+        assert!(loaded[0].tool_calls.is_some(), "Tool calls should be preserved");
+        let calls = loaded[0].tool_calls.as_ref().unwrap();
+        assert_eq!(calls.len(), 2);
+        assert_eq!(calls[0].name, "bash");
+        assert_eq!(calls[0].arguments["command"], "ls");
+        assert_eq!(calls[1].name, "read");
+        assert_eq!(loaded[1].tool_call_id.as_deref(), Some("call_1"));
+        assert!(loaded[1].content.contains("file1.txt"));
+
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn test_load_corrupt_session() {
+        let dir = std::env::temp_dir().join(format!("rupi-sessions-corrupt-{}", std::process::id()));
+        let _ = fs::create_dir_all(&dir);
+        let path = dir.join("corrupt.jsonl");
+        let mut file = fs::File::create(&path).unwrap();
+        use std::io::Write;
+        // Valid header
+        writeln!(file, r#"{{"type":"session","model":"gpt-4"}}"#).unwrap();
+        // Valid message
+        writeln!(file, r#"{{"type":"message","message":{{"role":"user","content":"hello"}}}}"#).unwrap();
+        // Corrupt JSON line
+        writeln!(file, "this is not json at all {{").unwrap();
+        // Valid message after corruption
+        writeln!(file, r#"{{"type":"message","message":{{"role":"assistant","content":"hi"}}}}"#).unwrap();
+        drop(file);
+
+        let loaded = load_session(&path).unwrap();
+        // Should skip corrupt line but still load valid ones
+        assert_eq!(loaded.len(), 2, "Corrupt line should be skipped");
+        assert_eq!(loaded[0].content, "hello");
+        assert_eq!(loaded[1].content, "hi");
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn test_old_format_compat() {
+        // Old format didn't have tool_calls/tool_call_id fields — should still load
+        let json = r#"{"role":"user","content":"hello"}"#;
+        let entry: SessionMessageEntry = serde_json::from_str(json).unwrap();
+        assert_eq!(entry.role, "user");
+        assert_eq!(entry.content, "hello");
+        assert!(entry.tool_calls.is_none());
+        assert!(entry.tool_call_id.is_none());
     }
 }
