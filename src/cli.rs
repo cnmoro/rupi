@@ -47,6 +47,14 @@ pub struct Cli {
     /// Resume a session by ID (loads ~/.config/rupi_sessions/<ID>.jsonl)
     #[arg(long)]
     pub session: Option<String>,
+
+    /// List available models from Opencode (requires opencode_api_key in config)
+    #[arg(long)]
+    pub list_opencode_models: bool,
+
+    /// Opencode provider variant: "go" (default) or "zen"
+    #[arg(long, default_value = "go")]
+    pub opencode_provider: String,
 }
 
 impl Cli {

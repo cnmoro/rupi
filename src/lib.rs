@@ -6,6 +6,7 @@ pub mod compaction;
 pub mod config;
 pub mod error;
 pub mod modes;
+pub mod opencode_models;
 pub mod output_parser;
 pub mod provider;
 pub mod quality;

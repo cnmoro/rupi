@@ -25,31 +25,78 @@ async fn main() {
 
     let cli = Cli::parse();
 
-    // Load config from file, then override with CLI/env
-    let file_config = RupiConfig::load().unwrap_or_else(|_| {
-        if cli.base_url.is_none() || cli.api_key.is_none() || cli.model.is_none() {
-            eprintln!(
-                "Error: No config file found at ~/.config/rupi.json and --base-url/--api-key/--model not provided.\n\
-                 Create ~/.config/rupi.json with:\n\
-                 {{\n  \"base_url\": \"...\",\n  \"api_key\": \"...\",\n  \"model_tag\": \"...\"\n}}"
-            );
-            std::process::exit(1);
+    // Load config from file
+    let file_config = match RupiConfig::load() {
+        Ok(c) => c,
+        Err(e) => {
+            // If opencode provider was specified via CLI, we can work without the full config
+            if cli.list_opencode_models {
+                eprintln!("rupi: no config file found, but --list-opencode-models specified");
+                eprintln!("rupi: create ~/.config/rupi.json with: {{\"opencode_api_key\": \"...\"}}");
+                // We still need the API key — try env var
+                RupiConfig {
+                    base_url: String::new(),
+                    api_key: String::new(),
+                    model_tag: String::new(),
+                    opencode_api_key: std::env::var("OPENCODE_API_KEY").ok(),
+                    opencode_provider: Some(cli.opencode_provider.clone()),
+                }
+            } else {
+                eprintln!("Error: {}", e);
+                std::process::exit(1);
+            }
         }
-        RupiConfig {
-            base_url: String::new(),
-            api_key: String::new(),
-            model_tag: String::new(),
+    };
+
+    // Handle --list-opencode-models early
+    if cli.list_opencode_models {
+        let provider_id = match file_config.opencode_provider.as_deref().unwrap_or(&cli.opencode_provider) {
+            "zen" => "opencode",
+            _ => "opencode-go",
+        };
+        let models = rupi::opencode_models::fetch_opencode_models(provider_id)
+            .unwrap_or_else(|e| {
+                eprintln!("Error fetching opencode models: {}", e);
+                std::process::exit(1);
+            });
+        println!("Opencode models ({}):", provider_id);
+        rupi::opencode_models::print_models(&models);
+        return;
+    }
+
+    // Resolve base_url, api_key, model — opencode config takes priority if set
+    let base_url = if file_config.opencode_api_key.is_some() {
+        // Use opencode's effective base URL (overrides CLI --base-url)
+        file_config.effective_base_url().to_string()
+    } else {
+        cli.base_url.as_deref().unwrap_or(&file_config.base_url).to_string()
+    };
+
+    let api_key = if file_config.opencode_api_key.is_some() {
+        rupi::auth::resolve_api_key(file_config.effective_api_key())
+    } else if let Some(cli_key) = cli.api_key.as_deref() {
+        rupi::auth::resolve_api_key(cli_key)
+    } else {
+        rupi::auth::resolve_api_key(&file_config.api_key)
+    };
+
+    let model = if file_config.opencode_api_key.is_some() {
+        // Default model for opencode: deepseek-v4-flash for Go, gpt-5-nano for Zen
+        match file_config.opencode_provider.as_deref() {
+            Some("zen") => "gpt-5-nano",
+            _ => cli.model.as_deref().unwrap_or("deepseek-v4-flash"),
         }
-    });
+    } else {
+        cli.model.as_deref().unwrap_or(&file_config.model_tag)
+    };
 
-    let base_url = cli.base_url.as_deref().unwrap_or(&file_config.base_url);
-    let api_key = rupi::auth::resolve_api_key(
-        cli.api_key.as_deref().unwrap_or(&file_config.api_key)
-    );
-    let model = cli.model.as_deref().unwrap_or(&file_config.model_tag);
+    if api_key.is_empty() {
+        eprintln!("Error: Missing API key. Provide --api-key, set opencode_api_key in config, or set OPENCODE_API_KEY env var.");
+        std::process::exit(1);
+    }
 
-    if base_url.is_empty() || api_key.is_empty() || model.is_empty() {
-        eprintln!("Error: Missing configuration. Provide --base-url, --api-key, --model or create ~/.config/rupi.json");
+    if base_url.is_empty() {
+        eprintln!("Error: Missing base URL. Provide --base-url or create ~/.config/rupi.json");
         std::process::exit(1);
     }
 

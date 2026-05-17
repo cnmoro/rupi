@@ -6,6 +6,10 @@ pub struct RupiConfig {
     pub base_url: String,
     pub api_key: String,
     pub model_tag: String,
+    #[serde(rename = "opencode_api_key", default)]
+    pub opencode_api_key: Option<String>,
+    #[serde(rename = "opencode_provider", default)]
+    pub opencode_provider: Option<String>,
 }
 
 impl RupiConfig {
@@ -21,6 +25,12 @@ impl RupiConfig {
             .map_err(|e| format!("Failed to read {}: {}", path.display(), e))?;
         let config: RupiConfig = serde_json::from_str(&contents)
             .map_err(|e| format!("Failed to parse {}: {}", path.display(), e))?;
+
+        // If opencode_api_key is set, it overrides the standard config
+        if config.opencode_api_key.is_some() {
+            return Ok(config);
+        }
+
         if config.base_url.is_empty() {
             return Err("base_url cannot be empty in config".into());
         }
@@ -31,6 +41,32 @@ impl RupiConfig {
             return Err("model_tag cannot be empty in config".into());
         }
         Ok(config)
+    }
+
+    /// Resolve the effective API key — uses opencode_api_key if present.
+    pub fn effective_api_key(&self) -> &str {
+        self.opencode_api_key.as_deref().unwrap_or(&self.api_key)
+    }
+
+    /// Resolve the effective base URL — uses opencode URL if opencode_api_key is set.
+    pub fn effective_base_url(&self) -> &str {
+        if self.opencode_api_key.is_some() {
+            // Default to Go provider
+            match self.opencode_provider.as_deref() {
+                Some("zen") => "https://opencode.ai/zen/v1",
+                _ => "https://opencode.ai/zen/go/v1",
+            }
+        } else {
+            &self.base_url
+        }
+    }
+
+    /// Get the opencode provider variant ("go" or "zen").
+    pub fn opencode_variant(&self) -> &str {
+        match self.opencode_provider.as_deref() {
+            Some("zen") => "zen",
+            _ => "go",
+        }
     }
 }
 
@@ -99,9 +135,62 @@ mod tests {
             base_url: "".into(),
             api_key: "sk-test".into(),
             model_tag: "gpt-4".into(),
+            opencode_api_key: None,
+            opencode_provider: None,
         };
-        // The validation would fail but we can't call load() since it's on the file
-        // Just verify the struct fields
         assert!(config.base_url.is_empty());
+    }
+
+    #[test]
+    fn test_opencode_config_overrides() {
+        let config = RupiConfig {
+            base_url: "https://old.example.com".into(),
+            api_key: "old-key".into(),
+            model_tag: "old-model".into(),
+            opencode_api_key: Some("oc_key".into()),
+            opencode_provider: Some("go".into()),
+        };
+        assert_eq!(config.effective_api_key(), "oc_key");
+        assert_eq!(config.effective_base_url(), "https://opencode.ai/zen/go/v1");
+        assert_eq!(config.opencode_variant(), "go");
+    }
+
+    #[test]
+    fn test_opencode_config_zen() {
+        let config = RupiConfig {
+            base_url: "".into(),
+            api_key: "".into(),
+            model_tag: "".into(),
+            opencode_api_key: Some("oc_key".into()),
+            opencode_provider: Some("zen".into()),
+        };
+        assert_eq!(config.effective_base_url(), "https://opencode.ai/zen/v1");
+        assert_eq!(config.opencode_variant(), "zen");
+    }
+
+    #[test]
+    fn test_opencode_config_defaults() {
+        let config = RupiConfig {
+            base_url: "https://old.example.com".into(),
+            api_key: "old-key".into(),
+            model_tag: "old-model".into(),
+            opencode_api_key: None,
+            opencode_provider: None,
+        };
+        assert_eq!(config.effective_api_key(), "old-key");
+        assert_eq!(config.effective_base_url(), "https://old.example.com");
+        assert_eq!(config.opencode_variant(), "go");
+    }
+
+    #[test]
+    fn test_opencode_config_default_provider_is_go() {
+        let config = RupiConfig {
+            base_url: "".into(),
+            api_key: "".into(),
+            model_tag: "".into(),
+            opencode_api_key: Some("k".into()),
+            opencode_provider: None,
+        };
+        assert_eq!(config.effective_base_url(), "https://opencode.ai/zen/go/v1");
     }
 }

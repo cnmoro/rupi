@@ -56,6 +56,8 @@ fn load_e2e_config() -> Option<RupiConfig> {
                     base_url,
                     api_key,
                     model_tag: model,
+                    opencode_api_key: None,
+                    opencode_provider: None,
                 });
             }
         }
