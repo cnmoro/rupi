@@ -270,7 +270,7 @@ async fn process_prompt(
                         let _ = stdout().flush();
                     }
                     Some(AgentEvent::AgentStart { .. }) => {
-                        let _ = write!(stdout(), "\n[running...]");
+                        let _ = write!(stdout(), "\n[running...]\n");
                         let _ = stdout().flush();
                     }
                     Some(AgentEvent::AgentEnd { .. }) | None => {

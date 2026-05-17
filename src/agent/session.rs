@@ -1235,6 +1235,7 @@ impl AgentSession {
     /// Cancel the current loop (if any).
     pub async fn cancel_loop(&self) {
         self.loop_cancelled.store(true, std::sync::atomic::Ordering::SeqCst);
+        *self.loop_prompt.write().await = None;
         self.abort().await;
     }
 
