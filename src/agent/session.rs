@@ -16,6 +16,7 @@ pub struct Message {
     pub content: String,
     pub tool_calls: Option<Vec<crate::tools::ToolCall>>,
     pub tool_call_id: Option<String>,
+    pub reasoning_content: Option<String>,
 }
 
 impl Message {
@@ -25,6 +26,7 @@ impl Message {
             content: content.to_string(),
             tool_calls: None,
             tool_call_id: None,
+            reasoning_content: None,
         }
     }
 
@@ -34,6 +36,7 @@ impl Message {
             content: assistant_content.to_string(),
             tool_calls: Some(calls),
             tool_call_id: None,
+            reasoning_content: None,
         }
     }
 
@@ -43,7 +46,13 @@ impl Message {
             content: content.to_string(),
             tool_calls: None,
             tool_call_id: Some(tool_call_id.to_string()),
+            reasoning_content: None,
         }
+    }
+
+    pub fn with_reasoning(mut self, reasoning: Option<String>) -> Self {
+        self.reasoning_content = reasoning;
+        self
     }
 }
 
@@ -731,6 +740,7 @@ impl AgentSession {
             };
 
             let mut full_content = String::new();
+            let mut reasoning_content = String::new();
             let mut input_tokens = 0;
             let mut output_tokens = 0;
             let mut prompt_cost: Option<f64> = None;
@@ -765,6 +775,7 @@ impl AgentSession {
                     StreamEvent::Done(result) => {
                         had_stream_events = true;
                         full_content = result.content;
+                        reasoning_content = result.reasoning_content;
                         input_tokens = result.input_tokens;
                         output_tokens = result.output_tokens;
                         if let Some(c) = result.cost {
@@ -777,6 +788,7 @@ impl AgentSession {
                     StreamEvent::ToolCalls {
                         calls,
                         content,
+                        reasoning_content: rc,
                         input_tokens: it,
                         output_tokens: ot,
                         cost,
@@ -784,6 +796,7 @@ impl AgentSession {
                     } => {
                         had_stream_events = true;
                         full_content = content;
+                        reasoning_content = rc;
                         input_tokens = it;
                         output_tokens = ot;
                         if let Some(c) = cost {
@@ -894,7 +907,8 @@ impl AgentSession {
             // If tool calls were made, execute them and continue to next turn
             if !tool_calls.is_empty() {
                 // Add assistant message with tool calls to history
-                let assistant_msg = Message::tool_call(&full_content, tool_calls.clone());
+                let rc = if reasoning_content.is_empty() { None } else { Some(reasoning_content.clone()) };
+                let assistant_msg = Message::tool_call(&full_content, tool_calls.clone()).with_reasoning(rc);
                 self.persist_message(&assistant_msg).await;
                 self.messages.write().await.push(assistant_msg);
 
@@ -999,7 +1013,8 @@ impl AgentSession {
             };
 
             // Add assistant message to history
-            let assistant_msg = Message::new("assistant", &full_content);
+            let rc = if reasoning_content.is_empty() { None } else { Some(reasoning_content.clone()) };
+            let assistant_msg = Message::new("assistant", &full_content).with_reasoning(rc);
             self.persist_message(&assistant_msg).await;
             self.messages.write().await.push(assistant_msg);
 

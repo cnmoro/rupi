@@ -43,6 +43,8 @@ pub struct SessionMessageEntry {
     pub tool_calls: Option<Vec<serde_json::Value>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tool_call_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_content: Option<String>,
 }
 
 /// Info about a saved session.
@@ -95,6 +97,7 @@ pub fn append_message(path: &PathBuf, msg: &Message) -> Result<(), String> {
             content: msg.content.clone(),
             tool_calls,
             tool_call_id: msg.tool_call_id.clone(),
+            reasoning_content: msg.reasoning_content.clone(),
         }),
         summary: None,
         tokens_before: None,
@@ -155,6 +158,7 @@ pub fn load_session(path: &PathBuf) -> Result<Vec<Message>, String> {
                     if let Ok(entry) = serde_json::from_value::<SessionMessageEntry>(msg_val.clone()) {
                         let mut msg = Message::new(&entry.role, &entry.content);
                         msg.tool_call_id = entry.tool_call_id;
+                        msg.reasoning_content = entry.reasoning_content;
                         if let Some(calls) = entry.tool_calls {
                             let tool_calls: Vec<crate::tools::ToolCall> = calls.into_iter()
                                 .filter_map(|v| {

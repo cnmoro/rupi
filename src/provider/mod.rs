@@ -12,6 +12,7 @@ pub struct StreamResult {
     pub input_tokens: u64,
     pub output_tokens: u64,
     pub cost: Option<PromptCost>,
+    pub reasoning_content: String,
 }
 
 /// Cost information from the provider (e.g. OpenRouter).
@@ -37,6 +38,7 @@ pub enum StreamEvent {
         output_tokens: u64,
         cost: Option<PromptCost>,
         finish_reason: Option<String>,
+        reasoning_content: String,
     },
     Error(String),
 }

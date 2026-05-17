@@ -44,6 +44,8 @@ struct ChatMessage {
     tool_calls: Option<Vec<ToolCallData>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     tool_call_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reasoning_content: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -83,6 +85,8 @@ struct ChunkDelta {
     content: Option<String>,
     #[serde(default)]
     tool_calls: Option<Vec<ChunkToolCall>>,
+    #[serde(default)]
+    reasoning_content: Option<String>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -159,7 +163,13 @@ impl OpenAIProvider {
                     content,
                     tool_calls: None,
                     tool_call_id: None,
+                    reasoning_content: None,
                 };
+
+                // Include reasoning_content for assistant messages (required by reasoning models like DeepSeek)
+                if m.role == "assistant" {
+                    chat_msg.reasoning_content = m.reasoning_content.clone();
+                }
 
                 // Handle assistant messages with tool calls
                 if let Some(ref calls) = m.tool_calls {
@@ -263,6 +273,7 @@ impl ChatProvider for OpenAIProvider {
             }
 
             let mut full_content = String::new();
+            let mut reasoning_content = String::new();
             let mut input_tokens = 0;
             let mut output_tokens = 0;
             let mut cost: Option<super::PromptCost> = None;
@@ -326,6 +337,9 @@ impl ChatProvider for OpenAIProvider {
                                                         full_content.push_str(&content);
                                                         let _ = tx.send(StreamEvent::Delta(content)).await;
                                                     }
+                                                    if let Some(rc) = delta.reasoning_content {
+                                                        reasoning_content.push_str(&rc);
+                                                    }
                                                     if let Some(chunk_tool_calls) = delta.tool_calls {
                                                         for tc in chunk_tool_calls {
                                                             let index = tc.index;
@@ -381,6 +395,7 @@ impl ChatProvider for OpenAIProvider {
                     .send(StreamEvent::ToolCalls {
                         calls,
                         content: full_content,
+                        reasoning_content,
                         input_tokens,
                         output_tokens,
                         cost,
@@ -393,6 +408,7 @@ impl ChatProvider for OpenAIProvider {
             let _ = tx
                 .send(StreamEvent::Done(StreamResult {
                     content: full_content,
+                    reasoning_content,
                     input_tokens,
                     output_tokens,
                     cost,
