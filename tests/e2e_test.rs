@@ -1270,3 +1270,102 @@ async fn e2e_test_session_create_and_find() {
     assert!(found.unwrap().exists(), "Found session file should exist");
     eprintln!("e2e: session ID {} created and found", id);
 }
+
+#[tokio::test]
+async fn e2e_test_loop_mode() {
+    let config = match load_e2e_config() {
+        Some(c) => c,
+        None => {
+            eprintln!("Skipping e2e test: credentials not set");
+            return;
+        }
+    };
+
+    let openai_config = make_config(&config);
+    let session = Arc::new(AgentSession::from_config(openai_config));
+
+    // Set loop mode with a simple prompt
+    session.set_loop(Some("Say hello and nothing else.".to_string())).await;
+
+    let (tx, mut rx) = mpsc::unbounded_channel::<AgentEvent>();
+
+    // Start the prompt (this will loop)
+    let s = session.clone();
+    let prompt_handle = tokio::spawn(async move {
+        s.prompt("Say hello and nothing else.", tx.clone()).await.unwrap();
+    });
+
+    // Wait for several turn_end events (agent_end is suppressed in loop mode)
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(40);
+    let mut turn_end_count = 0;
+    while std::time::Instant::now() < deadline {
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        while let Ok(event) = rx.try_recv() {
+            if matches!(event, AgentEvent::TurnEnd { .. }) {
+                turn_end_count += 1;
+                if turn_end_count >= 2 {
+                    break;
+                }
+            }
+        }
+        if turn_end_count >= 2 { break; }
+    }
+
+    // Cancel the loop
+    session.cancel_loop().await;
+    let _ = prompt_handle.await;
+
+    assert!(turn_end_count >= 2, "Loop should have run at least 2 iterations (turn_end count: {})", turn_end_count);
+    eprintln!("Loop test: {} turn_end events seen", turn_end_count);
+}
+
+#[tokio::test]
+async fn e2e_test_loop_mode_prompt_repeated() {
+    let config = match load_e2e_config() {
+        Some(c) => c,
+        None => {
+            eprintln!("Skipping e2e test: credentials not set");
+            return;
+        }
+    };
+
+    let openai_config = make_config(&config);
+    let session = Arc::new(AgentSession::from_config(openai_config));
+
+    // Count "Say goodbye." in conversation after loop
+    session.set_loop(Some("Say goodbye.".to_string())).await;
+
+    let (tx, mut rx) = mpsc::unbounded_channel::<AgentEvent>();
+
+    let s = session.clone();
+    let prompt_handle = tokio::spawn(async move {
+        s.prompt("Say goodbye.", tx.clone()).await.unwrap();
+    });
+
+    // Wait for several turn_end events
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(40);
+    let mut turn_end_count = 0;
+    while std::time::Instant::now() < deadline {
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        while let Ok(event) = rx.try_recv() {
+            if matches!(event, AgentEvent::TurnEnd { .. }) {
+                turn_end_count += 1;
+                if turn_end_count >= 2 {
+                    break;
+                }
+            }
+        }
+        if turn_end_count >= 2 { break; }
+    }
+
+    session.cancel_loop().await;
+    let _ = prompt_handle.await;
+
+    assert!(turn_end_count >= 2, "Loop should have run at least 2 iterations, got {}", turn_end_count);
+
+    // The "Say goodbye." prompt should appear multiple times in conversation
+    let msgs = session.messages().await;
+    let goodbye_count = msgs.iter().filter(|m| m.content.contains("goodbye")).count();
+    eprintln!("Loop repeat test: {} 'goodbye' messages in conversation", goodbye_count);
+    assert!(goodbye_count >= 2, "Should have at least 2 'goodbye' messages, got {}", goodbye_count);
+}

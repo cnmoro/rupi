@@ -217,6 +217,8 @@ pub struct AgentSession {
     auto_compaction_enabled: RwLock<bool>,
     recent_tool_calls: RwLock<Vec<Vec<crate::tools::ToolCall>>>,
     consecutive_quality_issues: RwLock<u32>,
+    loop_prompt: RwLock<Option<String>>,
+    loop_cancelled: std::sync::atomic::AtomicBool,
 }
 
 impl AgentSession {
@@ -266,6 +268,8 @@ impl AgentSession {
             auto_compaction_enabled: RwLock::new(true),
             recent_tool_calls: RwLock::new(Vec::new()),
             consecutive_quality_issues: RwLock::new(0),
+            loop_prompt: RwLock::new(None),
+            loop_cancelled: std::sync::atomic::AtomicBool::new(false),
         }
     }
 
@@ -416,6 +420,7 @@ impl AgentSession {
         self.pending_steer.write().await.clear();
         self.pending_follow_up.write().await.clear();
         self.set_goal(None).await;
+        self.set_loop(None).await;
         *self.auto_compaction_enabled.write().await = true;
         *self.thinking_level.write().await = "off".to_string();
         *self.abort_signal.lock().await = None;
@@ -474,7 +479,6 @@ impl AgentSession {
             let fwd = tokio::spawn(async move {
                 while let Some(ev) = wrapped_rx.recv().await {
                     if matches!(ev, AgentEvent::AgentEnd { .. }) {
-                        // Suppress agent_end during loop; save it
                         let _ = held_tx.send(ev);
                     } else {
                         let _ = tx_clone.send(ev);
@@ -494,7 +498,7 @@ impl AgentSession {
                 }
 
                 if goal_iter == max_goal_iterations - 1 {
-                    break; // Last iteration, don't nudge
+                    break;
                 }
 
                 let nudge_text = format!("Continue working toward the goal. The goal is: {}. Do not stop until this goal is fully achieved. What is your next step?", g);
@@ -516,7 +520,6 @@ impl AgentSession {
 
             drop(wrapped_tx);
             let _ = fwd.await;
-            // Forward the LAST saved agent_end (if any)
             let mut last_ae = None;
             while let Ok(ae) = held_rx.try_recv() {
                 last_ae = Some(ae);
@@ -524,11 +527,67 @@ impl AgentSession {
             if let Some(ae) = last_ae {
                 let _ = event_tx.send(ae);
             } else {
-                // No agent_end was held — send a synthetic one
+                let _ = event_tx.send(AgentEvent::agent_end());
+            }
+        } else if self.loop_prompt.read().await.is_some() {
+            // Loop mode: re-send the loop prompt after each agent_end until cancelled.
+            // Suppress agent_end events during the loop like goal mode.
+            let loop_msg = self.loop_prompt.read().await.clone().unwrap();
+            let (wrapped_tx, mut wrapped_rx) = mpsc::unbounded_channel::<AgentEvent>();
+            let (held_tx, mut held_rx) = tokio::sync::mpsc::unbounded_channel::<AgentEvent>();
+
+            let tx_clone = event_tx.clone();
+            let fwd = tokio::spawn(async move {
+                while let Some(ev) = wrapped_rx.recv().await {
+                    if matches!(ev, AgentEvent::AgentEnd { .. }) {
+                        let _ = held_tx.send(ev);
+                    } else {
+                        let _ = tx_clone.send(ev);
+                    }
+                }
+            });
+
+            loop {
+                if self.loop_cancelled.load(std::sync::atomic::Ordering::SeqCst) {
+                    break;
+                }
+                if let Err(e) = self.run_tool_loop(wrapped_tx.clone()).await {
+                    eprintln!("rupi: tool loop error in loop mode: {}", e);
+                    break;
+                }
+                if self.loop_cancelled.load(std::sync::atomic::Ordering::SeqCst) {
+                    break;
+                }
+                // Re-send the loop prompt
+                let msg = Message::new("user", &loop_msg);
+                self.persist_message(&msg).await;
+                self.messages.write().await.push(msg);
+                let _ = event_tx.send(AgentEvent::turn_start());
+                let _ = event_tx.send(AgentEvent::message_start(AgentMessage {
+                    role: "user".to_string(),
+                    content: vec![MessageContent {
+                        content_type: "text".to_string(),
+                        text: Some(loop_msg.clone()),
+                    }],
+                    model: None,
+                    usage: None,
+                    stop_reason: None,
+                }));
+            }
+
+            drop(wrapped_tx);
+            let _ = fwd.await;
+            let mut last_ae = None;
+            while let Ok(ae) = held_rx.try_recv() {
+                last_ae = Some(ae);
+            }
+            if let Some(ae) = last_ae {
+                let _ = event_tx.send(ae);
+            } else {
                 let _ = event_tx.send(AgentEvent::agent_end());
             }
         } else {
-            // No goal: normal flow
+            // No goal, no loop: normal flow
             if let Err(e) = self.run_tool_loop(event_tx.clone()).await {
                 eprintln!("rupi: tool loop error: {}", e);
             }
@@ -1141,6 +1200,24 @@ impl AgentSession {
         self.goal.read().await.clone()
     }
 
+    /// Set a loop prompt. When set, the agent will re-send the prompt
+    /// repeatedly after each agent_end until cancelled.
+    pub async fn set_loop(&self, prompt: Option<String>) {
+        *self.loop_prompt.write().await = prompt;
+        self.loop_cancelled.store(false, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// Cancel the current loop (if any).
+    pub async fn cancel_loop(&self) {
+        self.loop_cancelled.store(true, std::sync::atomic::Ordering::SeqCst);
+        self.abort().await;
+    }
+
+    /// Check if loop mode is active.
+    pub async fn is_loop_active(&self) -> bool {
+        self.loop_prompt.read().await.is_some()
+    }
+
     /// Verify whether the current goal has been achieved by asking the model.
     /// Returns true if the model confirms the goal is met.
     async fn verify_goal(&self, goal: &str) -> bool {
@@ -1350,5 +1427,27 @@ mod tests {
         assert_eq!(msgs.len(), 1);
         assert_eq!(msgs[0].role, "user");
         assert_eq!(msgs[0].content[0].text.as_deref(), Some("hello"));
+    }
+
+    #[tokio::test]
+    async fn test_loop_set_and_cancel() {
+        let session = create_test_session();
+        assert!(!session.is_loop_active().await);
+        session.set_loop(Some("test prompt".to_string())).await;
+        assert!(session.is_loop_active().await);
+        assert_eq!(*session.loop_prompt.read().await, Some("test prompt".to_string()));
+        assert!(!session.loop_cancelled.load(std::sync::atomic::Ordering::SeqCst));
+        session.cancel_loop().await;
+        assert!(session.loop_cancelled.load(std::sync::atomic::Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn test_loop_reset_clears() {
+        let session = create_test_session();
+        session.set_loop(Some("loop text".to_string())).await;
+        assert!(session.is_loop_active().await);
+        session.reset().await;
+        assert!(!session.is_loop_active().await);
+        assert!(!session.loop_cancelled.load(std::sync::atomic::Ordering::SeqCst));
     }
 }

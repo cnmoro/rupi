@@ -148,6 +148,20 @@ impl RpcHandler {
                 let sessions = crate::sessions::list_sessions().unwrap_or_default();
                 write_success(tx, id, "list_sessions", Some(serde_json::json!({ "sessions": sessions }))).await;
             }
+            RpcCommand::SetLoop { id, message } => {
+                let msg = message.clone();
+                session.read().await.set_loop(Some(msg.clone())).await;
+                let session2 = session.clone();
+                let tx2 = output_tx.clone();
+                let id2 = id.clone();
+                tokio::spawn(async move {
+                    handle_async_prompt(session2, tx2, id2, &msg, "set_loop").await;
+                });
+            }
+            RpcCommand::StopLoop { id } => {
+                session.read().await.cancel_loop().await;
+                write_success::<()>(tx, id, "stop_loop", None).await;
+            }
         }
     }
 }

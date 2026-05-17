@@ -1,36 +1,20 @@
 use std::io::{stdout, Write};
 use std::sync::Arc;
-use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::sync::Mutex;
 
 use crate::agent::session::AgentSession;
+use crate::modes::stdin::{spawn_stdin_reader, CANCEL_LOOP_SIG};
 use crate::rpc::types::{AgentEvent, AgentMessage, AssistantMessageEvent, MessageContent};
 
 /// Run the interactive REPL mode with concurrent stdin + event reading.
 /// While the agent generates output, the prompt stays active for steer/follow-up.
 pub async fn run_interactive(session: Arc<Mutex<AgentSession>>) {
-    let _ = writeln!(stdout(), "rupi interactive mode. Type your prompts. Exit: Ctrl+D, /exit, /quit, or 'exit'.");
+    let _ = writeln!(stdout(), "rupi interactive mode. Type your prompts. Exit: Ctrl+D, /exit, /quit, or 'exit'. Double-Esc to cancel loop.");
     let _ = stdout().flush();
 
-    // Spawn a single persistent stdin reader that feeds lines through a channel.
+    // Spawn a single persistent stdin reader with double-Esc detection
     let (stdin_tx, mut stdin_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
-    tokio::spawn(async move {
-        let mut reader = BufReader::new(tokio::io::stdin());
-        let mut buf = String::new();
-        loop {
-            buf.clear();
-            match reader.read_line(&mut buf).await {
-                Ok(0) | Err(_) => break,
-                Ok(_) => {
-                    let input = buf.trim().to_string();
-                    if input.is_empty() {
-                        continue;
-                    }
-                    let _ = stdin_tx.send(input).ok();
-                }
-            }
-        }
-    });
+    spawn_stdin_reader(stdin_tx);
 
     loop {
         let _ = write!(stdout(), "> ");
@@ -39,6 +23,14 @@ pub async fn run_interactive(session: Arc<Mutex<AgentSession>>) {
             Some(l) => l,
             None => break,
         };
+
+        if line == CANCEL_LOOP_SIG {
+            let sess = session.lock().await;
+            sess.cancel_loop().await;
+            let _ = writeln!(stdout(), "\n[loop cancelled]");
+            let _ = stdout().flush();
+            continue;
+        }
 
         match handle_command(&session, &line).await {
             CommandAction::Continue => continue,
@@ -73,6 +65,31 @@ async fn handle_command(session: &Arc<Mutex<AgentSession>>, line: &str) -> Comma
         }
         let _ = stdout().flush();
         return CommandAction::Continue;
+    }
+
+    if line.starts_with("/stop") || line == "/stop" {
+        let sess = session.lock().await;
+        sess.cancel_loop().await;
+        let _ = writeln!(stdout(), "Loop cancelled.");
+        let _ = stdout().flush();
+        return CommandAction::Continue;
+    }
+
+    if line.starts_with("/loop ") {
+        let loop_text = line[6..].trim().to_string();
+        if !loop_text.is_empty() {
+            {
+                let sess = session.lock().await;
+                sess.set_loop(Some(loop_text.clone())).await;
+            }
+            let _ = writeln!(stdout(), "Loop started: {}", loop_text);
+            let _ = stdout().flush();
+            return CommandAction::Prompt(loop_text);
+        } else {
+            let _ = writeln!(stdout(), "Usage: /loop <prompt to repeat>");
+            let _ = stdout().flush();
+            return CommandAction::Continue;
+        }
     }
 
     if line.starts_with("/goal ") {
@@ -179,6 +196,13 @@ async fn process_prompt(
             loop {
                 match stdin_rx.try_recv() {
                     Ok(input) => {
+                        if input == CANCEL_LOOP_SIG {
+                            let sess = session.lock().await;
+                            sess.cancel_loop().await;
+                            let _ = writeln!(stdout(), "\n[loop cancelled]");
+                            let _ = stdout().flush();
+                            continue;
+                        }
                         eprintln!("rupi: stdin during prompt: {:?}", &input[..input.len().min(60)]);
                         let sess = session.lock().await;
                         if input.starts_with("/steer ") {

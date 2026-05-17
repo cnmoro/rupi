@@ -1,32 +1,18 @@
 use std::io::{stdout, Write};
 use std::sync::Arc;
-use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::sync::Mutex;
 
 use crate::agent::session::AgentSession;
+use crate::modes::stdin::{spawn_stdin_reader, CANCEL_LOOP_SIG};
 use crate::rpc::jsonl::serialize_json_line;
 use crate::rpc::types::{AgentEvent, AgentMessage, AssistantMessageEvent, MessageContent};
 
 pub async fn run_raw(session: Arc<Mutex<AgentSession>>) {
-    let _ = writeln!(stdout(), "rupi raw mode. Type your prompts. Exit: Ctrl+D, /exit, /quit, or 'exit'.");
+    let _ = writeln!(stdout(), "rupi raw mode. Type your prompts. Exit: Ctrl+D, /exit, /quit, or 'exit'. Double-Esc to cancel loop.");
     let _ = stdout().flush();
 
     let (stdin_tx, mut stdin_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
-    tokio::spawn(async move {
-        let mut reader = BufReader::new(tokio::io::stdin());
-        let mut buf = String::new();
-        loop {
-            buf.clear();
-            match reader.read_line(&mut buf).await {
-                Ok(0) | Err(_) => break,
-                Ok(_) => {
-                    let input = buf.trim().to_string();
-                    if input.is_empty() { continue; }
-                    let _ = stdin_tx.send(input).ok();
-                }
-            }
-        }
-    });
+    spawn_stdin_reader(stdin_tx);
 
     loop {
         let _ = write!(stdout(), "> ");
@@ -112,6 +98,40 @@ pub async fn run_raw(session: Arc<Mutex<AgentSession>>) {
             continue;
         }
 
+        if line == CANCEL_LOOP_SIG {
+            let sess = session.lock().await;
+            sess.cancel_loop().await;
+            let json = serialize_json_line(&serde_json::json!({"type": "loop_cancelled"}));
+            let _ = write!(stdout(), "{}", json);
+            let _ = stdout().flush();
+            continue;
+        }
+
+        if line == "/stop" {
+            let sess = session.lock().await;
+            sess.cancel_loop().await;
+            let json = serialize_json_line(&serde_json::json!({"type": "loop_cancelled"}));
+            let _ = write!(stdout(), "{}", json);
+            let _ = stdout().flush();
+            continue;
+        }
+
+        if line.starts_with("/loop ") {
+            let loop_text = line[6..].trim().to_string();
+            if !loop_text.is_empty() {
+                { let sess = session.lock().await; sess.set_loop(Some(loop_text.clone())).await; }
+                let json = serialize_json_line(&serde_json::json!({"type": "loop_set", "message": loop_text}));
+                let _ = write!(stdout(), "{}", json);
+                let _ = stdout().flush();
+                process_prompt_raw(&session, &loop_text, &mut stdin_rx).await;
+                continue;
+            } else {
+                let _ = write!(stdout(), "{}", serialize_json_line(&serde_json::json!({"type":"error","message":"Usage: /loop <prompt>"})));
+                let _ = stdout().flush();
+                continue;
+            }
+        }
+
         process_prompt_raw(&session, &line, &mut stdin_rx).await;
     }
 }
@@ -142,6 +162,13 @@ async fn process_prompt_raw(
     loop {
         // Poll stdin non-blockingly
         while let Ok(input) = stdin_rx.try_recv() {
+            if input == CANCEL_LOOP_SIG {
+                let sess = session.lock().await;
+                sess.cancel_loop().await;
+                let _ = write!(stdout(), "{}", serialize_json_line(&serde_json::json!({"type": "loop_cancelled"})));
+                let _ = stdout().flush();
+                continue;
+            }
             let sess = session.lock().await;
             if sess.is_streaming().await {
                 if input.starts_with("/steer ") {
