@@ -90,6 +90,7 @@ Available tools:
 - grep: Search file contents for patterns (uses ripgrep, respects .gitignore, falls back to grep).
 - find: Find files by glob pattern (uses fd, respects .gitignore, falls back to find).
 - ls: List directory contents.
+- search_code: Search code using natural language queries. Uses a local AI model (Model2Vec with potion-code-16M) to find relevant code by what it does, not just by keyword matching. Describe what you are looking for in plain English. Falls back to keyword search if the model is unavailable.
 
 Guidelines:
 - Be concise in your responses
@@ -610,9 +611,10 @@ impl AgentSession {
             let mut tool_calls: Vec<ToolCall> = Vec::new();
             let mut finish_reason: Option<String> = None;
             let mut had_stream_events = false;
+            // 5-minute timeout between stream events (accommodates reasoning models)
             loop {
                 let event = match tokio::time::timeout(
-                    std::time::Duration::from_secs(120),
+                    std::time::Duration::from_secs(300),
                     rx.recv(),
                 ).await {
                     Ok(Some(event)) => event,
@@ -1124,7 +1126,7 @@ Has the assistant's output satisfied this exact condition? Reply with only YES o
             follow_up_mode: "all".to_string(),
             auto_compaction_enabled: *self.auto_compaction_enabled.read().await,
             message_count: self.messages.read().await.len(),
-            pending_message_count: 0,
+            pending_message_count: self.pending_steer.read().await.len() + self.pending_follow_up.read().await.len(),
             session_file: self.session_path.read().await.as_ref().map(|p| p.to_string_lossy().to_string()),
         }
     }
