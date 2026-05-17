@@ -8,8 +8,8 @@ Output compression: bash command output is automatically filtered to reduce toke
 
 ## Setup
 
-```jsonΩ
-// ~/.config/rupi.json
+```json
+// ~/.config/rupi.json — standard OpenAI-compatible provider
 {
   "base_url": "https://openrouter.ai/api/v1",
   "api_key": "sk-or-...",
@@ -18,6 +18,32 @@ Output compression: bash command output is automatically filtered to reduce toke
 ```
 
 All values can be overridden via CLI flags (`--base-url`, `--api-key`, `--model`, `--context-window`, `--timeout`, `--memory`, `--disable-yolo`, `--session`).
+
+### Opencode Go / Zen (zero-config alternative)
+
+Instead of finding an API key and base URL, set `opencode_api_key` in your config:
+
+```json
+// ~/.config/rupi.json
+{
+  "opencode_api_key": "oc_...",
+  "opencode_provider": "go"
+}
+```
+
+This uses opencode.ai's API directly — no separate base URL or model tag needed. Two tiers:
+
+- **Opencode Go** (`"opencode_provider": "go"`, default) — `https://opencode.ai/zen/go/v1`. Models: deepseek-v4-flash, deepseek-v4-pro, kimi-k2.5, minimax-m2.7, glm-5, mimo-v2.5-pro.
+- **Opencode Zen** (`"opencode_provider": "zen"`) — `https://opencode.ai/zen/v1`. Models: gpt-5.1-codex-max, claude-sonnet-4-6, gemini-3.1-pro, gpt-5-nano, claude-haiku-4-5.
+
+List available models with:
+
+```
+./rupi --list-opencode-models
+./rupi --list-opencode-models --opencode-provider zen
+```
+
+The list is fetched from `https://models.dev/api.json` (same source opencode uses), with a bundled snapshot as fallback.
 
 ## Modes
 
@@ -28,7 +54,16 @@ REPL prompt for humans. While the agent is generating, you can still type:
 - **Press Enter** → queues as **follow-up**: the message is saved and processed after the current response finishes.
 - **`/steer <message>`** → **interrupts immediately**: the agent receives your message right away and pivots.
 
-Commands: `/goal <desc>`, `/model <name>`, `/compact`, `/steer <message>`. Exit with `Ctrl+D`, `/exit`, `/quit`, or `exit`.
+Commands: `/goal <desc>`, `/model <name>`, `/compact`, `/steer <message>`, `/loop <prompt>`, `/stop`. Exit with `Ctrl+D`, `/exit`, `/quit`, or `exit`.
+
+### Loop mode — `/loop <prompt>`
+
+Sends the prompt, waits for the agent to finish, then sends it again — repeats forever until cancelled. Useful for:
+- Continuous code review
+- Ongoing monitoring tasks
+- Creative generation sprints
+
+Cancel with **double-Esc** (press Esc twice in rapid succession), or type `/stop`.
 
 ### RPC — `./rupi --rpc`
 
@@ -52,6 +87,13 @@ Events: `generation_id`, `agent_start`, `turn_start`, `message_start`, `message_
 
 - `"steer"` — interrupts the current generation immediately, like `/steer` in interactive.
 - `"followUp"` — queues the message; the agent processes it after the current turn finishes.
+
+**Loop mode in RPC** — start and stop with `SetLoop` and `StopLoop`:
+
+```json
+{"type":"set_loop","id":"1","message":"review this file"}
+{"type":"stop_loop","id":"2"}
+```
 
 ### Raw — `./rupi --raw`
 
