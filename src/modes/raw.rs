@@ -60,6 +60,9 @@ pub async fn run_raw(session: Arc<Mutex<AgentSession>>) {
                 let json = serialize_json_line(&serde_json::json!({"type": "goal_set", "goal": goal_text}));
                 let _ = write!(stdout(), "{}", json);
                 let _ = stdout().flush();
+                // Use the goal text as the prompt, not the /goal command
+                process_prompt_raw(&session, &goal_text, &mut stdin_rx).await;
+                continue;
             } else {
                 let _ = write!(stdout(), "{}", serialize_json_line(&serde_json::json!({"type":"error","message":"Usage: /goal <description>"})));
                 let _ = stdout().flush();

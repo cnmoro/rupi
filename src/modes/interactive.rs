@@ -43,8 +43,8 @@ pub async fn run_interactive(session: Arc<Mutex<AgentSession>>) {
         match handle_command(&session, &line).await {
             CommandAction::Continue => continue,
             CommandAction::Break => break,
-            CommandAction::Prompt => {
-                process_prompt(&session, &line, &mut stdin_rx).await;
+            CommandAction::Prompt(prompt_line) => {
+                process_prompt(&session, &prompt_line, &mut stdin_rx).await;
             }
         }
     }
@@ -53,7 +53,7 @@ pub async fn run_interactive(session: Arc<Mutex<AgentSession>>) {
 enum CommandAction {
     Continue,
     Break,
-    Prompt,
+    Prompt(String),
 }
 
 async fn handle_command(session: &Arc<Mutex<AgentSession>>, line: &str) -> CommandAction {
@@ -84,7 +84,8 @@ async fn handle_command(session: &Arc<Mutex<AgentSession>>, line: &str) -> Comma
             }
             let _ = writeln!(stdout(), "Goal set and starting work: {}", goal_text);
             let _ = stdout().flush();
-            // Fall through — the goal text becomes the prompt
+            // Use the goal text as the prompt (not the /goal command)
+            return CommandAction::Prompt(goal_text);
         } else {
             let _ = writeln!(stdout(), "Usage: /goal <description of what to achieve>");
             let _ = stdout().flush();
@@ -131,7 +132,7 @@ async fn handle_command(session: &Arc<Mutex<AgentSession>>, line: &str) -> Comma
         return CommandAction::Continue;
     }
 
-    CommandAction::Prompt
+    CommandAction::Prompt(line.to_string())
 }
 
 async fn process_prompt(
