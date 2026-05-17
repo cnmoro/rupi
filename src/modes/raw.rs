@@ -2,7 +2,7 @@ use std::io::{stdout, Write};
 use std::sync::Arc;
 
 use crate::agent::session::AgentSession;
-use crate::modes::stdin::{spawn_stdin_reader, CANCEL_LOOP_SIG, EOF_SIG};
+use crate::modes::stdin::{read_line_edited, spawn_streaming_reader, CANCEL_LOOP_SIG, EOF_SIG};
 use crate::rpc::jsonl::serialize_json_line;
 use crate::rpc::types::{AgentEvent, AgentMessage, AssistantMessageEvent, MessageContent};
 
@@ -10,13 +10,13 @@ pub async fn run_raw(session: Arc<AgentSession>) {
     let _ = writeln!(stdout(), "rupi raw mode. Type your prompts. Exit: Ctrl+D, /exit, /quit, or 'exit'. Double-Esc to cancel loop.");
     let _ = stdout().flush();
 
-    let (stdin_tx, mut stdin_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
-    spawn_stdin_reader(stdin_tx);
-
     loop {
-        let _ = write!(stdout(), "> ");
-        let _ = stdout().flush();
-        let line = match stdin_rx.recv().await {
+        let line = tokio::task::spawn_blocking(move || read_line_edited("> "))
+            .await
+            .ok()
+            .flatten();
+
+        let line = match line {
             Some(l) => l,
             None => break,
         };
@@ -44,15 +44,14 @@ pub async fn run_raw(session: Arc<AgentSession>) {
                 let json = serialize_json_line(&serde_json::json!({"type": "goal_set", "goal": goal_text}));
                 let _ = write!(stdout(), "{}", json);
                 let _ = stdout().flush();
-                // Use the goal text as the prompt, not the /goal command
-                process_prompt_raw(&session, &goal_text, &mut stdin_rx).await;
-                continue;
-            } else {
-                let _ = write!(stdout(), "{}", serialize_json_line(&serde_json::json!({"type":"error","message":"Usage: /goal <description>"})));
-                let _ = stdout().flush();
+                process_prompt_raw(&session, &goal_text).await;
                 continue;
             }
-        } else if line == "/goal" {
+            let _ = write!(stdout(), "{}", serialize_json_line(&serde_json::json!({"type":"error","message":"Usage: /goal <description>"})));
+            let _ = stdout().flush();
+            continue;
+        }
+        if line == "/goal" {
             let goal = session.get_goal().await;
             let json = serialize_json_line(&serde_json::json!({"type": "goal_info", "goal": goal}));
             let _ = write!(stdout(), "{}", json);
@@ -115,23 +114,21 @@ pub async fn run_raw(session: Arc<AgentSession>) {
                 let json = serialize_json_line(&serde_json::json!({"type": "loop_set", "message": loop_text}));
                 let _ = write!(stdout(), "{}", json);
                 let _ = stdout().flush();
-                process_prompt_raw(&session, &loop_text, &mut stdin_rx).await;
-                continue;
-            } else {
-                let _ = write!(stdout(), "{}", serialize_json_line(&serde_json::json!({"type":"error","message":"Usage: /loop <prompt>"})));
-                let _ = stdout().flush();
+                process_prompt_raw(&session, &loop_text).await;
                 continue;
             }
+            let _ = write!(stdout(), "{}", serialize_json_line(&serde_json::json!({"type":"error","message":"Usage: /loop <prompt>"})));
+            let _ = stdout().flush();
+            continue;
         }
 
-        process_prompt_raw(&session, &line, &mut stdin_rx).await;
+        process_prompt_raw(&session, &line).await;
     }
 }
 
 async fn process_prompt_raw(
     session: &Arc<AgentSession>,
     initial_input: &str,
-    stdin_rx: &mut tokio::sync::mpsc::UnboundedReceiver<String>,
 ) {
     let (event_tx, mut event_rx) = tokio::sync::mpsc::unbounded_channel::<AgentEvent>();
     let sess = session.clone();
@@ -150,6 +147,11 @@ async fn process_prompt_raw(
         }
     });
 
+    // Spawn streaming reader for steer/follow-up during this prompt
+    let (stdin_tx, mut stdin_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+    let streaming_stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    spawn_streaming_reader(stdin_tx, streaming_stop.clone());
+
     loop {
         // Poll stdin non-blockingly
         while let Ok(input) = stdin_rx.try_recv() {
@@ -157,6 +159,10 @@ async fn process_prompt_raw(
                 session.cancel_loop().await;
                 let _ = write!(stdout(), "{}", serialize_json_line(&serde_json::json!({"type": "loop_cancelled"})));
                 let _ = stdout().flush();
+                if input == EOF_SIG {
+                    streaming_stop.store(true, std::sync::atomic::Ordering::SeqCst);
+                    return;
+                }
                 continue;
             }
             if session.is_streaming().await {
@@ -186,28 +192,23 @@ async fn process_prompt_raw(
                         let mut obj = serde_json::json!({"type": "message_end", "role": message.role});
                         let text_content: Vec<&str> = message.content.iter()
                             .filter_map(|c| c.text.as_deref()).collect();
-                        let text_content = text_content.join("\n");
-                        if !text_content.is_empty() { obj["content"] = serde_json::json!(text_content); }
-                        if let Some(reason) = &message.stop_reason { obj["stop_reason"] = serde_json::json!(reason); }
-                        if let Some(usage) = &message.usage {
-                            obj["usage"] = serde_json::json!({"input_tokens": usage.input, "output_tokens": usage.output, "total_tokens": usage.total_tokens});
-                            if let Some(cost) = &usage.cost {
-                                let mut cost_obj = serde_json::Map::new();
-                                if let Some(pc) = cost.prompt_cost { cost_obj.insert("prompt_cost".into(), serde_json::json!(pc)); }
-                                if let Some(cc) = cost.completion_cost { cost_obj.insert("completion_cost".into(), serde_json::json!(cc)); }
-                                if let Some(tc) = cost.total_cost { cost_obj.insert("total_cost".into(), serde_json::json!(tc)); }
-                                if !cost_obj.is_empty() { obj["cost"] = serde_json::Value::Object(cost_obj); }
-                            }
+                        if !text_content.is_empty() {
+                            obj["content"] = serde_json::json!(text_content.join("\n"));
+                        }
+                        if let Some(ref reason) = message.stop_reason {
+                            obj["stop_reason"] = serde_json::json!(reason);
                         }
                         serialize_json_line(&obj)
                     }
-                    Some(AgentEvent::GenerationId { id, .. }) => serialize_json_line(&serde_json::json!({"type": "generation_id", "id": id})),
-                    Some(AgentEvent::AgentEnd { .. }) | None => { break; }
-                    Some(AgentEvent::ToolExecutionStart { tool_name, arguments, .. }) => serialize_json_line(&serde_json::json!({"type": "tool_execution_start", "tool": tool_name, "arguments": arguments})),
+                    Some(AgentEvent::ToolExecutionStart { tool_name, arguments, .. }) =>
+                        serialize_json_line(&serde_json::json!({"type": "tool_execution_start", "tool": tool_name, "arguments": arguments})),
                     Some(AgentEvent::ToolExecutionEnd { tool_name, result, .. }) => {
                         let truncated = if result.len() > 2000 { format!("{}... [truncated]", &result[..2000]) } else { result.clone() };
                         serialize_json_line(&serde_json::json!({"type": "tool_execution_end", "tool": tool_name, "result": truncated}))
                     }
+                    Some(AgentEvent::AgentStart { .. }) =>
+                        serialize_json_line(&serde_json::json!({"type": "agent_start"})),
+                    Some(AgentEvent::AgentEnd { .. }) | None => { break; }
                     _ => continue,
                 };
                 let _ = write!(stdout(), "{}", json);
@@ -216,5 +217,6 @@ async fn process_prompt_raw(
         }
     }
 
+    streaming_stop.store(true, std::sync::atomic::Ordering::SeqCst);
     let _ = prompt_handle.await;
 }

@@ -2,7 +2,7 @@ use std::io::{stdout, Write};
 use std::sync::Arc;
 
 use crate::agent::session::AgentSession;
-use crate::modes::stdin::{spawn_stdin_reader, CANCEL_LOOP_SIG, EOF_SIG};
+use crate::modes::stdin::{read_line_edited, spawn_streaming_reader, CANCEL_LOOP_SIG, EOF_SIG};
 use crate::rpc::types::{AgentEvent, AgentMessage, AssistantMessageEvent, MessageContent};
 
 /// Run the interactive REPL mode with concurrent stdin + event reading.
@@ -11,16 +11,17 @@ pub async fn run_interactive(session: Arc<AgentSession>) {
     let _ = writeln!(stdout(), "rupi interactive mode. Type your prompts. Exit: Ctrl+D, /exit, /quit, or 'exit'. Double-Esc to cancel loop.");
     let _ = stdout().flush();
 
-    // Spawn a single persistent stdin reader with double-Esc detection
-    let (stdin_tx, mut stdin_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
-    spawn_stdin_reader(stdin_tx);
-
+    // Inline helper to run interact_text on a blocking thread
     loop {
-        let _ = write!(stdout(), "> ");
-        let _ = stdout().flush();
-        let line = match stdin_rx.recv().await {
+        // Read input with full line editing at the "> " prompt
+        let line = tokio::task::spawn_blocking(move || read_line_edited("> "))
+            .await
+            .ok()
+            .flatten();
+
+        let line = match line {
             Some(l) => l,
-            None => break,
+            None => break, // Ctrl+D
         };
 
         if line == CANCEL_LOOP_SIG {
@@ -31,7 +32,6 @@ pub async fn run_interactive(session: Arc<AgentSession>) {
         }
 
         if line == EOF_SIG {
-            // Cancel any active loop, then exit
             session.cancel_loop().await;
             break;
         }
@@ -40,7 +40,7 @@ pub async fn run_interactive(session: Arc<AgentSession>) {
             CommandAction::Continue => continue,
             CommandAction::Break => break,
             CommandAction::Prompt(prompt_line) => {
-                process_prompt(&session, &prompt_line, &mut stdin_rx).await;
+                process_prompt(&session, &prompt_line).await;
             }
         }
     }
@@ -70,7 +70,7 @@ async fn handle_command(session: &Arc<AgentSession>, line: &str) -> CommandActio
         return CommandAction::Continue;
     }
 
-    if line == "/stop" || line == "/stop" {
+    if line == "/stop" {
         session.cancel_loop().await;
         let _ = writeln!(stdout(), "Loop cancelled.");
         let _ = stdout().flush();
@@ -84,11 +84,10 @@ async fn handle_command(session: &Arc<AgentSession>, line: &str) -> CommandActio
             let _ = writeln!(stdout(), "Loop started: {}", loop_text);
             let _ = stdout().flush();
             return CommandAction::Prompt(loop_text);
-        } else {
-            let _ = writeln!(stdout(), "Usage: /loop <prompt to repeat>");
-            let _ = stdout().flush();
-            return CommandAction::Continue;
         }
+        let _ = writeln!(stdout(), "Usage: /loop <prompt to repeat>");
+        let _ = stdout().flush();
+        return CommandAction::Continue;
     }
 
     if line.starts_with("/goal ") {
@@ -98,12 +97,12 @@ async fn handle_command(session: &Arc<AgentSession>, line: &str) -> CommandActio
             let _ = writeln!(stdout(), "Goal set and starting work: {}", goal_text);
             let _ = stdout().flush();
             return CommandAction::Prompt(goal_text);
-        } else {
-            let _ = writeln!(stdout(), "Usage: /goal <description of what to achieve>");
-            let _ = stdout().flush();
-            return CommandAction::Continue;
         }
-    } else if line == "/goal" {
+        let _ = writeln!(stdout(), "Usage: /goal <description of what to achieve>");
+        let _ = stdout().flush();
+        return CommandAction::Continue;
+    }
+    if line == "/goal" {
         match session.get_goal().await {
             Some(g) => { let _ = writeln!(stdout(), "Current goal: {}", g); }
             None => { let _ = writeln!(stdout(), "No goal set."); }
@@ -146,10 +145,11 @@ async fn handle_command(session: &Arc<AgentSession>, line: &str) -> CommandActio
 async fn process_prompt(
     session: &Arc<AgentSession>,
     initial_input: &str,
-    stdin_rx: &mut tokio::sync::mpsc::UnboundedReceiver<String>,
 ) {
     let (event_tx, mut event_rx) = tokio::sync::mpsc::unbounded_channel::<AgentEvent>();
+    let mut interrupted: Option<String> = None;
 
+    // Spawn the prompt in a background task
     let sess = session.clone();
     let tx = event_tx.clone();
     let prompt_msg = initial_input.to_string();
@@ -171,19 +171,17 @@ async fn process_prompt(
         }
     });
 
-    // Event loop: print events, poll stdin non-blockingly for steer/follow-up.
-    // IMPORTANT: Do NOT acquire the session lock here — prompt() holds it for
-    // the entire duration, and we'd deadlock waiting for it. All session
-    // operations use interior mutability (AtomicBool, tokio RwLock, etc.) and
-    // don't need the outer Mutex.
+    // Spawn a temporary stdin reader for steer/follow-up during streaming
+    let (stdin_tx, mut stdin_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+    let streaming_stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    spawn_streaming_reader(stdin_tx, streaming_stop.clone());
+
+    // Event loop
     let mut got_text = false;
     let mut saw_reasoning = false;
-    let mut interrupted: Option<String> = None;
 
     loop {
-        // Poll stdin non-blockingly. Lines entered during streaming are
-        // queued as steer or follow-up. Lines entered after the prompt has
-        // finished will be left in the channel for the main REPL loop.
+        // Poll stdin non-blockingly for steer/follow-up
         loop {
             match stdin_rx.try_recv() {
                 Ok(input) => {
@@ -191,9 +189,12 @@ async fn process_prompt(
                         session.cancel_loop().await;
                         let _ = writeln!(stdout(), "\n[loop cancelled]");
                         let _ = stdout().flush();
+                        if input == EOF_SIG {
+                            streaming_stop.store(true, std::sync::atomic::Ordering::SeqCst);
+                            return;
+                        }
                         continue;
                     }
-                    eprintln!("rupi: stdin during prompt: {:?}", &input[..input.len().min(60)]);
                     if input.starts_with("/steer ") {
                         let steer_text = input[7..].trim().to_string();
                         session.abort().await;
@@ -282,6 +283,9 @@ async fn process_prompt(
         }
     }
 
+    // Stop the streaming reader
+    streaming_stop.store(true, std::sync::atomic::Ordering::SeqCst);
+
     let _ = prompt_handle.await;
 
     // If interrupted by steer, immediately start a new prompt
@@ -294,9 +298,21 @@ async fn process_prompt(
             let _ = sess2.prompt(&steer_text, tx2).await;
         });
         let mut got2 = false;
+
+        // Spawn another streaming reader for the steer prompt
+        let (stdin_tx2, mut stdin_rx2) = tokio::sync::mpsc::unbounded_channel::<String>();
+        let stop2 = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        spawn_streaming_reader(stdin_tx2, stop2.clone());
+
         loop {
-            // Poll stdin for any steer during this second prompt too
-            while let Ok(input) = stdin_rx.try_recv() {
+            while let Ok(input) = stdin_rx2.try_recv() {
+                if input == CANCEL_LOOP_SIG || input == EOF_SIG {
+                    session.cancel_loop().await;
+                    let _ = writeln!(stdout(), "\n[loop cancelled]");
+                    let _ = stdout().flush();
+                    stop2.store(true, std::sync::atomic::Ordering::SeqCst);
+                    return;
+                }
                 if session.is_streaming().await && input.starts_with("/steer ") {
                     let t = input[7..].trim().to_string();
                     session.abort().await;
@@ -338,6 +354,7 @@ async fn process_prompt(
                 _ => {}
             }
         }
+        stop2.store(true, std::sync::atomic::Ordering::SeqCst);
         let _ = handle2.await;
     }
 
