@@ -21,7 +21,10 @@ fn load_e2e_config() -> Option<RupiConfig> {
             let contents = std::fs::read_to_string(path).ok()?;
             // Try JSON format first (rupi config)
             if let Ok(config) = serde_json::from_str::<RupiConfig>(&contents) {
-                if !config.base_url.is_empty() && !config.api_key.is_empty() && !config.model_tag.is_empty() {
+                let has_standard = config.base_url.as_deref().unwrap_or("").len() > 0
+                    && config.api_key.as_deref().unwrap_or("").len() > 0
+                    && config.model_tag.as_deref().unwrap_or("").len() > 0;
+                if has_standard || config.opencode_api_key.is_some() {
                     return Some(config);
                 }
             }
@@ -53,9 +56,9 @@ fn load_e2e_config() -> Option<RupiConfig> {
             let model = std::env::var("RUPI_MODEL").ok().filter(|s| !s.is_empty());
             if let (Some(base_url), Some(api_key), Some(model)) = (base_url, api_key, model) {
                 return Some(RupiConfig {
-                    base_url,
-                    api_key,
-                    model_tag: model,
+                    base_url: Some(base_url),
+                    api_key: Some(api_key),
+                    model_tag: Some(model),
                     opencode_api_key: None,
                     opencode_provider: None,
                 });
@@ -67,9 +70,9 @@ fn load_e2e_config() -> Option<RupiConfig> {
 
 fn make_config(config: &RupiConfig) -> OpenAIConfig {
     OpenAIConfig {
-        base_url: config.base_url.clone(),
-        api_key: config.api_key.clone(),
-        model: config.model_tag.clone(),
+        base_url: config.base_url.clone().unwrap_or_default(),
+        api_key: config.api_key.clone().unwrap_or_default(),
+        model: config.model_tag.clone().unwrap_or_default(),
         context_window: 128000,
         timeout_secs: 0,
             reasoning: false,
@@ -88,7 +91,7 @@ async fn e2e_test_api_reachable() {
 
     let provider = rupi::provider::openai::OpenAIProvider::new(make_config(&config));
     let info = provider.model_info();
-    assert_eq!(info.id, config.model_tag);
+    assert_eq!(info.id, config.model_tag.as_deref().unwrap_or(""));
     assert_eq!(info.provider, "openai-compatible");
     assert!(info.context_window > 0);
 }
@@ -107,7 +110,7 @@ async fn e2e_test_rpc_get_state() {
     let state = session.get_state().await;
     assert!(state.model.is_some());
     let model = state.model.as_ref().unwrap();
-    assert_eq!(model.id, config.model_tag);
+    assert_eq!(model.id, config.model_tag.as_deref().unwrap_or(""));
     assert_eq!(model.provider, "openai-compatible");
     assert_eq!(state.message_count, 0);
     assert!(!state.is_streaming);
@@ -162,7 +165,7 @@ async fn e2e_test_rpc_available_models() {
     let session = AgentSession::from_config(make_config(&config));
     let info = session.provider_model_info();
     assert_eq!(info.provider, "openai-compatible");
-    assert_eq!(info.id, config.model_tag);
+    assert_eq!(info.id, config.model_tag.as_deref().unwrap_or(""));
 }
 
 #[tokio::test]
@@ -182,7 +185,7 @@ async fn e2e_test_rpc_set_model() {
     let cmd = RpcCommand::SetModel {
         id: Some("e2e-2".into()),
         provider: "openai-compatible".into(),
-        model_id: config.model_tag.clone(),
+        model_id: config.model_tag.clone().unwrap_or_default(),
     };
     handler.handle(cmd, tx).await;
 
@@ -366,9 +369,9 @@ async fn e2e_test_compaction_and_continuation() {
     // Create a session with a tiny context window (500 tokens) so
     // compaction triggers immediately after a few messages.
     let openai_config = OpenAIConfig {
-        base_url: config.base_url.clone(),
-        api_key: config.api_key.clone(),
-        model: config.model_tag.clone(),
+        base_url: config.base_url.clone().unwrap_or_default(),
+        api_key: config.api_key.clone().unwrap_or_default(),
+        model: config.model_tag.clone().unwrap_or_default(),
         context_window: 500,
         timeout_secs: 0,
             reasoning: false,
@@ -461,9 +464,9 @@ async fn e2e_test_compaction_via_rpc_and_continue() {
     };
 
     let openai_config = OpenAIConfig {
-        base_url: config.base_url.clone(),
-        api_key: config.api_key.clone(),
-        model: config.model_tag.clone(),
+        base_url: config.base_url.clone().unwrap_or_default(),
+        api_key: config.api_key.clone().unwrap_or_default(),
+        model: config.model_tag.clone().unwrap_or_default(),
         context_window: 500,
         timeout_secs: 0,
             reasoning: false,
@@ -569,9 +572,9 @@ async fn e2e_test_goal_completes() {
     };
 
     let openai_config = OpenAIConfig {
-        base_url: config.base_url.clone(),
-        api_key: config.api_key.clone(),
-        model: config.model_tag.clone(),
+        base_url: config.base_url.clone().unwrap_or_default(),
+        api_key: config.api_key.clone().unwrap_or_default(),
+        model: config.model_tag.clone().unwrap_or_default(),
         context_window: 128000,
         timeout_secs: 0,
             reasoning: false,
@@ -618,9 +621,9 @@ async fn e2e_test_goal_nudge_detected() {
     };
 
     let openai_config = OpenAIConfig {
-        base_url: config.base_url.clone(),
-        api_key: config.api_key.clone(),
-        model: config.model_tag.clone(),
+        base_url: config.base_url.clone().unwrap_or_default(),
+        api_key: config.api_key.clone().unwrap_or_default(),
+        model: config.model_tag.clone().unwrap_or_default(),
         context_window: 128000,
         timeout_secs: 0,
             reasoning: false,
@@ -684,9 +687,9 @@ async fn e2e_test_goal_no_goal_normal_flow() {
     };
 
     let openai_config = OpenAIConfig {
-        base_url: config.base_url.clone(),
-        api_key: config.api_key.clone(),
-        model: config.model_tag.clone(),
+        base_url: config.base_url.clone().unwrap_or_default(),
+        api_key: config.api_key.clone().unwrap_or_default(),
+        model: config.model_tag.clone().unwrap_or_default(),
         context_window: 128000,
         timeout_secs: 0,
             reasoning: false,
@@ -724,9 +727,9 @@ async fn e2e_test_goal_rpc_set_and_run() {
     };
 
     let openai_config = OpenAIConfig {
-        base_url: config.base_url.clone(),
-        api_key: config.api_key.clone(),
-        model: config.model_tag.clone(),
+        base_url: config.base_url.clone().unwrap_or_default(),
+        api_key: config.api_key.clone().unwrap_or_default(),
+        model: config.model_tag.clone().unwrap_or_default(),
         context_window: 128000,
         timeout_secs: 0,
             reasoning: false,
@@ -770,9 +773,9 @@ async fn e2e_test_approval_deny_tool() {
     };
 
     let openai_config = OpenAIConfig {
-        base_url: config.base_url.clone(),
-        api_key: config.api_key.clone(),
-        model: config.model_tag.clone(),
+        base_url: config.base_url.clone().unwrap_or_default(),
+        api_key: config.api_key.clone().unwrap_or_default(),
+        model: config.model_tag.clone().unwrap_or_default(),
         context_window: 128000,
         timeout_secs: 0,
             reasoning: false,
@@ -828,9 +831,9 @@ async fn e2e_test_approval_allow_tool() {
     };
 
     let openai_config = OpenAIConfig {
-        base_url: config.base_url.clone(),
-        api_key: config.api_key.clone(),
-        model: config.model_tag.clone(),
+        base_url: config.base_url.clone().unwrap_or_default(),
+        api_key: config.api_key.clone().unwrap_or_default(),
+        model: config.model_tag.clone().unwrap_or_default(),
         context_window: 128000,
         timeout_secs: 0,
             reasoning: false,
@@ -885,9 +888,9 @@ async fn e2e_test_approval_yolo_default() {
     };
 
     let openai_config = OpenAIConfig {
-        base_url: config.base_url.clone(),
-        api_key: config.api_key.clone(),
-        model: config.model_tag.clone(),
+        base_url: config.base_url.clone().unwrap_or_default(),
+        api_key: config.api_key.clone().unwrap_or_default(),
+        model: config.model_tag.clone().unwrap_or_default(),
         context_window: 128000,
         timeout_secs: 0,
             reasoning: false,
@@ -937,9 +940,9 @@ async fn e2e_test_steer_queues_during_streaming() {
     };
 
     let openai_config = OpenAIConfig {
-        base_url: config.base_url.clone(),
-        api_key: config.api_key.clone(),
-        model: config.model_tag.clone(),
+        base_url: config.base_url.clone().unwrap_or_default(),
+        api_key: config.api_key.clone().unwrap_or_default(),
+        model: config.model_tag.clone().unwrap_or_default(),
         context_window: 128000,
         reasoning: false,
         timeout_secs: 0,

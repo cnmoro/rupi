@@ -3,9 +3,12 @@ use std::path::PathBuf;
 /// Configuration loaded from ~/.config/rupi.json
 #[derive(Debug, Clone, serde::Deserialize)]
 pub struct RupiConfig {
-    pub base_url: String,
-    pub api_key: String,
-    pub model_tag: String,
+    #[serde(default)]
+    pub base_url: Option<String>,
+    #[serde(default)]
+    pub api_key: Option<String>,
+    #[serde(default)]
+    pub model_tag: Option<String>,
     #[serde(rename = "opencode_api_key", default)]
     pub opencode_api_key: Option<String>,
     #[serde(rename = "opencode_provider", default)]
@@ -26,18 +29,18 @@ impl RupiConfig {
         let config: RupiConfig = serde_json::from_str(&contents)
             .map_err(|e| format!("Failed to parse {}: {}", path.display(), e))?;
 
-        // If opencode_api_key is set, it overrides the standard config
+        // If opencode_api_key is set, skip standard field validation
         if config.opencode_api_key.is_some() {
             return Ok(config);
         }
 
-        if config.base_url.is_empty() {
+        if config.base_url.as_deref().unwrap_or("").is_empty() {
             return Err("base_url cannot be empty in config".into());
         }
-        if config.api_key.is_empty() {
+        if config.api_key.as_deref().unwrap_or("").is_empty() {
             return Err("api_key cannot be empty in config".into());
         }
-        if config.model_tag.is_empty() {
+        if config.model_tag.as_deref().unwrap_or("").is_empty() {
             return Err("model_tag cannot be empty in config".into());
         }
         Ok(config)
@@ -45,19 +48,18 @@ impl RupiConfig {
 
     /// Resolve the effective API key — uses opencode_api_key if present.
     pub fn effective_api_key(&self) -> &str {
-        self.opencode_api_key.as_deref().unwrap_or(&self.api_key)
+        self.opencode_api_key.as_deref().unwrap_or(self.api_key.as_deref().unwrap_or(""))
     }
 
     /// Resolve the effective base URL — uses opencode URL if opencode_api_key is set.
     pub fn effective_base_url(&self) -> &str {
         if self.opencode_api_key.is_some() {
-            // Default to Go provider
             match self.opencode_provider.as_deref() {
                 Some("zen") => "https://opencode.ai/zen/v1",
                 _ => "https://opencode.ai/zen/go/v1",
             }
         } else {
-            &self.base_url
+            self.base_url.as_deref().unwrap_or("")
         }
     }
 
@@ -117,36 +119,40 @@ mod tests {
         // Temporarily redirect config_path to our test file
         let contents = fs::read_to_string(&config_path).unwrap();
         let config: RupiConfig = serde_json::from_str(&contents).unwrap();
-        assert_eq!(config.base_url, "https://api.example.com");
-        assert_eq!(config.api_key, "sk-test");
-        assert_eq!(config.model_tag, "gpt-4");
+        assert_eq!(config.base_url.as_deref(), Some("https://api.example.com"));
+        assert_eq!(config.api_key.as_deref(), Some("sk-test"));
+        assert_eq!(config.model_tag.as_deref(), Some("gpt-4"));
         fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]
-    fn test_load_invalid_config_missing_fields() {
-        let result = serde_json::from_str::<RupiConfig>(r#"{"base_url":"https://example.com"}"#);
-        assert!(result.is_err());
+    fn test_load_partial_config_succeeds_with_defaults() {
+        // With only base_url, the other fields default to None
+        let config: RupiConfig = serde_json::from_str(r#"{"base_url":"https://example.com"}"#).unwrap();
+        assert_eq!(config.base_url.as_deref(), Some("https://example.com"));
+        assert_eq!(config.api_key, None);
+        assert_eq!(config.model_tag, None);
+        assert_eq!(config.opencode_api_key, None);
     }
 
     #[test]
     fn test_config_empty_validation() {
         let config = RupiConfig {
-            base_url: "".into(),
-            api_key: "sk-test".into(),
-            model_tag: "gpt-4".into(),
+            base_url: Some("".into()),
+            api_key: Some("sk-test".into()),
+            model_tag: Some("gpt-4".into()),
             opencode_api_key: None,
             opencode_provider: None,
         };
-        assert!(config.base_url.is_empty());
+        assert!(config.base_url.as_deref().unwrap_or("").is_empty());
     }
 
     #[test]
     fn test_opencode_config_overrides() {
         let config = RupiConfig {
-            base_url: "https://old.example.com".into(),
-            api_key: "old-key".into(),
-            model_tag: "old-model".into(),
+            base_url: Some("https://old.example.com".into()),
+            api_key: Some("old-key".into()),
+            model_tag: Some("old-model".into()),
             opencode_api_key: Some("oc_key".into()),
             opencode_provider: Some("go".into()),
         };
@@ -156,14 +162,16 @@ mod tests {
     }
 
     #[test]
-    fn test_opencode_config_zen() {
+    fn test_opencode_config_omits_standard_fields() {
+        // Simulate a config that has ONLY opencode fields (what the user would write)
         let config = RupiConfig {
-            base_url: "".into(),
-            api_key: "".into(),
-            model_tag: "".into(),
+            base_url: None,
+            api_key: None,
+            model_tag: None,
             opencode_api_key: Some("oc_key".into()),
             opencode_provider: Some("zen".into()),
         };
+        assert_eq!(config.effective_api_key(), "oc_key");
         assert_eq!(config.effective_base_url(), "https://opencode.ai/zen/v1");
         assert_eq!(config.opencode_variant(), "zen");
     }
@@ -171,9 +179,9 @@ mod tests {
     #[test]
     fn test_opencode_config_defaults() {
         let config = RupiConfig {
-            base_url: "https://old.example.com".into(),
-            api_key: "old-key".into(),
-            model_tag: "old-model".into(),
+            base_url: Some("https://old.example.com".into()),
+            api_key: Some("old-key".into()),
+            model_tag: Some("old-model".into()),
             opencode_api_key: None,
             opencode_provider: None,
         };
@@ -185,9 +193,9 @@ mod tests {
     #[test]
     fn test_opencode_config_default_provider_is_go() {
         let config = RupiConfig {
-            base_url: "".into(),
-            api_key: "".into(),
-            model_tag: "".into(),
+            base_url: None,
+            api_key: None,
+            model_tag: None,
             opencode_api_key: Some("k".into()),
             opencode_provider: None,
         };

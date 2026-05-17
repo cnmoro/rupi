@@ -35,9 +35,9 @@ async fn main() {
                 eprintln!("rupi: create ~/.config/rupi.json with: {{\"opencode_api_key\": \"...\"}}");
                 // We still need the API key — try env var
                 RupiConfig {
-                    base_url: String::new(),
-                    api_key: String::new(),
-                    model_tag: String::new(),
+                    base_url: None,
+                    api_key: None,
+                    model_tag: None,
                     opencode_api_key: std::env::var("OPENCODE_API_KEY").ok(),
                     opencode_provider: Some(cli.opencode_provider.clone()),
                 }
@@ -66,10 +66,11 @@ async fn main() {
 
     // Resolve base_url, api_key, model — opencode config takes priority if set
     let base_url = if file_config.opencode_api_key.is_some() {
-        // Use opencode's effective base URL (overrides CLI --base-url)
         file_config.effective_base_url().to_string()
+    } else if let Some(url) = cli.base_url.as_deref() {
+        url.to_string()
     } else {
-        cli.base_url.as_deref().unwrap_or(&file_config.base_url).to_string()
+        file_config.base_url.as_deref().unwrap_or("").to_string()
     };
 
     let api_key = if file_config.opencode_api_key.is_some() {
@@ -77,14 +78,15 @@ async fn main() {
     } else if let Some(cli_key) = cli.api_key.as_deref() {
         rupi::auth::resolve_api_key(cli_key)
     } else {
-        rupi::auth::resolve_api_key(&file_config.api_key)
+        rupi::auth::resolve_api_key(file_config.api_key.as_deref().unwrap_or(""))
     };
 
     let model = if file_config.opencode_api_key.is_some() {
-        // Default to deepseek-v4-flash for both Go and Zen
-        cli.model.as_deref().unwrap_or("deepseek-v4-flash")
+        cli.model.as_deref().unwrap_or("deepseek-v4-flash").to_string()
+    } else if let Some(m) = cli.model.as_deref() {
+        m.to_string()
     } else {
-        cli.model.as_deref().unwrap_or(&file_config.model_tag)
+        file_config.model_tag.as_deref().unwrap_or("").to_string()
     };
 
     if api_key.is_empty() {
