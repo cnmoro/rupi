@@ -80,7 +80,8 @@ fn enable_raw_mode() -> Result<std::os::unix::io::RawFd, ()> {
         return Err(());
     }
     let mut raw = termios;
-    raw.c_iflag &= !(libc::BRKINT | libc::ICRNL | libc::INPCK | libc::ISTRIP | libc::IXON);
+    raw.c_iflag &= !(libc::BRKINT | libc::INPCK | libc::ISTRIP | libc::IXON);
+    raw.c_iflag |= libc::ICRNL;
     raw.c_oflag |= libc::OPOST | libc::ONLCR;
     raw.c_cflag |= libc::CS8;
     raw.c_lflag &= !(libc::ICANON | libc::IEXTEN | libc::ISIG);
