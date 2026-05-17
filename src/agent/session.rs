@@ -665,6 +665,8 @@ impl AgentSession {
             }
 
             // Create abort signal for this round
+            // Reset the persistent flag now that we have a fresh signal path
+            *self.abort_requested.lock().await = false;
             let (abort_tx, abort_rx) = watch::channel(false);
             {
                 let mut signal = self.abort_signal.lock().await;
@@ -1201,10 +1203,15 @@ impl AgentSession {
     /// where is_streaming=false lets a new prompt() start before the old tool
     /// loop has finished cleaning up.
     pub async fn abort(&self) {
-        *self.abort_requested.lock().await = true;
         let mut signal = self.abort_signal.lock().await;
         if let Some(tx) = signal.take() {
             let _ = tx.send(true);
+            // Signal delivered through the watch channel — no need for the flag
+            *self.abort_requested.lock().await = false;
+        } else {
+            // No active stream — set persistent flag so the next iteration
+            // checks and aborts immediately.
+            *self.abort_requested.lock().await = true;
         }
     }
 

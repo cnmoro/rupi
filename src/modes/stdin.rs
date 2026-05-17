@@ -129,6 +129,7 @@ fn cbreak_reader(tx: tokio::sync::mpsc::UnboundedSender<String>) {
                         if !buf.is_empty() {
                             let line = String::from_utf8_lossy(&buf).trim().to_string();
                             if !line.is_empty() {
+                                echo_char(b'\n');
                                 let _ = tx.send(line);
                             }
                         }

@@ -269,6 +269,10 @@ async fn process_prompt(
                         let _ = writeln!(stdout(), "[{} completed]\n---\n{}\n---", tool_name, truncated);
                         let _ = stdout().flush();
                     }
+                    Some(AgentEvent::AgentStart { .. }) => {
+                        let _ = write!(stdout(), "\n[running...]");
+                        let _ = stdout().flush();
+                    }
                     Some(AgentEvent::AgentEnd { .. }) | None => {
                         break;
                     }
