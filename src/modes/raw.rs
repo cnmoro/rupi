@@ -10,34 +10,40 @@ use crate::rpc::types::{AgentEvent, AgentMessage, AssistantMessageEvent, Message
 /// Run raw mode: prints each SSE delta as a JSON line to stdout,
 /// reads user input from stdin interactively with steer support.
 pub async fn run_raw(session: Arc<Mutex<AgentSession>>) {
-    let mut stdin_reader = BufReader::new(tokio::io::stdin());
-    let mut line = String::new();
-
     let _ = writeln!(stdout(), "rupi raw mode. Type your prompts. Exit: Ctrl+D, /exit, /quit, or 'exit'.");
     let _ = stdout().flush();
 
+    // Single persistent stdin reader feeding a channel
+    let (stdin_tx, mut stdin_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+    tokio::spawn(async move {
+        let mut reader = BufReader::new(tokio::io::stdin());
+        let mut buf = String::new();
+        loop {
+            buf.clear();
+            match reader.read_line(&mut buf).await {
+                Ok(0) | Err(_) => break,
+                Ok(_) => {
+                    let input = buf.trim().to_string();
+                    if input.is_empty() { continue; }
+                    let _ = stdin_tx.send(input).ok();
+                }
+            }
+        }
+    });
+
     loop {
-        let _ = write!(stdout(), "> ");
-        let _ = stdout().flush();
+        let line = match stdin_rx.recv().await {
+            Some(l) => l,
+            None => break,
+        };
 
-        line.clear();
-        match stdin_reader.read_line(&mut line).await {
-            Ok(0) => break,
-            Ok(_) => {}
-            Err(_) => break,
-        }
-
-        let trimmed = line.trim().to_string();
-        if trimmed.is_empty() {
-            continue;
-        }
-        if trimmed == "exit" || trimmed == "/exit" || trimmed == "/quit" {
+        if line == "exit" || line == "/exit" || line == "/quit" {
             break;
         }
 
-        // Handle /steer command — interrupts current generation
-        if trimmed.starts_with("/steer ") {
-            let steer_text = trimmed[7..].trim().to_string();
+        // Handle /steer command
+        if line.starts_with("/steer ") {
+            let steer_text = line[7..].trim().to_string();
             if !steer_text.is_empty() {
                 let sess = session.lock().await;
                 sess.steer(&steer_text).await;
@@ -51,8 +57,8 @@ pub async fn run_raw(session: Arc<Mutex<AgentSession>>) {
         }
 
         // Handle /goal command
-        if trimmed.starts_with("/goal ") {
-            let goal_text = trimmed[6..].trim().to_string();
+        if line.starts_with("/goal ") {
+            let goal_text = line[6..].trim().to_string();
             if !goal_text.is_empty() {
                 {
                     let sess = session.lock().await;
@@ -68,7 +74,7 @@ pub async fn run_raw(session: Arc<Mutex<AgentSession>>) {
                 let _ = stdout().flush();
                 continue;
             }
-        } else if trimmed == "/goal" {
+        } else if line == "/goal" {
             let sess = session.lock().await;
             let goal = sess.get_goal().await;
             let json = serialize_json_line(&serde_json::json!({"type": "goal_info", "goal": goal}));
@@ -78,7 +84,7 @@ pub async fn run_raw(session: Arc<Mutex<AgentSession>>) {
         }
 
         // Handle /compact command
-        if trimmed == "/compact" {
+        if line == "/compact" {
             let sess = session.lock().await;
             match sess.compact().await {
                 Ok(result) => {
@@ -99,8 +105,8 @@ pub async fn run_raw(session: Arc<Mutex<AgentSession>>) {
         }
 
         // Handle /model command
-        if trimmed.starts_with("/model ") || trimmed == "/model" {
-            let parts: Vec<&str> = trimmed.splitn(2, ' ').collect();
+        if line.starts_with("/model ") || line == "/model" {
+            let parts: Vec<&str> = line.splitn(2, ' ').collect();
             if parts.len() == 2 {
                 let model_spec = parts[1].trim();
                 if !model_spec.is_empty() {
@@ -119,13 +125,16 @@ pub async fn run_raw(session: Arc<Mutex<AgentSession>>) {
         }
 
         // Process prompt
-        process_with_steer_raw(&session, &trimmed).await;
+        process_with_steer_raw(&session, &line, &mut stdin_rx).await;
     }
 }
 
-async fn process_with_steer_raw(session: &Arc<Mutex<AgentSession>>, initial_input: &str) {
+async fn process_with_steer_raw(
+    session: &Arc<Mutex<AgentSession>>,
+    initial_input: &str,
+    stdin_rx: &mut tokio::sync::mpsc::UnboundedReceiver<String>,
+) {
     let (event_tx, mut event_rx) = tokio::sync::mpsc::unbounded_channel::<AgentEvent>();
-    let (stdin_tx, mut stdin_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
 
     let sess = session.clone();
     let tx = event_tx.clone();
@@ -146,32 +155,6 @@ async fn process_with_steer_raw(session: &Arc<Mutex<AgentSession>>, initial_inpu
             }));
             let _ = tx.send(AgentEvent::turn_end());
             let _ = tx.send(AgentEvent::agent_end());
-        }
-    });
-
-    // Spawn stdin reader for steer/follow-up during streaming
-    let stdin_session = session.clone();
-    let stdin_tx_clone = stdin_tx.clone();
-    let _stdin_handle = tokio::spawn(async move {
-        let mut reader = BufReader::new(tokio::io::stdin());
-        let mut buf = String::new();
-        loop {
-            buf.clear();
-            match reader.read_line(&mut buf).await {
-                Ok(0) | Err(_) => break,
-                Ok(_) => {
-                    let input = buf.trim().to_string();
-                    if input.is_empty() { continue; }
-                    if stdin_session.lock().await.is_streaming().await {
-                        // Normal Enter during streaming → queue as follow-up
-                        stdin_session.lock().await.follow_up(&input).await;
-                        let _ = stdin_tx_clone.send(input);
-                    } else {
-                        let _ = stdin_tx_clone.send(input);
-                        break;
-                    }
-                }
-            }
         }
     });
 
@@ -229,10 +212,15 @@ async fn process_with_steer_raw(session: &Arc<Mutex<AgentSession>>, initial_inpu
                 let _ = write!(stdout(), "{}", json);
                 let _ = stdout().flush();
             }
-            _ = stdin_rx.recv() => {
-                // Steer queued during streaming
-                let _ = write!(stdout(), "{}", serialize_json_line(&serde_json::json!({"type": "queued"})));
-                let _ = stdout().flush();
+            line = stdin_rx.recv() => {
+                if let Some(input) = line {
+                    let sess = session.lock().await;
+                    if sess.is_streaming().await {
+                        sess.follow_up(&input).await;
+                        let _ = write!(stdout(), "{}", serialize_json_line(&serde_json::json!({"type": "queued"})));
+                        let _ = stdout().flush();
+                    }
+                }
             }
         }
     }
