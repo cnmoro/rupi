@@ -29,6 +29,7 @@ use crate::tools::ToolCall;
 #[derive(Debug, Clone)]
 pub enum StreamEvent {
     Delta(String),
+    Reasoning(String),
     GenerationId(String),
     Done(StreamResult),
     ToolCalls {

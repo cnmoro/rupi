@@ -207,11 +207,17 @@ async fn process_prompt(
             event = event_rx.recv() => {
                 match event {
                     Some(AgentEvent::MessageUpdate { assistant_message_event, .. }) => {
-                        if let AssistantMessageEvent::TextDelta { delta } = &assistant_message_event {
-                            got_text = true;
-                            let _ = write!(stdout(), "{}", delta);
-                            let _ = stdout().flush();
+                        match &assistant_message_event {
+                            AssistantMessageEvent::TextDelta { delta } => {
+                                got_text = true;
+                                let _ = write!(stdout(), "{}", delta);
+                            }
+                            AssistantMessageEvent::ThinkingDelta { delta } => {
+                                // Show reasoning content in a dim/italic style
+                                let _ = write!(stdout(), "\x1b[2m{}\x1b[22m", delta);
+                            }
                         }
+                        let _ = stdout().flush();
                     }
                     Some(AgentEvent::MessageEnd { message, .. }) => {
                         if !got_text {
@@ -286,11 +292,16 @@ async fn process_prompt(
             }
             match event_rx.recv().await {
                 Some(AgentEvent::MessageUpdate { assistant_message_event, .. }) => {
-                    if let AssistantMessageEvent::TextDelta { delta } = &assistant_message_event {
-                        got2 = true;
-                        let _ = write!(stdout(), "{}", delta);
-                        let _ = stdout().flush();
+                    match &assistant_message_event {
+                        AssistantMessageEvent::TextDelta { delta } => {
+                            got2 = true;
+                            let _ = write!(stdout(), "{}", delta);
+                        }
+                        AssistantMessageEvent::ThinkingDelta { delta } => {
+                            let _ = write!(stdout(), "\x1b[2m{}\x1b[22m", delta);
+                        }
                     }
+                    let _ = stdout().flush();
                 }
                 Some(AgentEvent::MessageEnd { message, .. }) => {
                     if !got2 {

@@ -772,6 +772,10 @@ impl AgentSession {
                         full_content.push_str(&delta);
                         let _ = event_tx.send(AgentEvent::message_update(delta));
                     }
+                    StreamEvent::Reasoning(rc) => {
+                        had_stream_events = true;
+                        let _ = event_tx.send(AgentEvent::reasoning_update(rc));
+                    }
                     StreamEvent::Done(result) => {
                         had_stream_events = true;
                         full_content = result.content;

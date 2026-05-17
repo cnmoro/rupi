@@ -339,6 +339,7 @@ impl ChatProvider for OpenAIProvider {
                                                     }
                                                     if let Some(rc) = delta.reasoning_content {
                                                         reasoning_content.push_str(&rc);
+                                                        let _ = tx.send(StreamEvent::Reasoning(rc)).await;
                                                     }
                                                     if let Some(chunk_tool_calls) = delta.tool_calls {
                                                         for tc in chunk_tool_calls {

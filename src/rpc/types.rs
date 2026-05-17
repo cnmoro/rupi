@@ -311,6 +311,13 @@ impl AgentEvent {
         }
     }
 
+    pub fn reasoning_update(delta: String) -> Self {
+        AgentEvent::MessageUpdate {
+            assistant_message_event: AssistantMessageEvent::ThinkingDelta { delta },
+            timestamp: now_millis(),
+        }
+    }
+
     pub fn message_end(message: AgentMessage) -> Self {
         AgentEvent::MessageEnd {
             message,

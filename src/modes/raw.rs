@@ -175,9 +175,12 @@ async fn process_prompt_raw(
             event = event_rx.recv() => {
                 let json = match event {
                     Some(AgentEvent::MessageUpdate { assistant_message_event, .. }) => {
-                        if let AssistantMessageEvent::TextDelta { delta } = &assistant_message_event {
-                            serialize_json_line(&serde_json::json!({"type": "delta", "content": delta}))
-                        } else { continue; }
+                        match &assistant_message_event {
+                            AssistantMessageEvent::TextDelta { delta } =>
+                                serialize_json_line(&serde_json::json!({"type": "delta", "content": delta})),
+                            AssistantMessageEvent::ThinkingDelta { delta } =>
+                                serialize_json_line(&serde_json::json!({"type": "thinking_delta", "content": delta})),
+                        }
                     }
                     Some(AgentEvent::MessageEnd { message, .. }) => {
                         let mut obj = serde_json::json!({"type": "message_end", "role": message.role});
