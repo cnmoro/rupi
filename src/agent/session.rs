@@ -314,11 +314,13 @@ impl AgentSession {
     }
 
     pub fn set_model(&self, new_model: String) {
-        *self.model.write().unwrap() = new_model;
+        if let Ok(mut m) = self.model.write() {
+            *m = new_model;
+        }
     }
 
     pub fn model(&self) -> String {
-        self.model.read().unwrap().clone()
+        self.model.read().map(|m| m.clone()).unwrap_or_default()
     }
 
     pub async fn messages(&self) -> Vec<Message> {

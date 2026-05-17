@@ -38,7 +38,8 @@ struct ChatRequest {
 #[derive(Debug, Serialize)]
 struct ChatMessage {
     role: String,
-    content: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    content: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     tool_calls: Option<Vec<ToolCallData>>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -145,9 +146,17 @@ impl OpenAIProvider {
         messages
             .iter()
             .map(|m| {
+                // OpenAI expects content: null for assistant messages with only tool calls
+                let has_tool_calls = m.tool_calls.as_ref().map_or(false, |c| !c.is_empty());
+                let content = if has_tool_calls && m.content.is_empty() {
+                    None
+                } else {
+                    Some(m.content.clone())
+                };
+
                 let mut chat_msg = ChatMessage {
                     role: m.role.clone(),
-                    content: m.content.clone(),
+                    content,
                     tool_calls: None,
                     tool_call_id: None,
                 };
@@ -201,6 +210,10 @@ impl ChatProvider for OpenAIProvider {
 
         let (tx, rx) = mpsc::channel(256);
 
+        // Spawn the streaming task. Panics are caught by tokio and stored
+        // in the JoinHandle. Since we don't await the handle, a panic would
+        // close the tx channel silently. Wrap the body in catch_unwind to
+        // send an error event on panic.
         let tx_catch = tx.clone();
         let handle: tokio::task::JoinHandle<()> = tokio::spawn(async move {
             let body = ChatRequest {
