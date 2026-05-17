@@ -2,7 +2,7 @@ use std::io::{stdout, Write};
 use std::sync::Arc;
 
 use crate::agent::session::AgentSession;
-use crate::modes::stdin::{spawn_stdin_reader, CANCEL_LOOP_SIG};
+use crate::modes::stdin::{spawn_stdin_reader, CANCEL_LOOP_SIG, EOF_SIG};
 use crate::rpc::types::{AgentEvent, AgentMessage, AssistantMessageEvent, MessageContent};
 
 /// Run the interactive REPL mode with concurrent stdin + event reading.
@@ -28,6 +28,12 @@ pub async fn run_interactive(session: Arc<AgentSession>) {
             let _ = writeln!(stdout(), "\n[loop cancelled]");
             let _ = stdout().flush();
             continue;
+        }
+
+        if line == EOF_SIG {
+            // Cancel any active loop, then exit
+            session.cancel_loop().await;
+            break;
         }
 
         match handle_command(&session, &line).await {
@@ -171,6 +177,7 @@ async fn process_prompt(
     // operations use interior mutability (AtomicBool, tokio RwLock, etc.) and
     // don't need the outer Mutex.
     let mut got_text = false;
+    let mut saw_reasoning = false;
     let mut interrupted: Option<String> = None;
 
     loop {
@@ -180,7 +187,7 @@ async fn process_prompt(
         loop {
             match stdin_rx.try_recv() {
                 Ok(input) => {
-                    if input == CANCEL_LOOP_SIG {
+                    if input == CANCEL_LOOP_SIG || input == EOF_SIG {
                         session.cancel_loop().await;
                         let _ = writeln!(stdout(), "\n[loop cancelled]");
                         let _ = stdout().flush();
@@ -209,11 +216,15 @@ async fn process_prompt(
                     Some(AgentEvent::MessageUpdate { assistant_message_event, .. }) => {
                         match &assistant_message_event {
                             AssistantMessageEvent::TextDelta { delta } => {
+                                if saw_reasoning {
+                                    let _ = write!(stdout(), "\n");
+                                    saw_reasoning = false;
+                                }
                                 got_text = true;
                                 let _ = write!(stdout(), "{}", delta);
                             }
                             AssistantMessageEvent::ThinkingDelta { delta } => {
-                                // Show reasoning content in a dim/italic style
+                                saw_reasoning = true;
                                 let _ = write!(stdout(), "\x1b[2m{}\x1b[22m", delta);
                             }
                         }
@@ -294,10 +305,15 @@ async fn process_prompt(
                 Some(AgentEvent::MessageUpdate { assistant_message_event, .. }) => {
                     match &assistant_message_event {
                         AssistantMessageEvent::TextDelta { delta } => {
+                            if saw_reasoning {
+                                let _ = write!(stdout(), "\n");
+                                saw_reasoning = false;
+                            }
                             got2 = true;
                             let _ = write!(stdout(), "{}", delta);
                         }
                         AssistantMessageEvent::ThinkingDelta { delta } => {
+                            saw_reasoning = true;
                             let _ = write!(stdout(), "\x1b[2m{}\x1b[22m", delta);
                         }
                     }

@@ -2,7 +2,7 @@ use std::io::{stdout, Write};
 use std::sync::Arc;
 
 use crate::agent::session::AgentSession;
-use crate::modes::stdin::{spawn_stdin_reader, CANCEL_LOOP_SIG};
+use crate::modes::stdin::{spawn_stdin_reader, CANCEL_LOOP_SIG, EOF_SIG};
 use crate::rpc::jsonl::serialize_json_line;
 use crate::rpc::types::{AgentEvent, AgentMessage, AssistantMessageEvent, MessageContent};
 
@@ -21,7 +21,7 @@ pub async fn run_raw(session: Arc<AgentSession>) {
             None => break,
         };
 
-        if line == "exit" || line == "/exit" || line == "/quit" { break; }
+        if line == "exit" || line == "/exit" || line == "/quit" || line == EOF_SIG { break; }
 
         if line.starts_with("/steer ") {
             let steer_text = line[7..].trim().to_string();
@@ -92,7 +92,7 @@ pub async fn run_raw(session: Arc<AgentSession>) {
             continue;
         }
 
-        if line == CANCEL_LOOP_SIG {
+        if line == CANCEL_LOOP_SIG || line == EOF_SIG {
             session.cancel_loop().await;
             let json = serialize_json_line(&serde_json::json!({"type": "loop_cancelled"}));
             let _ = write!(stdout(), "{}", json);
@@ -153,7 +153,7 @@ async fn process_prompt_raw(
     loop {
         // Poll stdin non-blockingly
         while let Ok(input) = stdin_rx.try_recv() {
-            if input == CANCEL_LOOP_SIG {
+            if input == CANCEL_LOOP_SIG || input == EOF_SIG {
                 session.cancel_loop().await;
                 let _ = write!(stdout(), "{}", serialize_json_line(&serde_json::json!({"type": "loop_cancelled"})));
                 let _ = stdout().flush();
