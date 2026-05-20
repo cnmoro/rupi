@@ -17,7 +17,7 @@ Output compression: bash command output is automatically filtered to reduce toke
 }
 ```
 
-All values can be overridden via CLI flags (`--base-url`, `--api-key`, `--model`, `--context-window`, `--timeout`, `--memory`, `--disable-yolo`, `--session`).
+All values can be overridden via CLI flags (`--base-url`, `--api-key`, `--model`, `--context-window`, `--timeout`, `--memory`, `--disable-yolo`, `--session`, `--list-sessions`).
 
 ### Opencode Go / Zen (zero-config alternative)
 
@@ -56,7 +56,7 @@ REPL prompt for humans. While the agent is generating, you can still type:
 - **Press Enter** → queues as **follow-up**: the message is saved and processed after the current response finishes.
 - **`/steer <message>`** → **interrupts immediately**: the agent receives your message right away and pivots.
 
-Commands: `/goal <desc>`, `/model <name>`, `/compact`, `/steer <message>`, `/loop <prompt>`, `/stop`. Exit with `Ctrl+D`, `/exit`, `/quit`, or `exit`.
+Commands: `/goal <desc>`, `/model <name>`, `/compact`, `/steer <message>`, `/loop <prompt>`, `/stop`, `/sessions`. Exit with `Ctrl+D`, `/exit`, `/quit`, or `exit`.
 
 ### Loop mode — `/loop <prompt>`
 

@@ -48,6 +48,10 @@ pub struct Cli {
     #[arg(long)]
     pub session: Option<String>,
 
+    /// List all saved sessions with IDs and metadata
+    #[arg(long)]
+    pub list_sessions: bool,
+
     /// List available models from Opencode (requires opencode_api_key in config)
     #[arg(long)]
     pub list_opencode_models: bool,

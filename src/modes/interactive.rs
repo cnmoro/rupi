@@ -139,6 +139,26 @@ async fn handle_command(session: &Arc<AgentSession>, line: &str) -> CommandActio
         return CommandAction::Continue;
     }
 
+    if line == "/sessions" {
+        match crate::sessions::list_sessions() {
+            Ok(sessions) => {
+                if sessions.is_empty() {
+                    let _ = writeln!(stdout(), "No saved sessions.");
+                } else {
+                    let _ = writeln!(stdout(), "Saved sessions:");
+                    for s in &sessions {
+                        let _ = writeln!(stdout(), "  {}  {}  {} messages  {}", s.id, s.model, s.message_count, s.created_at);
+                    }
+                }
+            }
+            Err(e) => {
+                let _ = writeln!(stdout(), "Error: {}", e);
+            }
+        }
+        let _ = stdout().flush();
+        return CommandAction::Continue;
+    }
+
     CommandAction::Prompt(line.to_string())
 }
 

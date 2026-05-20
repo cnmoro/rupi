@@ -122,6 +122,21 @@ pub async fn run_raw(session: Arc<AgentSession>) {
             continue;
         }
 
+        if line == "/sessions" {
+            match crate::sessions::list_sessions() {
+                Ok(sessions) => {
+                    let json = serialize_json_line(&serde_json::json!({"type": "sessions", "sessions": sessions}));
+                    let _ = write!(stdout(), "{}", json);
+                }
+                Err(e) => {
+                    let json = serialize_json_line(&serde_json::json!({"type": "error", "message": e.to_string()}));
+                    let _ = write!(stdout(), "{}", json);
+                }
+            }
+            let _ = stdout().flush();
+            continue;
+        }
+
         process_prompt_raw(&session, &line).await;
     }
 }

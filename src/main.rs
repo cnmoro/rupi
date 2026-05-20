@@ -119,6 +119,23 @@ async fn main() {
         .to_string();
     let context_files = agent_session::load_context_files(&cwd);
 
+    // Handle --list-sessions early
+    if cli.list_sessions {
+        let sessions = rupi::sessions::list_sessions().unwrap_or_else(|e| {
+            eprintln!("Error listing sessions: {}", e);
+            std::process::exit(1);
+        });
+        if sessions.is_empty() {
+            println!("No saved sessions found.");
+        } else {
+            println!("Saved sessions:");
+            for s in &sessions {
+                println!("  {}  {}  {} messages  {}", s.id, s.model, s.message_count, s.created_at);
+            }
+        }
+        return;
+    }
+
     let memory = cli.memory;
     let session_id = cli.session.as_deref();
 
