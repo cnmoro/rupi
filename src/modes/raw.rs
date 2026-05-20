@@ -122,17 +122,11 @@ pub async fn run_raw(session: Arc<AgentSession>) {
             continue;
         }
 
-        if line == "/sessions" {
-            match crate::sessions::list_sessions() {
-                Ok(sessions) => {
-                    let json = serialize_json_line(&serde_json::json!({"type": "sessions", "sessions": sessions}));
-                    let _ = write!(stdout(), "{}", json);
-                }
-                Err(e) => {
-                    let json = serialize_json_line(&serde_json::json!({"type": "error", "message": e.to_string()}));
-                    let _ = write!(stdout(), "{}", json);
-                }
-            }
+        if line == "/session" {
+            let path = session.session_path().await;
+            let id = path.as_ref().and_then(|p| p.file_stem().and_then(|s| s.to_str()));
+            let json = serialize_json_line(&serde_json::json!({"type": "session_id", "session_id": id}));
+            let _ = write!(stdout(), "{}", json);
             let _ = stdout().flush();
             continue;
         }

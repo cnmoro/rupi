@@ -139,20 +139,15 @@ async fn handle_command(session: &Arc<AgentSession>, line: &str) -> CommandActio
         return CommandAction::Continue;
     }
 
-    if line == "/sessions" {
-        match crate::sessions::list_sessions() {
-            Ok(sessions) => {
-                if sessions.is_empty() {
-                    let _ = writeln!(stdout(), "No saved sessions.");
-                } else {
-                    let _ = writeln!(stdout(), "Saved sessions:");
-                    for s in &sessions {
-                        let _ = writeln!(stdout(), "  {}  {}  {} messages  {}", s.id, s.model, s.message_count, s.created_at);
-                    }
-                }
+    if line == "/session" {
+        let path = session.session_path().await;
+        match path {
+            Some(p) => {
+                let id = p.file_stem().and_then(|s| s.to_str()).unwrap_or("unknown");
+                let _ = writeln!(stdout(), "Session ID: {}", id);
             }
-            Err(e) => {
-                let _ = writeln!(stdout(), "Error: {}", e);
+            None => {
+                let _ = writeln!(stdout(), "No active session.");
             }
         }
         let _ = stdout().flush();

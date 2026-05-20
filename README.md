@@ -56,7 +56,7 @@ REPL prompt for humans. While the agent is generating, you can still type:
 - **Press Enter** → queues as **follow-up**: the message is saved and processed after the current response finishes.
 - **`/steer <message>`** → **interrupts immediately**: the agent receives your message right away and pivots.
 
-Commands: `/goal <desc>`, `/model <name>`, `/compact`, `/steer <message>`, `/loop <prompt>`, `/stop`, `/sessions`. Exit with `Ctrl+D`, `/exit`, `/quit`, or `exit`.
+Commands: `/goal <desc>`, `/model <name>`, `/compact`, `/steer <message>`, `/loop <prompt>`, `/stop`, `/session`. Exit with `Ctrl+D`, `/exit`, `/quit`, or `exit`. Use `/session` to show the current session ID.
 
 ### Loop mode — `/loop <prompt>`
 
