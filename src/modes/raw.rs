@@ -212,7 +212,10 @@ async fn process_prompt_raw(
                     Some(AgentEvent::ToolExecutionStart { tool_name, arguments, .. }) =>
                         serialize_json_line(&serde_json::json!({"type": "tool_execution_start", "tool": tool_name, "arguments": arguments})),
                     Some(AgentEvent::ToolExecutionEnd { tool_name, result, .. }) => {
-                        let truncated = if result.len() > 2000 { format!("{}... [truncated]", &result[..2000]) } else { result.clone() };
+                        let truncated = if result.len() > 2000 {
+                            let end = result.floor_char_boundary(2000);
+                            format!("{}... [truncated]", &result[..end])
+                        } else { result.clone() };
                         serialize_json_line(&serde_json::json!({"type": "tool_execution_end", "tool": tool_name, "result": truncated}))
                     }
                     Some(AgentEvent::AgentStart { .. }) =>

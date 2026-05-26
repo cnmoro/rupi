@@ -269,7 +269,8 @@ async fn process_prompt(
                     Some(AgentEvent::ToolExecutionStart { tool_name, arguments, .. }) => {
                         let args_str = serde_json::to_string(&arguments).unwrap_or_default();
                         let cmd = if args_str.len() > 120 {
-                            format!("{}...", &args_str[..117])
+                            let end = args_str.floor_char_boundary(117);
+                            format!("{}...", &args_str[..end])
                         } else {
                             args_str
                         };
@@ -278,7 +279,8 @@ async fn process_prompt(
                     }
                     Some(AgentEvent::ToolExecutionEnd { tool_name, result, .. }) => {
                         let truncated = if result.len() > 800 {
-                            format!("{}...\n[+ {} more chars]", &result[..797], result.len() - 797)
+                            let end = result.floor_char_boundary(797);
+                            format!("{}...\n[+ {} more chars]", &result[..end], result.len() - end)
                         } else {
                             result.clone()
                         };
