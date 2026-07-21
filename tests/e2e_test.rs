@@ -1117,6 +1117,7 @@ async fn e2e_test_code_search_via_tool() {
             "path": dir.to_string_lossy(),
             "top_k": 5,
         }),
+        raw_arguments: None,
     };
     let result = rupi::tools::execute_tool(&tc);
     assert!(!result.contains("Error:"), "Should not error: {}", result);

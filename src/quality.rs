@@ -9,6 +9,8 @@ pub enum QualityIssue {
     Hallucinated(String),
     /// Same tool call (name + arguments) repeated N times in recent history.
     Loop(String),
+    /// Response was truncated (finish_reason: "length").
+    Truncated,
     /// Other issue.
     Other(String),
 }
@@ -118,6 +120,13 @@ pub fn build_correction_message(issue: &QualityIssue) -> String {
                 names
             )
         }
+        QualityIssue::Truncated => {
+            "Your response was truncated (hit the output token limit). \
+             If you were writing a file, it may have been written partially with a RUPI_TRUNCATED marker. \
+             Read the file to see where it was cut off, then use Edit to continue from that point. \
+             If the file was not written, try again with a shorter response or break the task into smaller steps."
+                .to_string()
+        }
         QualityIssue::Other(msg) => msg.clone(),
     }
 }
@@ -136,6 +145,7 @@ mod tests {
             id: "test".into(),
             name: name.into(),
             arguments: args,
+            raw_arguments: None,
         }
     }
 
@@ -213,6 +223,10 @@ mod tests {
 
         let msg3 = build_correction_message(&QualityIssue::Loop("bash".into()));
         assert!(msg3.contains("repeating"));
+
+        let msg4 = build_correction_message(&QualityIssue::Truncated);
+        assert!(msg4.contains("truncated"));
+        assert!(msg4.contains("RUPI_TRUNCATED"));
     }
 
     #[test]

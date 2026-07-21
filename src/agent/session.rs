@@ -83,10 +83,15 @@ fn ensure_memory_file() -> String {
 }
 
 /// Build the system prompt describing available tools, skills, context files, and memory.
-fn build_system_prompt(skills: &[Skill], context_files: &[ContextFile], memory_enabled: bool) -> String {
-    let now = chrono::Local::now();
+/// If `datetime` is provided, it is used as the current time (for KV cache stability).
+/// Otherwise, `chrono::Local::now()` is used (for one-shot prompts like goal verification).
+fn build_system_prompt(skills: &[Skill], context_files: &[ContextFile], memory_enabled: bool, datetime: Option<&str>) -> String {
+    let time_str = match datetime {
+        Some(d) => d.to_string(),
+        None => chrono::Local::now().format("%A, %B %d, %Y at %I:%M:%S %p %z (%Z)").to_string(),
+    };
     let mut prompt = format!(
-        "You are an expert coding assistant operating inside rupi, a coding agent harness. \
+        "You are an expert coding agent operating inside rupi, a coding agent harness. \
         You help users by reading files, executing commands, editing code, and writing new files.
 
 Current date and time: {}
@@ -107,7 +112,7 @@ Guidelines:
 - Use bash to explore when you are unsure about the project structure or when you need to gather information
 - When a command fails, read the error output and try a different approach rather than giving up
 - If you don't have enough information to complete a task, use bash, read, grep, or find to get the necessary context",
-        now.format("%A, %B %d, %Y at %I:%M:%S %p %z (%Z)")
+        time_str
     );
 
     // Append skills as XML block
@@ -228,6 +233,7 @@ pub struct AgentSession {
     consecutive_quality_issues: RwLock<u32>,
     loop_prompt: RwLock<Option<String>>,
     loop_cancelled: std::sync::atomic::AtomicBool,
+    system_prompt: RwLock<String>,
 }
 
 impl AgentSession {
@@ -254,6 +260,10 @@ impl AgentSession {
         existing_path: Option<std::path::PathBuf>,
     ) -> Self {
         let session_path = existing_path.or_else(|| sessions::create_session(&model).ok());
+        // Freeze the timestamp at session creation so the system prompt stays
+        // byte-identical across turns — critical for server-side KV prefix caching.
+        let frozen_time = chrono::Local::now().format("%A, %B %d, %Y at %I:%M:%S %p %z (%Z)").to_string();
+        let system_prompt = build_system_prompt(&skills, &context_files, false, Some(&frozen_time));
         AgentSession {
             provider,
             approval_fn: RwLock::new(None),
@@ -279,6 +289,7 @@ impl AgentSession {
             consecutive_quality_issues: RwLock::new(0),
             loop_prompt: RwLock::new(None),
             loop_cancelled: std::sync::atomic::AtomicBool::new(false),
+            system_prompt: RwLock::new(system_prompt),
         }
     }
 
@@ -306,6 +317,10 @@ impl AgentSession {
         session.memory_enabled = memory_enabled;
         if memory_enabled {
             ensure_memory_file();
+            // Rebuild system prompt with memory content included
+            let frozen_time = chrono::Local::now().format("%A, %B %d, %Y at %I:%M:%S %p %z (%Z)").to_string();
+            let prompt = build_system_prompt(&session.skills, &session.context_files, memory_enabled, Some(&frozen_time));
+            *session.system_prompt.get_mut() = prompt;
         }
         session
     }
@@ -330,6 +345,9 @@ impl AgentSession {
         session.memory_enabled = memory_enabled;
         if memory_enabled {
             ensure_memory_file();
+            let frozen_time = chrono::Local::now().format("%A, %B %d, %Y at %I:%M:%S %p %z (%Z)").to_string();
+            let prompt = build_system_prompt(&session.skills, &session.context_files, memory_enabled, Some(&frozen_time));
+            *session.system_prompt.get_mut() = prompt;
         }
         // Load existing messages into the session
         for msg in &messages {
@@ -432,6 +450,12 @@ impl AgentSession {
         self.set_loop(None).await;
         *self.auto_compaction_enabled.write().await = true;
         *self.thinking_level.write().await = "off".to_string();
+
+        // Rebuild system prompt with a fresh frozen timestamp for the new session
+        let frozen_time = chrono::Local::now().format("%A, %B %d, %Y at %I:%M:%S %p %z (%Z)").to_string();
+        let prompt = build_system_prompt(&self.skills, &self.context_files, self.memory_enabled, Some(&frozen_time));
+        *self.system_prompt.write().await = prompt;
+
         *self.abort_signal.lock().await = None;
         let new_path = sessions::create_session(&self.model()).ok();
         *self.session_path.write().await = new_path;
@@ -683,8 +707,9 @@ impl AgentSession {
                 }
             }
 
-            // Build messages: system prompt with skills + context files, then history
-            let prompt_text = build_system_prompt(&self.skills, &self.context_files, self.memory_enabled);
+            // Build messages: use the cached system prompt (frozen at session creation)
+            // to keep the token prefix identical across turns — critical for server-side KV cache reuse.
+            let prompt_text = self.system_prompt.read().await.clone();
             let system_msg = Message::new("system", &prompt_text);
             let mut messages_for_api = vec![system_msg];
             messages_for_api.extend(self.messages.read().await.clone());
@@ -854,6 +879,20 @@ impl AgentSession {
                 if !embedded.is_empty() {
                     eprintln!("rupi: output parser extracted {} tool call(s) from text", embedded.len());
                     tool_calls = embedded;
+                }
+            }
+
+            // Truncation detection: if finish_reason is "length", the response was cut off
+            if finish_reason.as_deref() == Some("length") {
+                eprintln!("rupi: response truncated (finish_reason=length)");
+                let mut cc = self.consecutive_quality_issues.write().await;
+                let max_corrections: u32 = 2;
+                if *cc < max_corrections {
+                    let correction = quality::build_correction_message(&quality::QualityIssue::Truncated);
+                    self.pending_follow_up.write().await.push(correction);
+                    *cc += 1;
+                } else {
+                    eprintln!("rupi: truncation correction suppressed after {} corrections", *cc);
                 }
             }
 

@@ -149,6 +149,7 @@ fn tool_call_from_value(v: &Value) -> Option<ToolCall> {
         ),
         name,
         arguments: input_obj,
+        raw_arguments: None,
     })
 }
 
@@ -271,6 +272,7 @@ mod tests {
                 id: "c1".into(),
                 name: "read".into(),
                 arguments: serde_json::json!({}),
+                raw_arguments: None,
             }],
         );
         assert!(has_native_tool_calls(&m));

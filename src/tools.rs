@@ -23,6 +23,8 @@ pub struct ToolCall {
     pub id: String,
     pub name: String,
     pub arguments: Value,
+    /// Raw JSON string when arguments parsing failed (truncation recovery).
+    pub raw_arguments: Option<String>,
 }
 
 /// Get all available tool definitions.
@@ -197,7 +199,7 @@ pub fn execute_tool(tool_call: &ToolCall) -> String {
     match tool_call.name.as_str() {
         "bash" => execute_bash(&tool_call.arguments),
         "read" => execute_read(&tool_call.arguments),
-        "write" => execute_write(&tool_call.arguments),
+        "write" => execute_write(tool_call),
         "edit" => execute_edit(&tool_call.arguments),
         "grep" => execute_grep(&tool_call.arguments),
         "find" => execute_find(&tool_call.arguments),
@@ -338,21 +340,78 @@ fn execute_read(args: &Value) -> String {
     }
 }
 
-// ---- write (with guard) ----
-fn execute_write(args: &Value) -> String {
-    let file_path = match get_arg(args, "file_path") {
+// ---- write (with guard + truncation recovery) ----
+const TRUNCATION_MARKER: &str = "\n<!-- RUPI_TRUNCATED: Response was cut off before completion. File is incomplete. Continue writing from where this marker ends. -->\n";
+
+fn execute_write(tool_call: &ToolCall) -> String {
+    let args = &tool_call.arguments;
+    let mut file_path = get_arg(args, "file_path").map(|s| s.to_string());
+    let mut content = get_arg(args, "content").map(|s| s.to_string());
+    let mut truncated = false;
+
+    // If content is missing but raw_arguments exist, attempt truncation recovery
+    if content.is_none() {
+        if let Some(ref raw) = tool_call.raw_arguments {
+            // Try to extract file_path and content from raw JSON
+            if let Ok(raw_val) = serde_json::from_str::<Value>(raw) {
+                file_path = file_path.or_else(|| {
+                    raw_val.get("file_path").and_then(|v| v.as_str()).map(|s| s.to_string())
+                });
+                content = raw_val.get("content").and_then(|v| v.as_str()).map(|s| s.to_string());
+                truncated = true;
+            } else {
+                // Even raw JSON is malformed — try to extract file_path with regex-like approach
+                if let Some(fp_start) = raw.find("\"file_path\"") {
+                    let after_key = &raw[fp_start + 11..];
+                    if let Some(q1) = after_key.find('"') {
+                        let after_open = &after_key[q1 + 1..];
+                        if let Some(q2) = after_open.find('"') {
+                            file_path = Some(after_open[..q2].to_string());
+                        }
+                    }
+                }
+                // Try to extract content — find the last complete segment
+                if let Some(c_start) = raw.find("\"content\"") {
+                    let after_key = &raw[c_start + 9..];
+                    if let Some(q1) = after_key.find('"') {
+                        let after_open = &after_key[q1 + 1..];
+                        // Find the last unescaped quote, or take everything if none (truncated)
+                        let mut last_end = None;
+                        let mut chars = after_open.char_indices();
+                        while let Some((i, ch)) = chars.next() {
+                            if ch == '\\' {
+                                chars.next(); // skip escaped char
+                                continue;
+                            }
+                            if ch == '"' {
+                                last_end = Some(i);
+                                break;
+                            }
+                        }
+                        let end = last_end.unwrap_or(after_open.len());
+                        if end > 0 {
+                            content = Some(after_open[..end].to_string());
+                            truncated = true;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    let file_path = match file_path {
         Some(p) => p,
         None => return "Error: missing 'file_path' argument".to_string(),
     };
-    let content = match get_arg(args, "content") {
+    let mut content = match content {
         Some(c) => c,
-        None => return "Error: missing 'content' argument".to_string(),
+        None => return "Error: missing 'content' argument. If the response was truncated, try again with a shorter file.".to_string(),
     };
 
-    let path = resolve_path(file_path);
+    let path = resolve_path(&file_path);
 
-    // Write guard: refuse if file already exists
-    if path.exists() {
+    // Write guard: refuse if file already exists (skip for truncated recovery)
+    if path.exists() && !truncated {
         return format!(
             "Error: Write refused — {} already exists.\n\
              \n\
@@ -374,10 +433,24 @@ fn execute_write(args: &Value) -> String {
         }
     }
 
-    match std::fs::write(&path, content) {
+    // Append truncation marker if response was cut off
+    if truncated {
+        content.push_str(TRUNCATION_MARKER);
+    }
+
+    match std::fs::write(&path, &content) {
         Ok(_) => {
             let line_count = content.lines().count();
-            format!("Successfully wrote {} lines to {}", line_count, path.display())
+            if truncated {
+                format!(
+                    "WARNING: Response was truncated. Wrote {} lines (incomplete) to {}. \
+                     The file has a RUPI_TRUNCATED marker. Use Edit to continue writing from where it left off.",
+                    line_count,
+                    path.display()
+                )
+            } else {
+                format!("Successfully wrote {} lines to {}", line_count, path.display())
+            }
         }
         Err(e) => format!("Error writing file: {}", e),
     }
@@ -751,8 +824,13 @@ mod tests {
         fs::create_dir_all(&dir).unwrap();
         let path = dir.join("new_file.txt");
 
-        let args = serde_json::json!({"file_path": path.to_string_lossy(), "content": "hello\nworld"});
-        let result = execute_write(&args);
+        let tc = ToolCall {
+            id: "test".into(),
+            name: "write".into(),
+            arguments: serde_json::json!({"file_path": path.to_string_lossy(), "content": "hello\nworld"}),
+            raw_arguments: None,
+        };
+        let result = execute_write(&tc);
         assert!(result.contains("Successfully wrote"));
         assert!(path.exists());
         let content = fs::read_to_string(&path).unwrap();
@@ -767,8 +845,13 @@ mod tests {
         let path = dir.join("existing.txt");
         fs::write(&path, "original content").unwrap();
 
-        let args = serde_json::json!({"file_path": path.to_string_lossy(), "content": "new content"});
-        let result = execute_write(&args);
+        let tc = ToolCall {
+            id: "test".into(),
+            name: "write".into(),
+            arguments: serde_json::json!({"file_path": path.to_string_lossy(), "content": "new content"}),
+            raw_arguments: None,
+        };
+        let result = execute_write(&tc);
         assert!(result.contains("Write refused"));
         // Content should be unchanged
         let content = fs::read_to_string(&path).unwrap();
@@ -783,8 +866,13 @@ mod tests {
         let path = dir.join("existing.txt");
         fs::write(&path, "content").unwrap();
 
-        let args = serde_json::json!({"file_path": path.to_string_lossy(), "content": "new"});
-        let result = execute_write(&args);
+        let tc = ToolCall {
+            id: "test".into(),
+            name: "write".into(),
+            arguments: serde_json::json!({"file_path": path.to_string_lossy(), "content": "new"}),
+            raw_arguments: None,
+        };
+        let result = execute_write(&tc);
         assert!(result.contains("use Edit"));
         assert!(result.contains("old_text"));
         assert!(result.contains("new_text"));
@@ -940,6 +1028,7 @@ mod tests {
         let tc = ToolCall {
             id: "call_1".into(), name: "nonexistent".into(),
             arguments: serde_json::json!({}),
+            raw_arguments: None,
         };
         let result = execute_tool(&tc);
         assert!(result.contains("Unknown tool"));
@@ -963,8 +1052,13 @@ mod tests {
     fn test_write_creates_parent_dirs() {
         let dir = std::env::temp_dir().join("rupi-tools-test-write-parent".to_string());
         let nested = dir.join("nested").join("deep").join("file.txt");
-        let args = serde_json::json!({"file_path": nested.to_string_lossy(), "content": "test"});
-        let result = execute_write(&args);
+        let tc = ToolCall {
+            id: "test".into(),
+            name: "write".into(),
+            arguments: serde_json::json!({"file_path": nested.to_string_lossy(), "content": "test"}),
+            raw_arguments: None,
+        };
+        let result = execute_write(&tc);
         assert!(result.contains("Successfully wrote"));
         assert!(nested.exists());
         fs::remove_dir_all(&dir).unwrap();
@@ -974,11 +1068,76 @@ mod tests {
     fn test_write_creates_new_even_if_parent_doesnt_exist() {
         let dir = std::env::temp_dir().join("rupi-tools-test-write-deep".to_string());
         let nested = dir.join("a").join("b").join("c").join("f.txt");
-        let args = serde_json::json!({"file_path": nested.to_string_lossy(), "content": "hi"});
-        let result = execute_write(&args);
+        let tc = ToolCall {
+            id: "test".into(),
+            name: "write".into(),
+            arguments: serde_json::json!({"file_path": nested.to_string_lossy(), "content": "hi"}),
+            raw_arguments: None,
+        };
+        let result = execute_write(&tc);
         assert!(result.contains("Successfully wrote"));
         assert!(nested.exists());
         fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn test_write_truncation_recovery_valid_json() {
+        let dir = std::env::temp_dir().join("rupi-tools-test-trunc-valid".to_string());
+        let _ = fs::remove_dir_all(&dir);
+        let file_path = dir.join("truncated.html");
+        // Simulate truncated JSON: valid JSON but with raw_arguments containing partial content
+        let raw = r#"{"file_path":"/tmp/rupi-tools-test-trunc-valid/truncated.html","content":"<html><body><h1>Hello</h1>"}"#;
+        let tc = ToolCall {
+            id: "test".into(),
+            name: "write".into(),
+            arguments: serde_json::json!({"file_path": file_path.to_string_lossy()}), // content missing
+            raw_arguments: Some(raw.to_string()),
+        };
+        let result = execute_write(&tc);
+        assert!(result.contains("truncated"), "Expected truncation warning, got: {}", result);
+        assert!(file_path.exists());
+        let written = fs::read_to_string(&file_path).unwrap();
+        assert!(written.contains("<html>"));
+        assert!(written.contains("RUPI_TRUNCATED"));
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn test_write_truncation_recovery_malformed_json() {
+        let dir = std::env::temp_dir().join("rupi-tools-test-trunc-malformed".to_string());
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let file_path = dir.join("broken.html");
+        // Simulate severely truncated JSON: content string cut off, JSON is invalid
+        let raw = format!(
+            r#"{{"file_path":"{}","content":"<html><body> Hel"#,
+            file_path.to_string_lossy()
+        );
+        let tc = ToolCall {
+            id: "test".into(),
+            name: "write".into(),
+            arguments: serde_json::json!({}), // empty from failed parse
+            raw_arguments: Some(raw),
+        };
+        let result = execute_write(&tc);
+        assert!(result.contains("truncated"), "Expected truncation warning, got: {}", result);
+        assert!(file_path.exists());
+        let written = fs::read_to_string(&file_path).unwrap();
+        assert!(written.contains("<html>"));
+        assert!(written.contains("RUPI_TRUNCATED"));
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn test_write_no_content_no_raw_returns_error() {
+        let tc = ToolCall {
+            id: "test".into(),
+            name: "write".into(),
+            arguments: serde_json::json!({"file_path": "/tmp/test.txt"}),
+            raw_arguments: None,
+        };
+        let result = execute_write(&tc);
+        assert!(result.contains("missing 'content'"));
     }
 
     #[test]
@@ -1019,8 +1178,13 @@ mod tests {
 
     #[test]
     fn test_write_missing_args() {
-        let args = serde_json::json!({});
-        let result = execute_write(&args);
+        let tc = ToolCall {
+            id: "test".into(),
+            name: "write".into(),
+            arguments: serde_json::json!({}),
+            raw_arguments: None,
+        };
+        let result = execute_write(&tc);
         assert!(result.contains("missing"));
     }
 
@@ -1043,6 +1207,7 @@ mod tests {
         let tc = ToolCall {
             id: "e1".into(), name: "search_code".into(),
             arguments: serde_json::json!({"path": "."}),
+            raw_arguments: None,
         };
         let result = execute_tool(&tc);
         assert!(result.contains("missing"));

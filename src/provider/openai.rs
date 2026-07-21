@@ -385,10 +385,16 @@ impl ChatProvider for OpenAIProvider {
             if !tool_calls.is_empty() {
                 let calls: Vec<ToolCall> = tool_calls
                     .into_iter()
-                    .map(|tc| ToolCall {
-                        id: tc.id,
-                        name: tc.name,
-                        arguments: serde_json::from_str(&tc.arguments).unwrap_or_default(),
+                    .map(|tc| {
+                        let raw = tc.arguments.clone();
+                        let parsed = serde_json::from_str(&raw).ok();
+                        let truncated = parsed.is_none() && !raw.is_empty();
+                        ToolCall {
+                            id: tc.id,
+                            name: tc.name,
+                            arguments: parsed.unwrap_or_default(),
+                            raw_arguments: if truncated { Some(raw) } else { None },
+                        }
                     })
                     .collect();
 

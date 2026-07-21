@@ -165,7 +165,7 @@ pub fn load_session(path: &PathBuf) -> Result<Vec<Message>, String> {
                                     let id = v.get("id")?.as_str()?.to_string();
                                     let name = v.get("name")?.as_str()?.to_string();
                                     let args = v.get("arguments").cloned().unwrap_or_default();
-                                    Some(crate::tools::ToolCall { id, name, arguments: args })
+                                    Some(crate::tools::ToolCall { id, name, arguments: args, raw_arguments: None })
                                 })
                                 .collect();
                             if !tool_calls.is_empty() {
@@ -438,8 +438,8 @@ mod tests {
         // Create a message with tool calls
         let mut msg = Message::new("assistant", "let me check");
         msg.tool_calls = Some(vec![
-            ToolCall { id: "call_1".into(), name: "bash".into(), arguments: serde_json::json!({"command": "ls"}) },
-            ToolCall { id: "call_2".into(), name: "read".into(), arguments: serde_json::json!({"file_path": "/tmp/x"}) },
+            ToolCall { id: "call_1".into(), name: "bash".into(), arguments: serde_json::json!({"command": "ls"}), raw_arguments: None },
+            ToolCall { id: "call_2".into(), name: "read".into(), arguments: serde_json::json!({"file_path": "/tmp/x"}), raw_arguments: None },
         ]);
         append_message(&path, &msg).unwrap();
 
