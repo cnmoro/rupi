@@ -46,6 +46,10 @@ struct ChatMessage {
     tool_call_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     reasoning_content: Option<String>,
+    /// Hint to the server to cache the KV state for this message and all preceding ones.
+    /// Supported by servers that implement Anthropic-style prompt caching.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    cache_control: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Serialize)]
@@ -130,6 +134,7 @@ struct AccumulatedToolCall {
 pub struct OpenAIProvider {
     config: OpenAIConfig,
     client: Client,
+    cached_tools: Vec<serde_json::Value>,
 }
 
 impl OpenAIProvider {
@@ -140,9 +145,11 @@ impl OpenAIProvider {
             builder = builder.timeout(std::time::Duration::from_secs(config.timeout_secs));
         }
         let client = builder.build().unwrap_or_else(|_| Client::new());
+        let cached_tools = tools::serialize_tools(&tools::all_tools());
         OpenAIProvider {
             config,
             client,
+            cached_tools,
         }
     }
 
@@ -164,7 +171,17 @@ impl OpenAIProvider {
                     tool_calls: None,
                     tool_call_id: None,
                     reasoning_content: None,
+                    cache_control: None,
                 };
+
+                // Annotate the system message for explicit KV prefix caching.
+                // Compatible servers (vLLM, llama.cpp with cache_control, etc.)
+                // will cache this message and all preceding messages, then reuse
+                // the cached KV state on subsequent requests that share the prefix.
+                // Servers that don't support it will ignore the unknown field.
+                if m.role == "system" {
+                    chat_msg.cache_control = Some(serde_json::json!({"type": "ephemeral"}));
+                }
 
                 // Include reasoning_content for assistant messages (required by reasoning models like DeepSeek)
                 if m.role == "assistant" {
@@ -214,9 +231,8 @@ impl ChatProvider for OpenAIProvider {
         // Build messages with proper tool call/result formatting
         let api_messages = OpenAIProvider::build_messages(messages);
 
-        // Get tool definitions
-        let tools_defs = tools::all_tools();
-        let serialized_tools = tools::serialize_tools(&tools_defs);
+        // Use cached tool definitions (serialized once at provider creation)
+        let serialized_tools = self.cached_tools.clone();
 
         let (tx, rx) = mpsc::channel(256);
 

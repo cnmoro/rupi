@@ -82,6 +82,30 @@ fn ensure_memory_file() -> String {
     }
 }
 
+/// Maximum characters to store for a tool result in the conversation.
+/// Larger results are truncated to reduce KV cache prefill work in subsequent turns.
+/// The full result is still sent to the event stream; only the stored message is capped.
+const MAX_TOOL_RESULT_CHARS: usize = 4000;
+
+/// Truncate a tool result for storage in the conversation, keeping KV cache cost bounded.
+/// Keeps the first ~70% and last ~30% of long results so the model can still see both
+/// the beginning and end of tool output.
+fn capped_tool_result(result: &str) -> String {
+    if result.len() <= MAX_TOOL_RESULT_CHARS {
+        return result.to_string();
+    }
+    let keep_beginning = MAX_TOOL_RESULT_CHARS * 7 / 10;
+    let keep_end = MAX_TOOL_RESULT_CHARS - keep_beginning;
+    let beginning = &result[..keep_beginning];
+    let end = &result[result.len() - keep_end..];
+    format!(
+        "{}... [truncated: {} chars]\n...{}",
+        beginning,
+        result.len() - keep_beginning - keep_end,
+        end
+    )
+}
+
 /// Build the system prompt describing available tools, skills, context files, and memory.
 /// If `datetime` is provided, it is used as the current time (for KV cache stability).
 /// Otherwise, `chrono::Local::now()` is used (for one-shot prompts like goal verification).
@@ -711,8 +735,11 @@ impl AgentSession {
             // to keep the token prefix identical across turns — critical for server-side KV cache reuse.
             let prompt_text = self.system_prompt.read().await.clone();
             let system_msg = Message::new("system", &prompt_text);
-            let mut messages_for_api = vec![system_msg];
-            messages_for_api.extend(self.messages.read().await.clone());
+            let msgs_guard = self.messages.read().await;
+            let mut messages_for_api = Vec::with_capacity(msgs_guard.len() + 1);
+            messages_for_api.push(system_msg);
+            messages_for_api.extend(msgs_guard.iter().cloned());
+            drop(msgs_guard);
 
             let current_model = self.model();
 
@@ -999,7 +1026,11 @@ impl AgentSession {
                         tc.name.clone(),
                         result.clone(),
                     ));
-                    let result_msg = Message::tool_result(&tc.id, &result);
+                    // Cap the stored tool result to keep KV cache prefill bounded.
+                    // The full result is still sent to the event stream above;
+                    // only the conversation-history copy is truncated.
+                    let stored_result = capped_tool_result(&result);
+                    let result_msg = Message::tool_result(&tc.id, &stored_result);
                     self.persist_message(&result_msg).await;
                     self.messages.write().await.push(result_msg);
                 }
