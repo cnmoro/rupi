@@ -2,18 +2,36 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use serde_json::Value;
 
-/// Upper bound the model can request for a single bash command, in seconds.
-/// Two minutes suits interactive work; embedders whose tools shell out to
-/// longer jobs (media conversion, crawls, browser automation) raise it with
-/// `--bash-timeout-max`.
+/// Bounds for the bash tool's per-command timeout, in seconds.
+///
+/// Two minutes and a 30s default suit interactive coding. Embedders whose tools
+/// shell out to longer jobs (media conversion, crawls, browser automation)
+/// raise them with `--bash-timeout-max` / `--bash-timeout-default`.
+///
+/// Both are advertised to the model in the tool schema: it picks a timeout from
+/// what the description says is allowed, so raising the ceiling without saying
+/// so changes nothing in practice.
 static BASH_TIMEOUT_MAX: AtomicU64 = AtomicU64::new(120);
+static BASH_TIMEOUT_DEFAULT: AtomicU64 = AtomicU64::new(30);
 
 pub fn set_bash_timeout_max(seconds: u64) {
     BASH_TIMEOUT_MAX.store(seconds.max(1), Ordering::Relaxed);
 }
 
+pub fn set_bash_timeout_default(seconds: u64) {
+    BASH_TIMEOUT_DEFAULT.store(seconds.max(1), Ordering::Relaxed);
+}
+
 fn bash_timeout_max() -> u64 {
     BASH_TIMEOUT_MAX.load(Ordering::Relaxed)
+}
+
+fn bash_timeout_default() -> u64 {
+    bash_timeout_default_raw().min(bash_timeout_max())
+}
+
+fn bash_timeout_default_raw() -> u64 {
+    BASH_TIMEOUT_DEFAULT.load(Ordering::Relaxed)
 }
 
 /// A tool definition sent to the API.
@@ -65,7 +83,11 @@ fn bash_tool() -> ToolDef {
             "properties": {
                 "command": { "type": "string", "description": "The bash command to execute" },
                 "description": { "type": "string", "description": "A short description (for logging)" },
-                "timeout": { "type": "number", "description": "Timeout in seconds (max 120)", "default": 30 }
+                "timeout": {
+                    "type": "number",
+                    "description": format!("Timeout in seconds (max {})", bash_timeout_max()),
+                    "default": bash_timeout_default()
+                }
             },
             "required": ["command"]
         }),
@@ -254,7 +276,7 @@ fn execute_bash(args: &Value) -> String {
     let timeout_secs: u64 = args
         .get("timeout")
         .and_then(|t| t.as_u64())
-        .unwrap_or(30)
+        .unwrap_or_else(bash_timeout_default)
         .min(bash_timeout_max());
 
     match std::panic::catch_unwind(|| {
@@ -793,6 +815,36 @@ fn execute_search_code(args: &Value) -> String {
             ));
             out
         }
+    }
+}
+
+#[cfg(test)]
+mod timeout_tests {
+    use super::*;
+
+    #[test]
+    fn the_schema_advertises_the_configured_bounds() {
+        // The model chooses a timeout from what the schema says is allowed, so a
+        // raised ceiling that is not advertised buys nothing: it keeps asking
+        // for the old maximum.
+        set_bash_timeout_max(900);
+        set_bash_timeout_default(300);
+
+        let schema = bash_tool().parameters;
+        let timeout = &schema["properties"]["timeout"];
+        assert_eq!(timeout["default"].as_u64(), Some(300));
+        assert!(
+            timeout["description"].as_str().unwrap().contains("900"),
+            "ceiling not advertised: {}",
+            timeout["description"]
+        );
+
+        // A default above the ceiling must not be handed out.
+        set_bash_timeout_max(60);
+        assert_eq!(bash_timeout_default(), 60);
+
+        set_bash_timeout_max(120);
+        set_bash_timeout_default(30);
     }
 }
 

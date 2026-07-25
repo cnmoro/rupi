@@ -56,6 +56,10 @@ pub struct Cli {
     #[arg(long, env = "RUPI_BASH_TIMEOUT_MAX", default_value_t = 120)]
     pub bash_timeout_max: u64,
 
+    /// Timeout applied when the model does not ask for one, in seconds
+    #[arg(long, env = "RUPI_BASH_TIMEOUT_DEFAULT", default_value_t = 30)]
+    pub bash_timeout_default: u64,
+
     /// List all saved sessions with IDs and metadata
     #[arg(long)]
     pub list_sessions: bool,

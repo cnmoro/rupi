@@ -30,6 +30,7 @@ async fn main() {
         sessions::set_sessions_dir(std::path::PathBuf::from(dir));
     }
     tools::set_bash_timeout_max(cli.bash_timeout_max);
+    tools::set_bash_timeout_default(cli.bash_timeout_default);
 
     // Load config from file
     let file_config = match RupiConfig::load() {
