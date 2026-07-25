@@ -17,7 +17,9 @@ Output compression: bash command output is automatically filtered to reduce toke
 }
 ```
 
-All values can be overridden via CLI flags (`--base-url`, `--api-key`, `--model`, `--context-window`, `--timeout`, `--memory`, `--disable-yolo`, `--session`, `--list-sessions`).
+All values can be overridden via CLI flags (`--base-url`, `--api-key`, `--model`, `--context-window`, `--timeout`, `--memory`, `--disable-yolo`, `--session`, `--sessions-dir`, `--bash-timeout-max`, `--bash-timeout-default`, `--list-sessions`), and each also reads a `RUPI_*` environment variable (`RUPI_BASE_URL`, `RUPI_API_KEY`, `RUPI_MODEL`, `RUPI_SESSIONS_DIR`, `RUPI_BASH_TIMEOUT_MAX`, `RUPI_BASH_TIMEOUT_DEFAULT`).
+
+The config file is optional when `--base-url`, `--api-key` and `--model` are all supplied — useful when running rupi somewhere without a writable `$HOME`.
 
 ### Opencode Go / Zen (zero-config alternative)
 
@@ -103,21 +105,21 @@ Same event stream as RPC but reads user input interactively. Useful for debuggin
 
 ## How it works
 
-- **Tools**: bash, read, write, edit, grep, find, ls, search_code — the agent decides when to use them. `search_code` uses a local Model2Vec semantic code search model (potion-code-16M) to find code by natural language description — no grep patterns needed. YOLO mode (default): no approval needed. Add `--disable-yolo` to require user confirmation per execution.
+- **Tools**: bash, read, write, edit, grep, find, ls, search_code — the agent decides when to use them. A bash command times out after 30s unless the model asks for longer, capped at 120s; `--bash-timeout-default` and `--bash-timeout-max` move both, and the tool schema tells the model what the current limits are. `search_code` uses a local Model2Vec semantic code search model (potion-code-16M) to find code by natural language description — no grep patterns needed. YOLO mode (default): no approval needed. Add `--disable-yolo` to require user confirmation per execution.
 - **Write guard**: `write` refuses if the file already exists, returning an error with the exact `edit` call-shape. This prevents accidental whole-file rewrites of existing code. Use `edit` for any change to an existing file.
 - **Multi-edit**: `edit` accepts an `edits` array for batch changes in a single call. Each edit's `old_text` is matched against the **original** file content (not after other edits). Edits must not overlap.
 - **Output parser**: when the model emits tool calls inside text (fenced ` ```tool ``` blocks, `<tool_call>` tags, or bare JSON), the parser extracts and executes them as if they were native tool calls.
 - **Quality monitor**: detects empty responses, hallucinated tool names, and repeated identical tool calls (loops). Queues correction messages to nudge the model back on track (capped at 2 per session to avoid correction loops).
 - **Skills**: place `.md` files in `~/.config/rupi/skills/` — injected into the system prompt on startup
 - **Context files**: `CLAUDE.md` and `AGENTS.md` from cwd and ancestor directories are loaded automatically
-- **Compaction**: two-layer context management. First, **snip** truncates long tool-role messages older than the last 6 turns (rule-based, no API cost). Then, if still over threshold, **auto-compact** calls the LLM to summarize old messages. Set with `--context-window` (default 128000, fires at `window - 16384` tokens).
+- **Compaction**: two-layer context management. First, **snip** truncates long tool-role messages older than the last 6 turns (rule-based, no API cost). Then, if still over threshold, **auto-compact** calls the LLM to summarize old messages. Set with `--context-window` (default 128000, fires at `window - 16384` tokens). A compaction is recorded in the session file, and resuming honours it: everything the summary replaced is left out, so a compacted session does not reopen over budget and immediately compact again.
 - **No hard limits**: the agent runs indefinitely until the task is done. When context approaches the window limit, snip + auto-compact keeps the agent going. Optionally set `--timeout <secs>` to cap execution time.
 - **Steer / follow-up**: type while the agent generates — normal Enter queues as follow-up (processed after the current turn). Use `/steer <message>` to interrupt immediately. In RPC mode, set `"streamingBehavior": "steer"` or `"followUp"` on the prompt command.
 - **Memory**: add `--memory` to persist key facts across sessions. The agent reads/writes `~/.config/rupi/MEMORY.md` — reads on startup, overwrites with bullet points during execution.
-- **Session persistence**: conversations saved as JSONL in `~/.config/rupi_sessions/` with UUID filenames
-- **Session resumption**: use `--session <id>` to resume a previous conversation from where you left off. The agent remembers all prior messages. Works in interactive, raw, and RPC modes.
+- **Session persistence**: conversations saved as JSONL in `~/.config/rupi_sessions/` with UUID filenames. `--sessions-dir <path>` puts them somewhere else — one directory per tenant, or a path an embedding process controls. The transcript is recreated if something deletes it mid-run.
+- **Session resumption**: use `--session <id>` to resume a previous conversation from where you left off. The agent remembers all prior messages (up to the last compaction). An unknown id *starts* that session rather than falling back to a random one, so a caller that owns the id gets a predictable transcript path from the first turn. Works in interactive, raw, and RPC modes.
 - **Error reporting**: `message_end` includes `stop_reason` (`"stop"`, `"error"`, `"tool_calls"`, `"timeout"`) and error text in `content` when applicable.
-- **Generation ID**: `X-Generation-Id` from response headers emitted as an early event
+- **Generation ID**: `X-Generation-Id` from response headers emitted as an early event, and written to the session file so per-generation cost can still be reconciled with the provider after the stream is gone
 - **Cost**: usage and cost data from the API included in the `message_end` event
 
 ## Calling via code (Python / Node.js / Java)
