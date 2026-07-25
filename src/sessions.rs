@@ -70,11 +70,25 @@ pub struct SessionInfo {
     pub message_count: usize,
 }
 
+/// Create a new session file under a caller-chosen id. Returns the file path.
+///
+/// `--session <id>` names the conversation, so an embedder that owns the id
+/// (one per chat, say) gets a predictable transcript path from the first turn
+/// instead of a UUID it then has to discover.
+pub fn create_session_with_id(id: &str, model: &str) -> Result<PathBuf, String> {
+    let dir = ensure_sessions_dir()?;
+    write_session_header(&dir.join(format!("{}.jsonl", id)), id, model)
+}
+
 /// Create a new session file. Returns the file path.
 pub fn create_session(model: &str) -> Result<PathBuf, String> {
     let dir = ensure_sessions_dir()?;
     let id = uuid::Uuid::new_v4().to_string();
-    let path = dir.join(format!("{}.jsonl", id));
+    write_session_header(&dir.join(format!("{}.jsonl", id)), &id, model)
+}
+
+fn write_session_header(path: &PathBuf, id: &str, model: &str) -> Result<PathBuf, String> {
+    let path = path.clone();
 
     // Write session header with the ID
     let header = SessionEntry {
@@ -83,7 +97,7 @@ pub fn create_session(model: &str) -> Result<PathBuf, String> {
         message: None,
         summary: None,
         tokens_before: None,
-        session_id: Some(&id),
+        session_id: Some(id),
     };
     let mut file = std::fs::File::create(&path).map_err(|e| format!("Cannot create session file: {}", e))?;
     use std::io::Write;

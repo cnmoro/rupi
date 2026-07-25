@@ -47,6 +47,17 @@ async fn main() {
                     opencode_api_key: std::env::var("OPENCODE_API_KEY").ok(),
                     opencode_provider: Some(cli.opencode_provider.clone()),
                 }
+            } else if cli.base_url.is_some() && cli.api_key.is_some() && cli.model.is_some() {
+                // Everything the config file would supply came from flags or the
+                // environment. Requiring the file anyway breaks embedders that
+                // run rupi with no writable HOME.
+                RupiConfig {
+                    base_url: None,
+                    api_key: None,
+                    model_tag: None,
+                    opencode_api_key: None,
+                    opencode_provider: None,
+                }
             } else {
                 eprintln!("Error: {}", e);
                 std::process::exit(1);
@@ -164,8 +175,22 @@ async fn resolve_session(
     if let Some(sid) = session_id {
         let sid = sid.trim();
         if !sid.is_empty() {
-            if let Some(path) = sessions::find_session_path(sid) {
-                eprintln!("rupi: resuming session {}", sid);
+            // Not found means "start this session", not "start some other one":
+            // the caller named it, so claim that name.
+            let existing = sessions::find_session_path(sid).or_else(|| {
+                match sessions::create_session_with_id(sid, &config.model) {
+                    Ok(path) => {
+                        eprintln!("rupi: starting session {}", sid);
+                        Some(path)
+                    }
+                    Err(e) => {
+                        eprintln!("rupi: cannot create session '{}': {}", sid, e);
+                        None
+                    }
+                }
+            });
+            if let Some(path) = existing {
+                eprintln!("rupi: using session {}", sid);
                 match AgentSession::from_session(
                     config.clone(), path, cwd.to_string(),
                     skills.to_vec(), context_files.to_vec(), memory,
@@ -174,7 +199,7 @@ async fn resolve_session(
                     Err(e) => eprintln!("rupi: failed to resume session: {}", e),
                 }
             } else {
-                eprintln!("rupi: session '{}' not found, starting fresh", sid);
+                eprintln!("rupi: session '{}' unavailable, starting fresh", sid);
             }
         }
     }

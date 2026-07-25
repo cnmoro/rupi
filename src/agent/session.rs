@@ -1082,8 +1082,17 @@ impl AgentSession {
                 let msgs = self.messages.read().await.clone();
                 let total = compaction::estimate_total_tokens(&msgs);
                 if compaction::should_compact(total, self.context_window) {
-                    // Schedule compaction in background
-                    let _ = self.compact().await;
+                    // Say why when it doesn't happen. Swallowing the error made a
+                    // failed compaction indistinguishable from one that never
+                    // triggered: the context silently stays over budget and every
+                    // later turn pays to summarize again.
+                    match self.compact().await {
+                        Ok(result) => eprintln!(
+                            "rupi: compacted at ~{} tokens (window {})",
+                            result.tokens_before, self.context_window
+                        ),
+                        Err(e) => eprintln!("rupi: compaction failed: {}", e),
+                    }
                 }
             }
 

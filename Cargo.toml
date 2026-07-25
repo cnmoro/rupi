@@ -42,3 +42,11 @@ tree-sitter-c-sharp = "0.23"
 [dev-dependencies]
 mockito = "1"
 dotenvy = "0.15"
+
+# The binary ships as a single artifact, so the extra link time buys both a
+# smaller download and better codegen across crate boundaries. `catch_unwind`
+# in the bash tool rules out panic = "abort".
+[profile.release]
+lto = true
+codegen-units = 1
+strip = true
