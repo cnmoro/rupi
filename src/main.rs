@@ -31,6 +31,7 @@ async fn main() {
     }
     tools::set_bash_timeout_max(cli.bash_timeout_max);
     tools::set_bash_timeout_default(cli.bash_timeout_default);
+    rupi::provider::openai::set_stream_idle_timeout(cli.stream_idle_timeout);
 
     // Load config from file
     let file_config = match RupiConfig::load() {

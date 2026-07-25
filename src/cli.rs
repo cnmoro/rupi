@@ -60,6 +60,10 @@ pub struct Cli {
     #[arg(long, env = "RUPI_BASH_TIMEOUT_DEFAULT", default_value_t = 30)]
     pub bash_timeout_default: u64,
 
+    /// Seconds of silence mid-stream before the provider request is failed
+    #[arg(long, env = "RUPI_STREAM_IDLE_TIMEOUT", default_value_t = 120)]
+    pub stream_idle_timeout: u64,
+
     /// List all saved sessions with IDs and metadata
     #[arg(long)]
     pub list_sessions: bool,

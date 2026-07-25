@@ -137,10 +137,31 @@ pub struct OpenAIProvider {
     cached_tools: Vec<serde_json::Value>,
 }
 
+/// Max seconds of silence mid-stream before a provider request is failed.
+///
+/// Distinct from `--timeout`, which caps a whole run: a long generation is
+/// fine, a stream that goes quiet is not. Without this a provider that accepts
+/// the request and then stops sending parks the agent forever.
+static STREAM_IDLE_TIMEOUT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(120);
+
+pub fn set_stream_idle_timeout(seconds: u64) {
+    STREAM_IDLE_TIMEOUT.store(seconds.max(1), std::sync::atomic::Ordering::Relaxed);
+}
+
+fn stream_idle_timeout() -> u64 {
+    STREAM_IDLE_TIMEOUT.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 impl OpenAIProvider {
     pub fn new(config: OpenAIConfig) -> Self {
         let mut builder = Client::builder()
-            .connect_timeout(std::time::Duration::from_secs(10));
+            .connect_timeout(std::time::Duration::from_secs(10))
+            // Cap the gap *between* bytes, not the whole request: a long
+            // generation is fine, a stream that goes quiet is not. Without this
+            // a provider that accepts the request and then stops sending parks
+            // the agent forever — no event, no error, nothing for a caller to
+            // react to.
+            .read_timeout(std::time::Duration::from_secs(stream_idle_timeout()));
         if config.timeout_secs > 0 {
             builder = builder.timeout(std::time::Duration::from_secs(config.timeout_secs));
         }

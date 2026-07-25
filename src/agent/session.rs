@@ -498,7 +498,38 @@ impl AgentSession {
     /// Handles multi-turn tool execution (bash, etc.) internally.
     /// If a goal is set, loops until the goal is verified.
     /// If streaming and `streaming_behavior` is "steer" or "followUp", queues instead.
+    /// Run a turn, guaranteeing the caller is told when it ends.
+    ///
+    /// The turn body has several error exits (retry caps, provider failures,
+    /// aborts) and some returned without emitting `agent_end`. A caller driving
+    /// rupi over RPC waits on that event, so those paths left it hanging until
+    /// its own timeout — indistinguishable from a model that is simply slow.
+    /// Emitting it here means every exit is terminal, whatever the body does.
     pub async fn prompt(
+        &self,
+        message: &str,
+        event_tx: mpsc::UnboundedSender<AgentEvent>,
+    ) -> Result<(), AgentError> {
+        let result = self.prompt_inner(message, event_tx.clone()).await;
+        if let Err(ref e) = result {
+            eprintln!("rupi: turn ended with error: {}", e);
+            let _ = event_tx.send(AgentEvent::message_end(AgentMessage {
+                role: "assistant".to_string(),
+                content: vec![MessageContent {
+                    content_type: "text".to_string(),
+                    text: Some(format!("Error: {}", e)),
+                }],
+                model: None,
+                usage: None,
+                stop_reason: Some("error".to_string()),
+            }));
+            let _ = event_tx.send(AgentEvent::turn_end());
+            let _ = event_tx.send(AgentEvent::agent_end());
+        }
+        result
+    }
+
+    async fn prompt_inner(
         &self,
         message: &str,
         event_tx: mpsc::UnboundedSender<AgentEvent>,
