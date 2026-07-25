@@ -455,6 +455,15 @@ impl AgentSession {
         }
     }
 
+    /// Persist a provider generation id so cost can be reconciled later.
+    async fn persist_generation_id(&self, generation_id: &str) {
+        if let Some(ref path) = *self.session_path.read().await {
+            if let Err(e) = sessions::append_generation_id(path, generation_id) {
+                eprintln!("rupi: failed to persist generation id: {}", e);
+            }
+        }
+    }
+
     /// Reset the session (clear messages, create new session file).
     pub async fn reset(&self) {
         // Wait for any in-progress compaction to finish
@@ -818,6 +827,7 @@ impl AgentSession {
                 };
                 match event {
                     StreamEvent::GenerationId(id) => {
+                        self.persist_generation_id(&id).await;
                         let _ = event_tx.send(AgentEvent::generation_id(id));
                     }
                     StreamEvent::Delta(delta) => {
@@ -1182,7 +1192,10 @@ impl AgentSession {
         // Use role "user" (not "system") because OpenAI-compatible endpoints
         // expect at most one system message — the one built fresh each turn.
         // Relies on the summary's ## Goal section to retain the task objective.
-        let summary_msg = Message::new("user", &format!("[Compacted conversation history]\n{}", summary));
+        let summary_msg = Message::new(
+            "user",
+            &format!("{}\n{}", crate::sessions::COMPACTION_PREFIX, summary),
+        );
         self.persist_message(&summary_msg).await;
         let mut all_messages = self.messages.write().await;
         let keep: Vec<Message> = all_messages[cut_index..].to_vec();

@@ -8,6 +8,7 @@ use rupi::rpc::handler::RpcHandler;
 use rupi::rpc::types::RpcCommand;
 use rupi::sessions;
 use rupi::skills;
+use rupi::tools;
 use rupi::skills::Skill;
 
 use clap::Parser;
@@ -23,6 +24,12 @@ async fn main() {
         .init();
 
     let cli = Cli::parse();
+
+    // Both must be applied before anything opens a session or runs a tool.
+    if let Some(ref dir) = cli.sessions_dir {
+        sessions::set_sessions_dir(std::path::PathBuf::from(dir));
+    }
+    tools::set_bash_timeout_max(cli.bash_timeout_max);
 
     // Load config from file
     let file_config = match RupiConfig::load() {

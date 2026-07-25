@@ -48,6 +48,14 @@ pub struct Cli {
     #[arg(long)]
     pub session: Option<String>,
 
+    /// Directory holding session transcripts (default: ~/.config/rupi_sessions)
+    #[arg(long, env = "RUPI_SESSIONS_DIR")]
+    pub sessions_dir: Option<String>,
+
+    /// Ceiling for the bash tool's per-command timeout, in seconds
+    #[arg(long, env = "RUPI_BASH_TIMEOUT_MAX", default_value_t = 120)]
+    pub bash_timeout_max: u64,
+
     /// List all saved sessions with IDs and metadata
     #[arg(long)]
     pub list_sessions: bool,

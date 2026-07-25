@@ -6,8 +6,22 @@ use crate::tools::ToolCall;
 
 const SESSIONS_DIR: &str = "rupi_sessions";
 
-/// Get the sessions directory path (~/.config/rupi_sessions/).
+static SESSIONS_DIR_OVERRIDE: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+
+/// Store sessions in `dir` instead of `~/.config/rupi_sessions/`.
+///
+/// Embedders that sandbox rupi (or keep one session directory per tenant) need
+/// the transcripts somewhere they control, without depending on `$HOME`. Only
+/// the first call wins, so this must run before any session is opened.
+pub fn set_sessions_dir(dir: PathBuf) {
+    let _ = SESSIONS_DIR_OVERRIDE.set(dir);
+}
+
+/// Get the sessions directory path (`--sessions-dir`, else `~/.config/rupi_sessions/`).
 pub fn sessions_dir() -> Option<PathBuf> {
+    if let Some(dir) = SESSIONS_DIR_OVERRIDE.get() {
+        return Some(dir.clone());
+    }
     dirs::home_dir().map(|h| h.join(".config").join(SESSIONS_DIR))
 }
 
@@ -133,6 +147,69 @@ pub fn append_compaction(path: &PathBuf, summary: &str, tokens_before: u64) -> R
     Ok(())
 }
 
+/// Marker that identifies the summary message written when a session compacts.
+pub const COMPACTION_PREFIX: &str = "[Compacted conversation history]";
+
+/// Read the text of a session entry's `content`.
+///
+/// rupi writes a plain string. Transcripts written by other agents in this
+/// family use a content-block array (`[{"type":"text","text":"…"}]`), which we
+/// accept so an embedder can hand us a conversation it recorded itself.
+fn message_text(content: &serde_json::Value) -> String {
+    if let Some(text) = content.as_str() {
+        return text.to_string();
+    }
+    let Some(blocks) = content.as_array() else {
+        return String::new();
+    };
+    blocks
+        .iter()
+        .filter_map(|block| match block {
+            serde_json::Value::String(s) => Some(s.clone()),
+            serde_json::Value::Object(map) => match map.get("type").and_then(|t| t.as_str()) {
+                Some("text") | None => map.get("text").and_then(|t| t.as_str()).map(str::to_string),
+                Some("toolCall") => map
+                    .get("name")
+                    .and_then(|n| n.as_str())
+                    .map(|name| format!("[called tool: {}]", name)),
+                _ => None,
+            },
+            _ => None,
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// Map role spellings from other agents onto the ones the provider expects.
+fn normalize_role(role: &str) -> &str {
+    match role {
+        "toolResult" | "tool_result" => "tool",
+        other => other,
+    }
+}
+
+/// Record the provider's generation id for a turn.
+///
+/// Streaming usage is an estimate; the authoritative cost has to be fetched
+/// from the provider afterwards, keyed by this id. Keeping it only in the event
+/// stream loses it whenever nobody was listening (crash, detached run), so it
+/// belongs in the transcript.
+pub fn append_generation_id(path: &PathBuf, generation_id: &str) -> Result<(), String> {
+    let entry = serde_json::json!({
+        "type": "generation_id",
+        "id": generation_id,
+        "timestamp": chrono::Utc::now().to_rfc3339(),
+    });
+    let mut file = std::fs::OpenOptions::new()
+        .append(true)
+        .open(path)
+        .map_err(|e| format!("Cannot open session file: {}", e))?;
+    use std::io::Write;
+    writeln!(file, "{}", serialize_json_line(&entry).trim())
+        .map_err(|e| format!("Cannot append generation id to session file: {}", e))?;
+    Ok(())
+}
+
 /// Load all entries from a session file.
 pub fn load_session(path: &PathBuf) -> Result<Vec<Message>, String> {
     if !path.exists() {
@@ -140,7 +217,7 @@ pub fn load_session(path: &PathBuf) -> Result<Vec<Message>, String> {
     }
     let contents = std::fs::read_to_string(path)
         .map_err(|e| format!("Cannot read session file: {}", e))?;
-    let mut messages = Vec::new();
+    let mut messages: Vec<Message> = Vec::new();
 
     for line in contents.lines() {
         let line = line.trim();
@@ -149,14 +226,37 @@ pub fn load_session(path: &PathBuf) -> Result<Vec<Message>, String> {
         }
         if let Ok(val) = serde_json::from_str::<serde_json::Value>(line) {
             let entry_type = val["type"].as_str().unwrap_or("");
+            if entry_type == "compaction" {
+                // Everything above this point was summarized. Replaying it too
+                // would restore the very context the compaction just dropped —
+                // the session would resume over budget and immediately compact
+                // again, paying for a summary every single time.
+                let summary_msg = match messages.last() {
+                    Some(last) if last.content.starts_with(COMPACTION_PREFIX) => last.clone(),
+                    // Written by a different tool, or the summary message never
+                    // made it to disk: rebuild it from the compaction record.
+                    _ => Message::new(
+                        "user",
+                        &format!(
+                            "{}\n{}",
+                            COMPACTION_PREFIX,
+                            val["summary"].as_str().unwrap_or_default()
+                        ),
+                    ),
+                };
+                messages.clear();
+                messages.push(summary_msg);
+                continue;
+            }
             if entry_type == "message" {
                 if let Some(msg_val) = val.get("message") {
                     let role = msg_val["role"].as_str().unwrap_or("user");
-                    let content = msg_val["content"].as_str().unwrap_or("");
+                    let content = message_text(&msg_val["content"]);
+                    let content = content.as_str();
 
                     // Try to deserialize with optional tool_calls and tool_call_id
                     if let Ok(entry) = serde_json::from_value::<SessionMessageEntry>(msg_val.clone()) {
-                        let mut msg = Message::new(&entry.role, &entry.content);
+                        let mut msg = Message::new(normalize_role(&entry.role), &entry.content);
                         msg.tool_call_id = entry.tool_call_id;
                         msg.reasoning_content = entry.reasoning_content;
                         if let Some(calls) = entry.tool_calls {
@@ -174,7 +274,7 @@ pub fn load_session(path: &PathBuf) -> Result<Vec<Message>, String> {
                         }
                         messages.push(msg);
                     } else {
-                        messages.push(Message::new(role, content));
+                        messages.push(Message::new(normalize_role(role), content));
                     }
                 }
             }
@@ -485,6 +585,99 @@ mod tests {
         assert_eq!(loaded.len(), 2, "Corrupt line should be skipped");
         assert_eq!(loaded[0].content, "hello");
         assert_eq!(loaded[1].content, "hi");
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// Write `lines` to a throwaway session file and load it back.
+    fn load_lines(tag: &str, lines: &[serde_json::Value]) -> (PathBuf, Vec<Message>) {
+        let dir = std::env::temp_dir().join(format!("rupi-sessions-{}-{}", tag, std::process::id()));
+        let _ = fs::create_dir_all(&dir);
+        let path = dir.join(format!("{}.jsonl", tag));
+        let mut file = fs::File::create(&path).unwrap();
+        use std::io::Write;
+        for line in lines {
+            writeln!(file, "{}", serialize_json_line(line).trim()).unwrap();
+        }
+        drop(file);
+        let loaded = load_session(&path).unwrap();
+        (dir, loaded)
+    }
+
+    #[test]
+    fn resuming_after_compaction_drops_the_summarized_messages() {
+        // Without this, resuming replays the whole history *plus* the summary,
+        // so the session reopens over budget and compacts again immediately.
+        let summary_content = format!("{}\nuser asked about X; agent fixed Y", COMPACTION_PREFIX);
+        let (dir, loaded) = load_lines(
+            "compacted",
+            &[
+                serde_json::json!({"type":"session","model":"gpt-4"}),
+                serde_json::json!({"type":"message","message":{"role":"user","content":"old question"}}),
+                serde_json::json!({"type":"message","message":{"role":"assistant","content":"old answer"}}),
+                serde_json::json!({"type":"message","message":{"role":"user","content":summary_content}}),
+                serde_json::json!({"type":"compaction","summary":"user asked about X; agent fixed Y","tokens_before":9000}),
+                serde_json::json!({"type":"message","message":{"role":"user","content":"what next?"}}),
+            ],
+        );
+
+        assert_eq!(loaded.len(), 2, "expected summary + post-compaction message");
+        assert!(loaded[0].content.starts_with(COMPACTION_PREFIX));
+        assert!(loaded[0].content.contains("fixed Y"));
+        assert_eq!(loaded[1].content, "what next?");
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn compaction_without_a_persisted_summary_message_is_rebuilt() {
+        let (dir, loaded) = load_lines(
+            "compacted-nosummary",
+            &[
+                serde_json::json!({"type":"message","message":{"role":"user","content":"old"}}),
+                serde_json::json!({"type":"compaction","summary":"the story so far","tokens_before":9000}),
+                serde_json::json!({"type":"message","message":{"role":"assistant","content":"after"}}),
+            ],
+        );
+
+        assert_eq!(loaded.len(), 2);
+        assert_eq!(loaded[0].role, "user");
+        assert!(loaded[0].content.contains("the story so far"));
+        assert_eq!(loaded[1].content, "after");
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn content_blocks_and_foreign_roles_are_understood() {
+        // Transcripts recorded by an embedder use the content-block shape.
+        let (dir, loaded) = load_lines(
+            "blocks",
+            &[
+                serde_json::json!({"type":"message","message":{"role":"user","content":[{"type":"text","text":"hello"}]}}),
+                serde_json::json!({"type":"message","message":{"role":"assistant","content":[{"type":"text","text":"part one"},{"type":"toolCall","name":"bash"}]}}),
+                serde_json::json!({"type":"message","message":{"role":"toolResult","content":[{"type":"text","text":"exit 0"}]}}),
+            ],
+        );
+
+        assert_eq!(loaded.len(), 3);
+        assert_eq!(loaded[0].content, "hello");
+        assert_eq!(loaded[1].content, "part one\n[called tool: bash]");
+        assert_eq!(loaded[2].role, "tool", "toolResult must map to the tool role");
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn generation_ids_are_persisted_for_cost_reconciliation() {
+        let dir = std::env::temp_dir().join(format!("rupi-sessions-genid-{}", std::process::id()));
+        let _ = fs::create_dir_all(&dir);
+        let path = dir.join("genid.jsonl");
+        fs::write(&path, "").unwrap();
+
+        append_generation_id(&path, "gen-abc123").unwrap();
+
+        let text = fs::read_to_string(&path).unwrap();
+        assert!(text.contains("gen-abc123"));
+        assert!(text.contains("\"type\":\"generation_id\""));
+        // It must not be mistaken for conversation content on resume.
+        assert!(load_session(&path).unwrap().is_empty());
         fs::remove_dir_all(&dir).unwrap();
     }
 

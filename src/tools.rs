@@ -1,5 +1,20 @@
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
 use serde_json::Value;
+
+/// Upper bound the model can request for a single bash command, in seconds.
+/// Two minutes suits interactive work; embedders whose tools shell out to
+/// longer jobs (media conversion, crawls, browser automation) raise it with
+/// `--bash-timeout-max`.
+static BASH_TIMEOUT_MAX: AtomicU64 = AtomicU64::new(120);
+
+pub fn set_bash_timeout_max(seconds: u64) {
+    BASH_TIMEOUT_MAX.store(seconds.max(1), Ordering::Relaxed);
+}
+
+fn bash_timeout_max() -> u64 {
+    BASH_TIMEOUT_MAX.load(Ordering::Relaxed)
+}
 
 /// A tool definition sent to the API.
 #[derive(Debug, Clone)]
@@ -236,7 +251,11 @@ fn execute_bash(args: &Value) -> String {
         Some(cmd) => cmd,
         None => return "Error: missing 'command' argument".to_string(),
     };
-    let timeout_secs: u64 = args.get("timeout").and_then(|t| t.as_u64()).unwrap_or(30).min(120);
+    let timeout_secs: u64 = args
+        .get("timeout")
+        .and_then(|t| t.as_u64())
+        .unwrap_or(30)
+        .min(bash_timeout_max());
 
     match std::panic::catch_unwind(|| {
         let mut child = match std::process::Command::new("bash")
