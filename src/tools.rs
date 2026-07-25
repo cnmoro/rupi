@@ -1,3 +1,5 @@
+use std::io::Read;
+use std::os::unix::io::AsRawFd;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use serde_json::Value;
@@ -291,45 +293,50 @@ fn execute_bash(args: &Value) -> String {
             Err(e) => return format!("Failed to spawn bash: {}", e),
         };
 
+        // Read the pipes without blocking on them.
+        //
+        // `wait_with_output()` reads until EOF, and EOF only arrives when every
+        // holder of the pipe closes it — including processes the command left
+        // running on purpose (a browser, a dev server, anything backgrounded).
+        // Those keep the agent waiting forever, and the timeout below cannot
+        // help because by then the command itself has already exited. Reading
+        // what is available and moving on is the only behaviour that works for
+        // both a normal command and one that deliberately outlives its shell.
+        let mut stdout = child.stdout.take();
+        let mut stderr = child.stderr.take();
+        set_nonblocking(&stdout);
+        set_nonblocking(&stderr);
+
+        let mut out_buf: Vec<u8> = Vec::new();
+        let mut err_buf: Vec<u8> = Vec::new();
         let start = std::time::Instant::now();
         let timeout = std::time::Duration::from_secs(timeout_secs);
 
         loop {
+            drain(&mut stdout, &mut out_buf);
+            drain(&mut stderr, &mut err_buf);
+
             match child.try_wait() {
                 Ok(Some(status)) => {
-                    let output = child.wait_with_output().unwrap();
-                    let mut result = String::new();
-                    if !output.stdout.is_empty() {
-                        result.push_str(&String::from_utf8_lossy(&output.stdout));
+                    // The command is gone; give whatever it wrote a moment to
+                    // arrive, then stop — anything still holding the pipe is a
+                    // process that outlived it and is not ours to wait for.
+                    let grace = std::time::Instant::now();
+                    while grace.elapsed() < std::time::Duration::from_millis(300) {
+                        drain(&mut stdout, &mut out_buf);
+                        drain(&mut stderr, &mut err_buf);
+                        std::thread::sleep(std::time::Duration::from_millis(20));
                     }
-                    if !output.stderr.is_empty() {
-                        if !result.is_empty() { result.push('\n'); }
-                        result.push_str(&String::from_utf8_lossy(&output.stderr));
-                    }
-                    if !status.success() {
-                        let ec = status.code().unwrap_or(-1);
-                        result.push_str(&format!("\n[exit code: {}]", ec));
-                    }
-                    if result.trim().is_empty() {
-                        result = format!("[command completed with exit code {}]", status.code().unwrap_or(-1));
-                    } else {
-                        // Apply RTK-style output compression
-                        let original_len = result.len();
-                        result = crate::rtk_filter::filter_output(command, &result);
-                        let new_len = result.len();
-                        if new_len < original_len && original_len > 200 {
-                            let pct = (original_len - new_len) * 100 / original_len;
-                            if pct > 0 {
-                                result.push_str(&format!("\n[rtk: {}% token savings]", pct));
-                            }
-                        }
-                    }
-                    return result;
+                    return assemble_bash_result(command, &out_buf, &err_buf, status.code());
                 }
                 Ok(None) => {
                     if start.elapsed() > timeout {
                         let _ = child.kill();
-                        return format!("[timed out after {}s]", timeout_secs);
+                        let _ = child.wait();
+                        drain(&mut stdout, &mut out_buf);
+                        drain(&mut stderr, &mut err_buf);
+                        let partial = assemble_bash_result(command, &out_buf, &err_buf, None);
+                        return format!("[timed out after {}s]\n{}", timeout_secs, partial);
                     }
                     std::thread::sleep(std::time::Duration::from_millis(10));
                 }
@@ -340,6 +347,70 @@ fn execute_bash(args: &Value) -> String {
         Ok(r) => r,
         Err(_) => "Error: bash execution panicked".to_string(),
     }
+}
+
+/// Put a child pipe in non-blocking mode so a read can never park the agent.
+fn set_nonblocking<T: std::os::unix::io::AsRawFd>(pipe: &Option<T>) {
+    if let Some(p) = pipe {
+        unsafe {
+            let fd = p.as_raw_fd();
+            let flags = libc::fcntl(fd, libc::F_GETFL);
+            if flags >= 0 {
+                libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK);
+            }
+        }
+    }
+}
+
+/// Move whatever is currently readable into `buf`. Never blocks.
+fn drain<T: std::io::Read>(pipe: &mut Option<T>, buf: &mut Vec<u8>) {
+    let Some(p) = pipe.as_mut() else { return };
+    let mut chunk = [0u8; 8192];
+    loop {
+        match p.read(&mut chunk) {
+            Ok(0) => return,
+            Ok(n) => buf.extend_from_slice(&chunk[..n]),
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => return,
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(_) => return,
+        }
+    }
+}
+
+fn assemble_bash_result(command: &str, out: &[u8], err: &[u8], exit_code: Option<i32>) -> String {
+    let mut result = String::new();
+    if !out.is_empty() {
+        result.push_str(&String::from_utf8_lossy(out));
+    }
+    if !err.is_empty() {
+        if !result.is_empty() {
+            result.push('\n');
+        }
+        result.push_str(&String::from_utf8_lossy(err));
+    }
+    let failed = !matches!(exit_code, Some(0));
+    if failed {
+        if let Some(code) = exit_code {
+            result.push_str(&format!("\n[exit code: {}]", code));
+        }
+    }
+    if result.trim().is_empty() {
+        return format!(
+            "[command completed with exit code {}]",
+            exit_code.map(|c| c.to_string()).unwrap_or_else(|| "unknown".into())
+        );
+    }
+    // Apply RTK-style output compression
+    let original_len = result.len();
+    result = crate::rtk_filter::filter_output(command, &result);
+    let new_len = result.len();
+    if new_len < original_len && original_len > 200 {
+        let pct = (original_len - new_len) * 100 / original_len;
+        if pct > 0 {
+            result.push_str(&format!("\n[rtk: {}% token savings]", pct));
+        }
+    }
+    result
 }
 
 // ---- read ----
@@ -1257,6 +1328,34 @@ mod tests {
         };
         let result = execute_write(&tc);
         assert!(result.contains("missing"));
+    }
+
+    #[test]
+    fn a_backgrounded_child_does_not_stall_the_tool() {
+        // The command exits immediately but leaves a process holding its stdout.
+        // Reading to EOF waits for *that* process, so the tool used to block
+        // forever — past its own timeout, since the timeout only covers the
+        // command itself. This is the normal shape of "start a browser/server
+        // and leave it running", which is exactly what an embedder's helper
+        // scripts do.
+        let args = serde_json::json!({"command": "sleep 30 & echo STARTED", "timeout": 5});
+        let began = std::time::Instant::now();
+        let result = execute_bash(&args);
+        let elapsed = began.elapsed();
+
+        assert!(result.contains("STARTED"), "output lost: {result}");
+        assert!(
+            elapsed < std::time::Duration::from_secs(5),
+            "tool waited {elapsed:?} for a process that outlived the command"
+        );
+    }
+
+    #[test]
+    fn a_timeout_still_returns_what_was_printed() {
+        let args = serde_json::json!({"command": "echo PARCIAL; sleep 30", "timeout": 1});
+        let result = execute_bash(&args);
+        assert!(result.contains("timed out"), "{result}");
+        assert!(result.contains("PARCIAL"), "partial output was discarded: {result}");
     }
 
     #[test]
