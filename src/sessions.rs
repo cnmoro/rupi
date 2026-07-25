@@ -106,6 +106,20 @@ fn write_session_header(path: &PathBuf, id: &str, model: &str) -> Result<PathBuf
     Ok(path)
 }
 
+/// Open a session file for appending, recreating it if it vanished.
+///
+/// An embedder may prune the session directory between turns; without
+/// `create(true)` every later write fails with ENOENT and the transcript is
+/// silently lost for the rest of the process's life — taking the compaction
+/// record and the generation ids with it.
+fn open_for_append(path: &PathBuf) -> Result<std::fs::File, String> {
+    std::fs::OpenOptions::new()
+        .append(true)
+        .create(true)
+        .open(path)
+        .map_err(|e| format!("Cannot open session file: {}", e))
+}
+
 /// Append a message entry to a session file.
 pub fn append_message(path: &PathBuf, msg: &Message) -> Result<(), String> {
     let tool_calls = msg.tool_calls.as_ref().map(|calls| {
@@ -131,10 +145,7 @@ pub fn append_message(path: &PathBuf, msg: &Message) -> Result<(), String> {
         tokens_before: None,
         session_id: None,
     };
-    let mut file = std::fs::OpenOptions::new()
-        .append(true)
-        .open(path)
-        .map_err(|e| format!("Cannot open session file: {}", e))?;
+    let mut file = open_for_append(path)?;
     use std::io::Write;
     writeln!(file, "{}", serialize_json_line(&entry).trim())
         .map_err(|e| format!("Cannot append to session file: {}", e))?;
@@ -151,10 +162,7 @@ pub fn append_compaction(path: &PathBuf, summary: &str, tokens_before: u64) -> R
         tokens_before: Some(tokens_before),
         session_id: None,
     };
-    let mut file = std::fs::OpenOptions::new()
-        .append(true)
-        .open(path)
-        .map_err(|e| format!("Cannot open session file: {}", e))?;
+    let mut file = open_for_append(path)?;
     use std::io::Write;
     writeln!(file, "{}", serialize_json_line(&entry).trim())
         .map_err(|e| format!("Cannot append compaction to session file: {}", e))?;
@@ -214,10 +222,7 @@ pub fn append_generation_id(path: &PathBuf, generation_id: &str) -> Result<(), S
         "id": generation_id,
         "timestamp": chrono::Utc::now().to_rfc3339(),
     });
-    let mut file = std::fs::OpenOptions::new()
-        .append(true)
-        .open(path)
-        .map_err(|e| format!("Cannot open session file: {}", e))?;
+    let mut file = open_for_append(path)?;
     use std::io::Write;
     writeln!(file, "{}", serialize_json_line(&entry).trim())
         .map_err(|e| format!("Cannot append generation id to session file: {}", e))?;
@@ -693,6 +698,31 @@ mod tests {
         // It must not be mistaken for conversation content on resume.
         assert!(load_session(&path).unwrap().is_empty());
         fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn appending_recreates_a_transcript_that_was_deleted() {
+        // An embedder that prunes the session directory between turns used to
+        // break persistence permanently: every later append failed with ENOENT,
+        // losing the compaction record and the generation ids with it.
+        let dir = std::env::temp_dir().join(format!("rupi-sessions-gone-{}", std::process::id()));
+        let _ = fs::create_dir_all(&dir);
+        let path = create_session_with_id("vanishing", "gpt-4").unwrap_or(dir.join("vanishing.jsonl"));
+        let _ = fs::write(&path, "");
+
+        fs::remove_file(&path).unwrap();
+        assert!(!path.exists());
+
+        append_message(&path, &Message::new("user", "depois do sumico")).unwrap();
+        append_generation_id(&path, "gen-after").unwrap();
+
+        let loaded = load_session(&path).unwrap();
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(loaded[0].content, "depois do sumico");
+        assert!(fs::read_to_string(&path).unwrap().contains("gen-after"));
+
+        let _ = fs::remove_file(&path);
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]
