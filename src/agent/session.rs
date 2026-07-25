@@ -106,19 +106,31 @@ fn capped_tool_result(result: &str) -> String {
     )
 }
 
+/// The date to put in the system prompt.
+///
+/// Deliberately day-granular. Providers cache on an exact token prefix, and
+/// this sits ~200 characters into the *first* message — so a clock that ticks
+/// makes every process a cache miss for the whole conversation, not just for
+/// this line. Two runs a second apart shared 226 characters before this.
+///
+/// The exact time is a `date` call away when a task actually needs it.
+fn current_date_for_prompt() -> String {
+    chrono::Local::now().format("%A, %B %d, %Y (%Z)").to_string()
+}
+
 /// Build the system prompt describing available tools, skills, context files, and memory.
 /// If `datetime` is provided, it is used as the current time (for KV cache stability).
 /// Otherwise, `chrono::Local::now()` is used (for one-shot prompts like goal verification).
 fn build_system_prompt(skills: &[Skill], context_files: &[ContextFile], memory_enabled: bool, datetime: Option<&str>) -> String {
     let time_str = match datetime {
         Some(d) => d.to_string(),
-        None => chrono::Local::now().format("%A, %B %d, %Y at %I:%M:%S %p %z (%Z)").to_string(),
+        None => current_date_for_prompt(),
     };
     let mut prompt = format!(
         "You are an expert coding agent operating inside rupi, a coding agent harness. \
         You help users by reading files, executing commands, editing code, and writing new files.
 
-Current date and time: {}
+Current date: {}\nThe exact time of day is not given here — run `date` if a task needs it.
 
 Available tools:
 - bash: Execute bash commands (ls, grep, find, curl, git, compilers, etc.). Returns stdout and stderr. Optionally provide a timeout in seconds.
@@ -286,7 +298,7 @@ impl AgentSession {
         let session_path = existing_path.or_else(|| sessions::create_session(&model).ok());
         // Freeze the timestamp at session creation so the system prompt stays
         // byte-identical across turns — critical for server-side KV prefix caching.
-        let frozen_time = chrono::Local::now().format("%A, %B %d, %Y at %I:%M:%S %p %z (%Z)").to_string();
+        let frozen_time = current_date_for_prompt();
         let system_prompt = build_system_prompt(&skills, &context_files, false, Some(&frozen_time));
         AgentSession {
             provider,
@@ -342,7 +354,7 @@ impl AgentSession {
         if memory_enabled {
             ensure_memory_file();
             // Rebuild system prompt with memory content included
-            let frozen_time = chrono::Local::now().format("%A, %B %d, %Y at %I:%M:%S %p %z (%Z)").to_string();
+            let frozen_time = current_date_for_prompt();
             let prompt = build_system_prompt(&session.skills, &session.context_files, memory_enabled, Some(&frozen_time));
             *session.system_prompt.get_mut() = prompt;
         }
@@ -369,7 +381,7 @@ impl AgentSession {
         session.memory_enabled = memory_enabled;
         if memory_enabled {
             ensure_memory_file();
-            let frozen_time = chrono::Local::now().format("%A, %B %d, %Y at %I:%M:%S %p %z (%Z)").to_string();
+            let frozen_time = current_date_for_prompt();
             let prompt = build_system_prompt(&session.skills, &session.context_files, memory_enabled, Some(&frozen_time));
             *session.system_prompt.get_mut() = prompt;
         }
@@ -485,7 +497,7 @@ impl AgentSession {
         *self.thinking_level.write().await = "off".to_string();
 
         // Rebuild system prompt with a fresh frozen timestamp for the new session
-        let frozen_time = chrono::Local::now().format("%A, %B %d, %Y at %I:%M:%S %p %z (%Z)").to_string();
+        let frozen_time = current_date_for_prompt();
         let prompt = build_system_prompt(&self.skills, &self.context_files, self.memory_enabled, Some(&frozen_time));
         *self.system_prompt.write().await = prompt;
 
@@ -1468,6 +1480,34 @@ Has the assistant's output satisfied this exact condition? Reply with only YES o
                 stop_reason: None,
             })
             .collect()
+    }
+}
+
+#[cfg(test)]
+mod prefix_cache_tests {
+    use super::*;
+
+    #[test]
+    fn the_system_prompt_is_identical_for_two_processes_started_moments_apart() {
+        // Providers cache on an exact prefix. This string sits in the first
+        // message, so anything that changes between runs — a clock, in
+        // particular — throws away the cache for the whole conversation.
+        let first = build_system_prompt(&[], &[], false, None);
+        std::thread::sleep(std::time::Duration::from_millis(1100));
+        let second = build_system_prompt(&[], &[], false, None);
+
+        assert_eq!(
+            first, second,
+            "system prompt changed between runs — every cold start is now a cache miss"
+        );
+    }
+
+    #[test]
+    fn the_date_is_still_available_to_the_model() {
+        let prompt = build_system_prompt(&[], &[], false, None);
+        let today = chrono::Local::now().format("%Y").to_string();
+        assert!(prompt.contains("Current date:"), "date line missing");
+        assert!(prompt.contains(&today), "current year missing from the prompt");
     }
 }
 
