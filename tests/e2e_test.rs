@@ -1119,7 +1119,7 @@ async fn e2e_test_code_search_via_tool() {
         }),
         raw_arguments: None,
     };
-    let result = rupi::tools::execute_tool(&tc);
+    let result = rupi::tools::execute_tool(&tc, &rupi::tools::ToolContext::new());
     assert!(!result.contains("Error:"), "Should not error: {}", result);
     assert!(result.contains("calc.rs") || result.contains("add"), "Should find add function");
     eprintln!("e2e: search_code tool result found calc.rs");

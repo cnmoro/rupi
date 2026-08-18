@@ -103,7 +103,7 @@ async fn handle_command(session: &Arc<AgentSession>, line: &str) -> CommandActio
         return CommandAction::Continue;
     }
     if line == "/goal" {
-        match session.get_goal().await {
+        match session.goal_status().await {
             Some(g) => { let _ = writeln!(stdout(), "Current goal: {}", g); }
             None => { let _ = writeln!(stdout(), "No goal set."); }
         }

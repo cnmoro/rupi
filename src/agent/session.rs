@@ -96,13 +96,25 @@ fn capped_tool_result(result: &str) -> String {
     }
     let keep_beginning = MAX_TOOL_RESULT_CHARS * 7 / 10;
     let keep_end = MAX_TOOL_RESULT_CHARS - keep_beginning;
-    let beginning = &result[..keep_beginning];
-    let end = &result[result.len() - keep_end..];
+    // Snap both cuts to character boundaries. Slicing raw byte offsets panics on
+    // any tool output that contains a multi-byte character, and tool output is
+    // arbitrary bytes from the user's machine.
+    let mut head = keep_beginning.min(result.len());
+    while head > 0 && !result.is_char_boundary(head) {
+        head -= 1;
+    }
+    let mut tail = result.len().saturating_sub(keep_end);
+    while tail < result.len() && !result.is_char_boundary(tail) {
+        tail += 1;
+    }
+    if tail <= head {
+        return result.to_string();
+    }
     format!(
         "{}... [truncated: {} chars]\n...{}",
-        beginning,
-        result.len() - keep_beginning - keep_end,
-        end
+        &result[..head],
+        tail - head,
+        &result[tail..]
     )
 }
 
@@ -141,13 +153,18 @@ Available tools:
 - find: Find files by glob pattern (uses fd, respects .gitignore, falls back to find).
 - ls: List directory contents.
 - search_code: Search code using natural language queries. Uses a local AI model (Model2Vec with potion-code-16M) to find relevant code by what it does, not just by keyword matching. Describe what you are looking for in plain English. Falls back to keyword search if the model is unavailable.
+- todo_write: Record and update the task list for multi-step work. Send the ENTIRE list every call — it replaces the previous one. Keep at most one task in_progress. Skip it for trivial single-step tasks.
+- goal: Read or decide the durable goal, when one is set. Call it with operation \"complete\" once evidence shows the whole objective is met, or \"block\" with a reason when you cannot proceed. Pass the round number from the current <goal_round> block.
 
 Guidelines:
 - Be concise in your responses
 - Show file paths clearly when working with files
 - Use bash to explore when you are unsure about the project structure or when you need to gather information
 - When a command fails, read the error output and try a different approach rather than giving up
-- If you don't have enough information to complete a task, use bash, read, grep, or find to get the necessary context",
+- If you don't have enough information to complete a task, use bash, read, grep, or find to get the necessary context
+- For work of more than a few steps, plan it with todo_write first and keep the list current as you go
+- A message inside <active-task> tags re-states the request that started this session. It is context, not a new instruction — do not restart finished work when you see it
+- A message inside <compacted-summary> tags is a checkpoint of earlier context. Treat it as established background and continue from the messages after it",
         time_str
     );
 
@@ -242,11 +259,35 @@ pub fn load_context_files(cwd: &str) -> Vec<ContextFile> {
     files
 }
 
+/// Recover the originating request from a transcript loaded off disk.
+///
+/// Resume rebuilds a session with no in-memory state, so the anchor has to be
+/// readable out of the history itself. A previously emitted anchor block is the
+/// best source because it is exact. Failing that, the first real user message is
+/// the request, skipping checkpoints and anchors, which are host-written.
+pub fn recover_anchor(messages: &[Message]) -> Option<String> {
+    for msg in messages.iter().rev() {
+        if crate::anchor::is_anchor(&msg.content) {
+            if let Some(request) = crate::anchor::extract_request(&msg.content) {
+                return Some(request);
+            }
+        }
+    }
+    messages
+        .iter()
+        .find(|m| {
+            m.role == "user"
+                && !crate::anchor::is_anchor(&m.content)
+                && !m.content.starts_with(sessions::COMPACTION_PREFIX)
+                && !m.content.trim().is_empty()
+        })
+        .map(|m| m.content.clone())
+}
+
 /// Agent session manages conversation state and model interaction.
 pub struct AgentSession {
     provider: Arc<dyn ChatProvider>,
     approval_fn: RwLock<Option<ApprovalFn>>,
-    goal: RwLock<Option<String>>,
     memory_enabled: bool,
     model: std::sync::RwLock<String>,
     pending_steer: RwLock<Vec<String>>,
@@ -270,6 +311,21 @@ pub struct AgentSession {
     loop_prompt: RwLock<Option<String>>,
     loop_cancelled: std::sync::atomic::AtomicBool,
     system_prompt: RwLock<String>,
+    /// The verbatim request that started the current task.
+    ///
+    /// Compaction deletes everything outside the recent tail, so the originating
+    /// user message does not survive a long run. Holding it here makes it a value
+    /// the session owns rather than history that a summarizer might restate.
+    task_anchor: RwLock<Option<String>>,
+    /// How many times the anchor has been re-emitted into the conversation.
+    anchor_emissions: RwLock<u32>,
+    /// Tool results stored since the last user-role message.
+    ///
+    /// Drives the tail re-emission: appending at the end costs nothing in cache
+    /// terms, while inserting in the middle would invalidate every token after it.
+    tool_results_since_user: RwLock<u32>,
+    /// Session-scoped state for the stateful tools (`todo_write` and `goal`).
+    tool_context: tools::ToolContext,
 }
 
 impl AgentSession {
@@ -303,7 +359,6 @@ impl AgentSession {
         AgentSession {
             provider,
             approval_fn: RwLock::new(None),
-            goal: RwLock::new(None),
             memory_enabled: false,
             model: std::sync::RwLock::new(model),
             pending_steer: RwLock::new(Vec::new()),
@@ -326,6 +381,10 @@ impl AgentSession {
             loop_prompt: RwLock::new(None),
             loop_cancelled: std::sync::atomic::AtomicBool::new(false),
             system_prompt: RwLock::new(system_prompt),
+            task_anchor: RwLock::new(None),
+            anchor_emissions: RwLock::new(0),
+            tool_results_since_user: RwLock::new(0),
+            tool_context: tools::ToolContext::new(),
         }
     }
 
@@ -389,6 +448,9 @@ impl AgentSession {
         for msg in &messages {
             session.messages.write().await.push(msg.clone());
         }
+        // Restore the anchor so a resumed session that compacts again still carries
+        // the request it started from.
+        *session.task_anchor.write().await = recover_anchor(&messages);
         *session.session_path.write().await = Some(session_path);
         Ok(session)
     }
@@ -396,6 +458,34 @@ impl AgentSession {
     /// Get the session file path, if any.
     pub async fn session_path(&self) -> Option<std::path::PathBuf> {
         self.session_path.read().await.clone()
+    }
+
+    /// The session identity used to scope spill artifacts.
+    async fn session_id(&self) -> String {
+        self.session_path
+            .read()
+            .await
+            .as_ref()
+            .and_then(|p| p.file_stem().map(|s| s.to_string_lossy().to_string()))
+            .unwrap_or_else(|| "unscoped".to_string())
+    }
+
+    /// Store one tool result in the conversation, spilling the full text first.
+    ///
+    /// Truncation used to destroy the discarded bytes outright. Writing them to a
+    /// session-scoped file first costs one write and keeps the whole result
+    /// reachable through the `read` tool the agent already has, so the context stays
+    /// small without losing data.
+    async fn store_tool_result(&self, tool_name: &str, result: &str) -> String {
+        if result.len() <= MAX_TOOL_RESULT_CHARS {
+            return result.to_string();
+        }
+        let mut stored = capped_tool_result(result);
+        let session_id = self.session_id().await;
+        if let Some(spill) = crate::spill::save_text(&session_id, tool_name, result) {
+            stored.push_str(&crate::spill::retrieval_hint(&spill));
+        }
+        stored
     }
 
     pub fn set_model(&self, new_model: String) {
@@ -493,6 +583,10 @@ impl AgentSession {
         self.pending_follow_up.write().await.clear();
         self.set_goal(None).await;
         self.set_loop(None).await;
+        *self.task_anchor.write().await = None;
+        *self.anchor_emissions.write().await = 0;
+        *self.tool_results_since_user.write().await = 0;
+        self.tool_context.todos.reset();
         *self.auto_compaction_enabled.write().await = true;
         *self.thinking_level.write().await = "off".to_string();
 
@@ -552,10 +646,20 @@ impl AgentSession {
             std::sync::atomic::Ordering::SeqCst,
             std::sync::atomic::Ordering::SeqCst,
         ).is_err() {
-            // Already streaming — queue as steer
+            // Already streaming — queue as steer. This is the user redirecting work
+            // that is already running, so it joins the anchor rather than starting a
+            // new task.
+            self.append_task_anchor(message).await;
             self.pending_steer.write().await.push(message.to_string());
             return Ok(());
         }
+
+        // Anchor this request before anything can compact it away. A steer or a
+        // follow-up replaces the anchor because it redirects the task; a host-written
+        // block (a checkpoint, an anchor re-emission, a goal round) never does,
+        // because it is not the user speaking.
+        self.set_task_anchor(message).await;
+        *self.tool_results_since_user.write().await = 0;
 
         // Add user message to history
         let user_msg = Message::new("user", message);
@@ -575,8 +679,10 @@ impl AgentSession {
             stop_reason: None,
         }));
 
-        // Goal-aware execution loop
-        let goal_text = self.goal.read().await.clone();
+        // Goal-aware execution loop. The objective comes from the goal registry, not
+        // from the local field, so a goal the model already marked complete or
+        // blocked does not drive another round on the next prompt.
+        let goal_text = self.tool_context.goal.active_objective();
 
         if let Some(g) = goal_text {
             // Goal mode: suppress agent_end events during the loop.
@@ -595,36 +701,59 @@ impl AgentSession {
                 }
             });
 
-            let max_goal_iterations: u32 = 5;
-            for goal_iter in 0..max_goal_iterations {
+            let max_rounds = self.tool_context.goal.current()
+                .map(|state| state.max_rounds)
+                .unwrap_or(crate::goal::DEFAULT_MAX_ROUNDS);
+
+            for round in 1..=max_rounds {
+                // Open the round before the model runs. The goal tool accepts a
+                // decision only from inside the open round, so a model that calls
+                // `goal complete` from anywhere else is rejected rather than allowed
+                // to declare victory on its own.
+                self.tool_context.goal.admit_round(round);
+
+                // Every round gets the block, including the first. The round number
+                // is what the model has to echo back, so it must be visible from the
+                // start, and the "inspect, do not assume" framing matters most right
+                // after a compaction has degraded the narration.
+                let round_text = crate::goal::render_round_prompt(&g, round, max_rounds);
+                let round_msg = Message::new("user", &round_text);
+                self.persist_message(&round_msg).await;
+                self.messages.write().await.push(round_msg);
+                if round > 1 {
+                    // Round 1 rides the turn that prompt_inner already opened.
+                    let _ = event_tx.send(AgentEvent::turn_start());
+                    let _ = event_tx.send(AgentEvent::message_start(AgentMessage {
+                        role: "user".to_string(),
+                        content: vec![MessageContent {
+                            content_type: "text".to_string(),
+                            text: Some(round_text),
+                        }],
+                        model: None,
+                        usage: None,
+                        stop_reason: None,
+                    }));
+                }
+
                 if let Err(e) = self.run_tool_loop(wrapped_tx.clone()).await {
-                    eprintln!("rupi: tool loop error in goal iteration {}: {}", goal_iter, e);
+                    eprintln!("rupi: tool loop error in goal round {}: {}", round, e);
                     break;
                 }
 
+                // The working model decided inside its own round. No extra call.
+                if self.tool_context.goal.is_decided() {
+                    let status = self.tool_context.goal.current().map(|state| state.status);
+                    eprintln!("rupi: goal decided in round {} ({:?})", round, status);
+                    break;
+                }
+
+                // The model ignored the goal tool. Fall back to the out-of-band
+                // check so an older model still terminates instead of burning
+                // every round.
                 if self.verify_goal(&g).await {
+                    eprintln!("rupi: goal verified out of band in round {}", round);
                     break;
                 }
-
-                if goal_iter == max_goal_iterations - 1 {
-                    break;
-                }
-
-                let nudge_text = format!("Continue working toward the goal. The goal is: {}. Do not stop until this goal is fully achieved. What is your next step?", g);
-                let nudge_msg = Message::new("user", &nudge_text);
-                self.persist_message(&nudge_msg).await;
-                self.messages.write().await.push(nudge_msg);
-                let _ = event_tx.send(AgentEvent::turn_start());
-                let _ = event_tx.send(AgentEvent::message_start(AgentMessage {
-                    role: "user".to_string(),
-                    content: vec![MessageContent {
-                        content_type: "text".to_string(),
-                        text: Some(nudge_text),
-                    }],
-                    model: None,
-                    usage: None,
-                    stop_reason: None,
-                }));
             }
 
             drop(wrapped_tx);
@@ -985,11 +1114,18 @@ impl AgentSession {
                     let issue = verdict.reason.as_ref().unwrap();
                     let mut cc = self.consecutive_quality_issues.write().await;
                     let max_corrections: u32 = 2;
-                    if *cc < max_corrections {
+                    // The cap exists to stop a correction loop. The repeat ladder
+                    // cannot loop — it fires once per threshold for one run of
+                    // identical calls — so capping it would only silence the
+                    // escalation that was doing the work.
+                    let exempt = quality::is_self_limiting(issue);
+                    if exempt || *cc < max_corrections {
                         let correction = quality::build_correction_message(issue);
                         eprintln!("rupi: quality issue detected: {:?} — queuing correction", issue);
                         self.pending_follow_up.write().await.push(correction);
-                        *cc += 1;
+                        if !exempt {
+                            *cc += 1;
+                        }
                     } else {
                         eprintln!("rupi: quality issue suppressed after {} corrections", *cc);
                     }
@@ -1070,7 +1206,7 @@ impl AgentSession {
                     };
 
                     let result = if allowed {
-                        tools::execute_tool(tc)
+                        tools::execute_tool(tc, &self.tool_context)
                     } else {
                         format!("[User denied execution of tool '{}']", tc.name)
                     };
@@ -1080,12 +1216,31 @@ impl AgentSession {
                         result.clone(),
                     ));
                     // Cap the stored tool result to keep KV cache prefill bounded.
-                    // The full result is still sent to the event stream above;
-                    // only the conversation-history copy is truncated.
-                    let stored_result = capped_tool_result(&result);
+                    // The full result is still sent to the event stream above, and
+                    // spilled to disk; only the conversation-history copy is cut.
+                    let stored_result = self.store_tool_result(&tc.name, &result).await;
                     let result_msg = Message::tool_result(&tc.id, &stored_result);
                     self.persist_message(&result_msg).await;
                     self.messages.write().await.push(result_msg);
+                    *self.tool_results_since_user.write().await += 1;
+                }
+
+                // Re-state the request when it has drifted far back. Appending at
+                // the tail keeps the cached prefix intact, so this is free.
+                if let Some(reminder) = self.maybe_reemit_anchor().await {
+                    eprintln!("rupi: re-stated the task anchor after a long tool run");
+                    let _ = event_tx.send(AgentEvent::turn_start());
+                    let _ = event_tx.send(AgentEvent::message_start(AgentMessage {
+                        role: "user".to_string(),
+                        content: vec![MessageContent {
+                            content_type: "text".to_string(),
+                            text: Some(reminder.content.clone()),
+                        }],
+                        model: None,
+                        usage: None,
+                        stop_reason: None,
+                    }));
+                    continue;
                 }
 
                 // Start a new turn for the next LLM call (matching Pi's flow)
@@ -1191,17 +1346,18 @@ impl AgentSession {
             *compacting = true;
         }
 
-        // Step 1: Snip old tool results on the actual stored messages (rule-based, no API cost)
-        {
-            let mut stored = self.messages.write().await;
-            let snipped = compaction::snip_old_tool_results(&mut stored, 6);
-            if snipped > 0 {
-                eprintln!("rupi: snipped {} chars from old tool results", snipped);
-            }
-        }
-
-        let messages = self.messages.read().await.clone();
-        let total_tokens = compaction::estimate_total_tokens(&messages);
+        // Work on a copy. Nothing below this line touches the live history until the
+        // compaction is certain to commit.
+        //
+        // Snipping used to run here, in place, BEFORE the two guards that can return
+        // early. Both guards leave the conversation alive, so a run that snipped and
+        // then declined rewrote message bodies the provider had already cached and
+        // bought nothing for it: the next turn re-prefilled the whole conversation at
+        // full price. Even when it did avoid an LLM call, that was a bad trade —
+        // cached input is roughly a tenth the price of fresh input, so saving ~13k
+        // tokens by invalidating ~112k cached ones loses badly.
+        let pristine = self.messages.read().await.clone();
+        let total_tokens = compaction::estimate_total_tokens(&pristine);
 
         if !compaction::should_compact(total_tokens, self.context_window) {
             {
@@ -1211,8 +1367,17 @@ impl AgentSession {
             return Err(AgentError::Config("Context not full enough to compact".into()));
         }
 
+        // Snip a copy. It sizes the kept tail — more messages survive the same token
+        // budget once the old tool results are trimmed — and it becomes the tail that
+        // is actually stored, but only if this compaction commits. Snipping never
+        // adds, removes, or reorders messages, so one index addresses the same
+        // message in both copies.
+        let mut snipped = pristine.clone();
+        let removed = compaction::snip_old_tool_results(&mut snipped, 6);
+        let snipped_len = snipped.len();
+
         let keep_recent = self.context_window.saturating_div(10).max(1).min(20000);
-        let cut_index = match compaction::find_cut_point(&messages, keep_recent) {
+        let cut_index = match compaction::find_cut_point(&snipped, keep_recent) {
             Some(i) => i,
             None => {
                 {
@@ -1223,13 +1388,25 @@ impl AgentSession {
             }
         };
 
-        let messages_to_summarize = &messages[..cut_index];
+        // The summarizer replays the PRISTINE head. It is byte-identical to the
+        // prefix of the last routed request, so the provider serves it from cache
+        // instead of re-prefilling it, and the summarizer sees full-fidelity input.
+        let region = &pristine[..cut_index.min(pristine.len())];
         let compact_model = self.model();
+        // Replay the conversation's own system prompt so the summarization call is a
+        // genuine prefix of the last routed request. The provider then serves the
+        // whole replayed span from its KV cache instead of re-prefilling it. The old
+        // shape sent a different system prompt and a serialized text blob, which was
+        // a guaranteed cache miss that re-billed the entire history every time.
+        let system_prompt = self.system_prompt.read().await.clone();
+        if compaction::region_contains_checkpoint(region) {
+            eprintln!("rupi: compacting over a prior checkpoint — merging it into one summary");
+        }
         let summary = match compaction::generate_summary(
             &self.provider,
             &compact_model,
-            messages_to_summarize,
-            None,
+            Some(&system_prompt),
+            region,
         )
         .await
         {
@@ -1240,19 +1417,44 @@ impl AgentSession {
             }
         };
 
-        // Replace summarized messages with a compaction summary message.
+        // Replace summarized messages with a compaction checkpoint message.
         // Use role "user" (not "system") because OpenAI-compatible endpoints
         // expect at most one system message — the one built fresh each turn.
-        // Relies on the summary's ## Goal section to retain the task objective.
-        let summary_msg = Message::new(
-            "user",
-            &format!("{}\n{}", crate::sessions::COMPACTION_PREFIX, summary),
-        );
+        let summary_msg = Message::new("user", &compaction::build_checkpoint_body(&summary));
         self.persist_message(&summary_msg).await;
-        let mut all_messages = self.messages.write().await;
-        let keep: Vec<Message> = all_messages[cut_index..].to_vec();
-        *all_messages = keep;
-        all_messages.insert(0, summary_msg);
+
+        // Re-emit the anchor directly below the checkpoint. This is the position that
+        // makes the fix structural: the exact request the user typed is present in
+        // every request after every compaction, whatever the summarizer chose to
+        // write. The prefix is already invalid here, so the anchor costs nothing.
+        let anchor_msg = self
+            .next_anchor_block()
+            .await
+            .map(|block| Message::new("user", &block));
+
+        {
+            let mut all_messages = self.messages.write().await;
+            let cut = cut_index.min(all_messages.len());
+            // Take the tail from the snipped copy. The checkpoint sits at position
+            // zero, so every message after it is at a new offset and the whole
+            // request is a fresh prefix regardless — the snip is free here.
+            // Anything appended while the summary was in flight is taken from the
+            // live list, because the copy predates it.
+            let mut rebuilt = Vec::with_capacity(all_messages.len() - cut + 2);
+            rebuilt.push(summary_msg);
+            if let Some(ref anchor) = anchor_msg {
+                rebuilt.push(anchor.clone());
+            }
+            rebuilt.extend(snipped.drain(cut.min(snipped.len())..));
+            if all_messages.len() > snipped_len {
+                rebuilt.extend(all_messages[snipped_len..].to_vec());
+            }
+            *all_messages = rebuilt;
+        }
+        if removed > 0 {
+            eprintln!("rupi: snipped {} chars from old tool results", removed);
+        }
+        *self.tool_results_since_user.write().await = 0;
 
         {
             let mut compacting = self.is_compacting.lock().await;
@@ -1260,6 +1462,12 @@ impl AgentSession {
         }
 
         self.persist_compaction(&summary, total_tokens).await;
+        // Persist the anchor AFTER the compaction record. Replay clears everything
+        // above that record, so an anchor written before it would be dropped on
+        // resume and the fix would hold only until the process restarted.
+        if let Some(ref anchor) = anchor_msg {
+            self.persist_message(anchor).await;
+        }
 
         Ok(CompactionResult {
             summary,
@@ -1270,13 +1478,19 @@ impl AgentSession {
     /// Check if auto-compaction is needed and run it.
     /// Called after each prompt completes.
     /// Queue a steer message (interrupts current generation).
+    ///
+    /// The anchor grows here rather than in the drain, because by drain time a user
+    /// steer and a host-written quality correction share one queue and cannot be
+    /// told apart. Corrections push to the queue directly and never reach this path.
     pub async fn steer(&self, message: &str) {
+        self.append_task_anchor(message).await;
         self.pending_steer.write().await.push(message.to_string());
         self.abort().await;
     }
 
     /// Queue a follow-up message (processed after current generation finishes).
     pub async fn follow_up(&self, message: &str) {
+        self.append_task_anchor(message).await;
         self.pending_follow_up.write().await.push(message.to_string());
     }
 
@@ -1350,14 +1564,134 @@ impl AgentSession {
         }
     }
 
+    // ---- task anchor ----
+
+    /// Record the request that the current task is anchored to.
+    ///
+    /// Host-written blocks are rejected on purpose. A checkpoint, an anchor
+    /// re-emission, and a goal round all arrive on the `user` role because the
+    /// providers accept at most one system message, and letting any of them become
+    /// the anchor would overwrite the real request with rupi's own prose.
+    pub async fn set_task_anchor(&self, request: &str) {
+        let trimmed = request.trim();
+        if trimmed.is_empty()
+            || crate::anchor::is_anchor(trimmed)
+            || trimmed.starts_with(sessions::COMPACTION_PREFIX)
+            || trimmed.starts_with("<goal_round>")
+        {
+            return;
+        }
+        *self.task_anchor.write().await = Some(trimmed.to_string());
+        *self.anchor_emissions.write().await = 0;
+    }
+
+    /// Add a later user instruction to the anchor.
+    ///
+    /// A steer or a follow-up refines the task in flight rather than starting a new
+    /// one, so it joins the anchor instead of replacing it. Replacing would drop the
+    /// request the work is actually for; ignoring it would leave the anchor stating
+    /// a task the user has already redirected. The stored value is clamped, so a
+    /// session with many follow-ups keeps the original request and the most recent
+    /// instruction without growing without bound.
+    pub async fn append_task_anchor(&self, addition: &str) {
+        let trimmed = addition.trim();
+        if trimmed.is_empty()
+            || crate::anchor::is_anchor(trimmed)
+            || trimmed.starts_with(sessions::COMPACTION_PREFIX)
+            || trimmed.starts_with("<goal_round>")
+        {
+            return;
+        }
+        {
+            let mut guard = self.task_anchor.write().await;
+            match guard.as_mut() {
+                Some(existing) => {
+                    existing.push_str(crate::anchor::LATER_INSTRUCTION_SEPARATOR);
+                    existing.push_str(trimmed);
+                    *existing = crate::anchor::clamp(existing);
+                }
+                None => *guard = Some(trimmed.to_string()),
+            }
+        }
+        *self.anchor_emissions.write().await = 0;
+    }
+
+    /// The request the current task is anchored to.
+    pub async fn task_anchor(&self) -> Option<String> {
+        self.task_anchor.read().await.clone()
+    }
+
+    /// Render the next anchor emission and count it.
+    async fn next_anchor_block(&self) -> Option<String> {
+        let request = self.task_anchor.read().await.clone()?;
+        let mut emissions = self.anchor_emissions.write().await;
+        *emissions += 1;
+        let mut block = crate::anchor::render(&request, *emissions);
+        // The anchor states the goal. The todo list states where the work stands.
+        // They answer different questions, so a reminder carries both.
+        if let Some(todos) = self.tool_context.todos.render_current() {
+            block.push_str("\n\n<todo-list>\n");
+            block.push_str(&todos);
+            block.push_str("\n</todo-list>");
+        }
+        Some(block)
+    }
+
+    /// Tool results allowed between anchor re-emissions.
+    ///
+    /// The anchor is free at the tail and free right after a compaction, because
+    /// neither position invalidates a cached prefix. It is expensive anywhere else,
+    /// so it goes at the end and only after the request has drifted genuinely far
+    /// out of the model's attention.
+    const ANCHOR_REEMIT_AFTER_TOOL_RESULTS: u32 = 40;
+
+    /// Append an anchor reminder when the request has drifted far enough back.
+    ///
+    /// Returns the message that was appended, for the caller to announce.
+    async fn maybe_reemit_anchor(&self) -> Option<Message> {
+        {
+            let count = self.tool_results_since_user.read().await;
+            if *count < Self::ANCHOR_REEMIT_AFTER_TOOL_RESULTS {
+                return None;
+            }
+        }
+        let block = self.next_anchor_block().await?;
+        *self.tool_results_since_user.write().await = 0;
+        let msg = Message::new("user", &block);
+        self.persist_message(&msg).await;
+        self.messages.write().await.push(msg.clone());
+        Some(msg)
+    }
+
     /// Set a goal for durable execution. When set, the agent will loop until
     /// an internal verification prompt confirms the goal is met.
     pub async fn set_goal(&self, goal: Option<String>) {
-        *self.goal.write().await = goal;
+        self.tool_context.goal.set(goal, crate::goal::DEFAULT_MAX_ROUNDS);
     }
 
+    /// The objective still driving the session, or `None` once it is decided.
+    ///
+    /// Reads the registry rather than a second copy. A goal the model completed or
+    /// blocked is no longer current, and reporting it as current made `/goal` lie
+    /// about what the agent was doing.
     pub async fn get_goal(&self) -> Option<String> {
-        self.goal.read().await.clone()
+        self.tool_context.goal.active_objective()
+    }
+
+    /// A one-line description of the goal for display, including its status.
+    pub async fn goal_status(&self) -> Option<String> {
+        let state = self.tool_context.goal.current()?;
+        Some(format!(
+            "{} [round {}/{}, {}]",
+            state.objective,
+            state.admitted_round,
+            state.max_rounds,
+            match state.status {
+                crate::goal::GoalStatus::Active => "active",
+                crate::goal::GoalStatus::Complete => "complete",
+                crate::goal::GoalStatus::Blocked => "blocked",
+            }
+        ))
     }
 
     /// Set a loop prompt. When set, the agent will re-send the prompt
@@ -1380,6 +1714,12 @@ impl AgentSession {
     }
 
     /// Verify whether the current goal has been achieved by asking the model.
+    ///
+    /// This is now the FALLBACK path. The primary route is the `goal` tool, which
+    /// the working model calls from inside its own round with full context and no
+    /// extra request. This judge sees six truncated messages and no tools, so it
+    /// runs only when the model never used the tool.
+    ///
     /// Returns true if the model confirms the goal is met.
     async fn verify_goal(&self, goal: &str) -> bool {
         // Include recent conversation so the model can actually check the assistant's output.
@@ -1418,8 +1758,6 @@ Has the assistant's output satisfied this exact condition? Reply with only YES o
             "You are a verification assistant. Current date: {}",
             chrono::Local::now().format("%A, %B %d, %Y")
         );
-        let system_msg = Message::new("system", &simple_system);
-        let verify_msg = Message::new("user", &verify_prompt);
         let model_name = self.model();
         for attempt in 0..3 {
             let sys = Message::new("system", &simple_system);

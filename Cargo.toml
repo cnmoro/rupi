@@ -1,6 +1,6 @@
 [package]
 name = "rupi"
-version = "0.7.24"
+version = "0.8.0"
 edition = "2021"
 description = "Minimalistic RPC coding agent with OpenAI-compatible API support"
 

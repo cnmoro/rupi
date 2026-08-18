@@ -62,6 +62,25 @@ pub struct ToolCall {
     pub raw_arguments: Option<String>,
 }
 
+/// Session-scoped state that the stateful tools read and write.
+///
+/// Most tools are pure functions of their arguments and the filesystem. `todo_write`
+/// and `goal` are not: they own conversation state. Passing that state in keeps it
+/// owned by the session instead of by the process, so two sessions in one process
+/// cannot overwrite each other's plan or objective.
+#[derive(Debug, Default, Clone)]
+pub struct ToolContext {
+    pub todos: std::sync::Arc<crate::todo::TodoStore>,
+    pub goal: std::sync::Arc<crate::goal::GoalRegistry>,
+}
+
+impl ToolContext {
+    /// A context with an empty plan and no goal.
+    pub fn new() -> Self {
+        ToolContext::default()
+    }
+}
+
 /// Get all available tool definitions.
 pub fn all_tools() -> Vec<ToolDef> {
     vec![
@@ -73,6 +92,8 @@ pub fn all_tools() -> Vec<ToolDef> {
         find_tool(),
         ls_tool(),
         search_code_tool(),
+        todo_write_tool(),
+        goal_tool(),
     ]
 }
 
@@ -234,7 +255,7 @@ pub fn serialize_tools(tools: &[ToolDef]) -> Vec<Value> {
 }
 
 /// Execute a tool call and return the result.
-pub fn execute_tool(tool_call: &ToolCall) -> String {
+pub fn execute_tool(tool_call: &ToolCall, ctx: &ToolContext) -> String {
     match tool_call.name.as_str() {
         "bash" => execute_bash(&tool_call.arguments),
         "read" => execute_read(&tool_call.arguments),
@@ -244,6 +265,8 @@ pub fn execute_tool(tool_call: &ToolCall) -> String {
         "find" => execute_find(&tool_call.arguments),
         "ls" => execute_ls(&tool_call.arguments),
         "search_code" => execute_search_code(&tool_call.arguments),
+        "todo_write" => execute_todo_write(&tool_call.arguments, ctx),
+        "goal" => execute_goal(&tool_call.arguments, ctx),
         _ => format!("Unknown tool: {}", tool_call.name),
     }
 }
@@ -253,7 +276,13 @@ fn get_arg<'a>(args: &'a Value, name: &str) -> Option<&'a str> {
 }
 
 fn get_arg_i64(args: &Value, name: &str) -> Option<i64> {
-    args.get(name).and_then(|v| v.as_i64())
+    args.get(name).and_then(|v| {
+        // Models emit `1` and `1.0` interchangeably, and some emit `"1"`. All three
+        // mean the same number, so accept all three rather than rejecting the call.
+        v.as_i64()
+            .or_else(|| v.as_f64().map(|f| f as i64))
+            .or_else(|| v.as_str().and_then(|s| s.trim().parse::<i64>().ok()))
+    })
 }
 
 fn get_arg_bool(args: &Value, name: &str, default: bool) -> bool {
@@ -919,6 +948,189 @@ mod timeout_tests {
     }
 }
 
+// ---- todo_write ----
+
+fn todo_write_tool() -> ToolDef {
+    ToolDef {
+        name: "todo_write",
+        description: "Record and update a structured task list for the current work. Send the ENTIRE list on every call — it REPLACES the previous list. There are no partial updates and no per-item edits. Use it to plan multi-step work and to show progress: add one todo per concrete step before you start. Keep AT MOST ONE todo in_progress at a time, and while work remains, exactly one task should be in_progress. Mark a todo completed the moment it is done — do not batch completions. Skip the list for trivial single-step tasks. Statuses: pending (not started), in_progress (being worked on now), completed (finished).",
+        parameters: serde_json::json!({
+            "type": "object",
+            "properties": {
+                "todos": {
+                    "type": "array",
+                    "description": "The complete task list, in order. Replaces the previous list.",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "content": { "type": "string", "description": "What the step does, in the imperative" },
+                            "status": {
+                                "type": "string",
+                                "enum": ["pending", "in_progress", "completed"],
+                                "description": "Current state of this step"
+                            }
+                        },
+                        "required": ["content", "status"]
+                    }
+                }
+            },
+            "required": ["todos"]
+        }),
+    }
+}
+
+fn execute_todo_write(args: &Value, ctx: &ToolContext) -> String {
+    let raw = match args.get("todos") {
+        Some(value) => value,
+        None => return "Error: `todos` is required. Send the entire list.".to_string(),
+    };
+    match crate::todo::parse_items(raw).and_then(|items| ctx.todos.replace(items)) {
+        Ok(rendered) => rendered,
+        Err(message) => message,
+    }
+}
+
+// ---- goal ----
+
+fn goal_tool() -> ToolDef {
+    ToolDef {
+        name: "goal",
+        description: "Read or decide the durable goal that drives this session. Use operation \"read\" to see the objective, the open round, and the status. Use operation \"complete\" once you have gathered evidence that the WHOLE objective is achieved. Use operation \"block\" when you cannot proceed, and give the reason. A decision is accepted only from inside the round shown in the current <goal_round> block, so pass that exact round number.",
+        parameters: serde_json::json!({
+            "type": "object",
+            "properties": {
+                "operation": {
+                    "type": "string",
+                    "enum": ["read", "complete", "block"],
+                    "description": "What to do with the goal"
+                },
+                "round": {
+                    "type": "number",
+                    "description": "The round number from the current <goal_round> block. Required for complete and block."
+                },
+                "reason": {
+                    "type": "string",
+                    "description": "Why the goal is blocked. Required for block."
+                }
+            },
+            "required": ["operation"]
+        }),
+    }
+}
+
+fn execute_goal(args: &Value, ctx: &ToolContext) -> String {
+    let operation = get_arg(args, "operation").unwrap_or("read");
+    let result = match operation {
+        "read" => ctx.goal.read_goal(),
+        "complete" | "block" => {
+            let round = match get_arg_i64(args, "round") {
+                Some(r) if r > 0 => r as u32,
+                _ => {
+                    return "Rejected: `round` is required and must be the round number shown in \
+the current <goal_round> block."
+                        .to_string()
+                }
+            };
+            if operation == "complete" {
+                ctx.goal.complete(round)
+            } else {
+                ctx.goal.block(round, get_arg(args, "reason").unwrap_or(""))
+            }
+        }
+        other => Err(format!(
+            "Rejected: unknown operation {:?}. Use read, complete, or block.",
+            other
+        )),
+    };
+    match result {
+        Ok(message) => message,
+        Err(message) => message,
+    }
+}
+
+#[cfg(test)]
+mod stateful_tool_tests {
+    use super::*;
+
+    fn call(name: &str, args: Value) -> ToolCall {
+        ToolCall { id: "t1".into(), name: name.into(), arguments: args, raw_arguments: None }
+    }
+
+    fn context_with_open_round(round: u32) -> ToolContext {
+        let ctx = ToolContext::new();
+        ctx.goal.set(Some("ship the fix".into()), 5);
+        ctx.goal.admit_round(round);
+        ctx
+    }
+
+    #[test]
+    fn goal_round_accepts_every_spelling_of_the_number() {
+        // Models emit 1, 1.0, and "1" interchangeably. All three name round 1.
+        for round in [serde_json::json!(1), serde_json::json!(1.0), serde_json::json!("1")] {
+            let ctx = context_with_open_round(1);
+            let result = execute_tool(
+                &call("goal", serde_json::json!({"operation": "complete", "round": round})),
+                &ctx,
+            );
+            assert!(
+                result.contains("Goal marked complete in round 1"),
+                "round {:?} was not accepted: {}",
+                round,
+                result
+            );
+        }
+    }
+
+    #[test]
+    fn goal_requires_a_round_for_a_decision() {
+        let ctx = context_with_open_round(1);
+        let result = execute_tool(&call("goal", serde_json::json!({"operation": "complete"})), &ctx);
+        assert!(result.contains("`round` is required"), "{}", result);
+        assert!(!ctx.goal.is_decided());
+    }
+
+    #[test]
+    fn goal_rejects_an_unknown_operation() {
+        let ctx = context_with_open_round(1);
+        let result = execute_tool(
+            &call("goal", serde_json::json!({"operation": "finish", "round": 1})),
+            &ctx,
+        );
+        assert!(result.contains("unknown operation"), "{}", result);
+    }
+
+    #[test]
+    fn goal_read_needs_no_round() {
+        let ctx = context_with_open_round(2);
+        let result = execute_tool(&call("goal", serde_json::json!({"operation": "read"})), &ctx);
+        assert!(result.contains("Objective: ship the fix"));
+        assert!(result.contains("Round: 2/5"));
+    }
+
+    #[test]
+    fn todo_write_requires_the_list() {
+        let ctx = ToolContext::new();
+        let result = execute_tool(&call("todo_write", serde_json::json!({})), &ctx);
+        assert!(result.contains("`todos` is required"), "{}", result);
+    }
+
+    #[test]
+    fn todo_write_updates_the_context_it_was_given() {
+        let ctx = ToolContext::new();
+        let other = ToolContext::new();
+        let result = execute_tool(
+            &call(
+                "todo_write",
+                serde_json::json!({"todos": [{"content": "do the thing", "status": "in_progress"}]}),
+            ),
+            &ctx,
+        );
+        assert!(result.contains("[~] do the thing"), "{}", result);
+        assert_eq!(ctx.todos.snapshot().len(), 1);
+        assert!(other.todos.snapshot().is_empty(), "contexts must stay independent");
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1154,7 +1366,7 @@ mod tests {
     fn test_serialize_tools() {
         let tools = all_tools();
         let serialized = serialize_tools(&tools);
-        assert_eq!(serialized.len(), 8);
+        assert_eq!(serialized.len(), all_tools().len());
         assert_eq!(serialized[0]["function"]["name"], "bash");
         assert_eq!(serialized[1]["function"]["name"], "read");
         assert_eq!(serialized[2]["function"]["name"], "write");
@@ -1172,7 +1384,7 @@ mod tests {
             arguments: serde_json::json!({}),
             raw_arguments: None,
         };
-        let result = execute_tool(&tc);
+        let result = execute_tool(&tc, &ToolContext::new());
         assert!(result.contains("Unknown tool"));
     }
 
@@ -1379,7 +1591,7 @@ mod tests {
             arguments: serde_json::json!({"path": "."}),
             raw_arguments: None,
         };
-        let result = execute_tool(&tc);
+        let result = execute_tool(&tc, &ToolContext::new());
         assert!(result.contains("missing"));
     }
 }

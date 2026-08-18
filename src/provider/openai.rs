@@ -174,10 +174,76 @@ impl OpenAIProvider {
         }
     }
 
+    /// One non-streaming completion.
+    ///
+    /// `with_tools` decides whether the serialized tool schemas ride along. They
+    /// change nothing about the answer — `tool_choice` is `"none"` — but they keep
+    /// the request prefix byte-identical to the streaming calls, which is what lets
+    /// the provider serve the whole conversation from its KV cache.
+    async fn complete_inner(
+        &self,
+        model: &str,
+        messages: &[Message],
+        with_tools: bool,
+    ) -> Result<String, AgentError> {
+        let url = format!("{}/chat/completions", self.config.base_url.trim_end_matches('/'));
+        let api_key = self.config.api_key.clone();
+        let client = self.client.clone();
+        let model = model.to_string();
+        let api_messages = OpenAIProvider::build_messages(messages);
+
+        let mut body = serde_json::json!({
+            "model": model,
+            "messages": api_messages,
+            "stream": false,
+            "max_tokens": 4096,
+        });
+        if with_tools && !self.cached_tools.is_empty() {
+            body["tools"] = serde_json::Value::Array(self.cached_tools.clone());
+            body["tool_choice"] = serde_json::json!("none");
+        }
+
+        let response = client
+            .post(&url)
+            .header("Authorization", format!("Bearer {}", api_key))
+            .header("Content-Type", "application/json")
+            .json(&body)
+            .send()
+            .await
+            .map_err(AgentError::Http)?;
+
+        if !response.status().is_success() {
+            let status = response.status().as_u16();
+            let body_text = response.text().await.unwrap_or_default();
+            return Err(AgentError::Api {
+                message: body_text,
+                status_code: status,
+            });
+        }
+
+        let data: serde_json::Value = response.json().await.map_err(AgentError::Http)?;
+        let msg = &data["choices"][0]["message"];
+        if let Some(content) = msg["content"].as_str().filter(|s| !s.is_empty()) {
+            Ok(content.to_string())
+        } else {
+            Err(AgentError::Api {
+                message: "model returned tool call instead of text".to_string(),
+                status_code: 0,
+            })
+        }
+    }
+
+    /// Marker that asks a server to cache the KV state up to and including a message.
+    fn cache_breakpoint() -> serde_json::Value {
+        serde_json::json!({"type": "ephemeral"})
+    }
+
     fn build_messages(messages: &[Message]) -> Vec<ChatMessage> {
+        let last_index = messages.len().saturating_sub(1);
         messages
             .iter()
-            .map(|m| {
+            .enumerate()
+            .map(|(index, m)| {
                 // OpenAI expects content: null for assistant messages with only tool calls
                 let has_tool_calls = m.tool_calls.as_ref().map_or(false, |c| !c.is_empty());
                 let content = if has_tool_calls && m.content.is_empty() {
@@ -195,13 +261,24 @@ impl OpenAIProvider {
                     cache_control: None,
                 };
 
-                // Annotate the system message for explicit KV prefix caching.
-                // Compatible servers (vLLM, llama.cpp with cache_control, etc.)
-                // will cache this message and all preceding messages, then reuse
-                // the cached KV state on subsequent requests that share the prefix.
-                // Servers that don't support it will ignore the unknown field.
-                if m.role == "system" {
-                    chat_msg.cache_control = Some(serde_json::json!({"type": "ephemeral"}));
+                // Two explicit KV cache breakpoints.
+                //
+                // The system message is the static one: the prompt is frozen at
+                // session creation and the tool schemas are serialized once, so this
+                // prefix never changes for the life of the session.
+                //
+                // The last message is the moving one, and it is the one that matters.
+                // A server that needs explicit breakpoints caches only up to the
+                // furthest one it is given, so marking the system message alone left
+                // the entire conversation — which is nearly all of the tokens —
+                // re-prefilled on every single turn. Marking the tail extends the
+                // cached span to the whole request. Because the history is append
+                // only, this turn's breakpoint is next turn's cache hit.
+                //
+                // Servers with automatic prefix caching (vLLM, SGLang, OpenAI,
+                // DeepSeek) ignore the field and lose nothing by it.
+                if m.role == "system" || index == last_index {
+                    chat_msg.cache_control = Some(OpenAIProvider::cache_breakpoint());
                 }
 
                 // Include reasoning_content for assistant messages (required by reasoning models like DeepSeek)
@@ -483,46 +560,27 @@ impl ChatProvider for OpenAIProvider {
         model: &str,
         messages: &[Message],
     ) -> Result<String, AgentError> {
-        let url = format!("{}/chat/completions", self.config.base_url.trim_end_matches('/'));
-        let api_key = self.config.api_key.clone();
-        let client = self.client.clone();
-        let model = model.to_string();
-        let api_messages = OpenAIProvider::build_messages(messages);
+        self.complete_inner(model, messages, false).await
+    }
 
-        let body = serde_json::json!({
-            "model": model,
-            "messages": api_messages,
-            "stream": false,
-            "max_tokens": 4096,
-        });
-
-        let response = client
-            .post(&url)
-            .header("Authorization", format!("Bearer {}", api_key))
-            .header("Content-Type", "application/json")
-            .json(&body)
-            .send()
-            .await
-            .map_err(AgentError::Http)?;
-
-        if !response.status().is_success() {
-            let status = response.status().as_u16();
-            let body_text = response.text().await.unwrap_or_default();
-            return Err(AgentError::Api {
-                message: body_text,
-                status_code: status,
-            });
-        }
-
-        let data: serde_json::Value = response.json().await.map_err(AgentError::Http)?;
-        let msg = &data["choices"][0]["message"];
-        if let Some(content) = msg["content"].as_str().filter(|s| !s.is_empty()) {
-            Ok(content.to_string())
-        } else {
-            Err(AgentError::Api {
-                message: "model returned tool call instead of text".to_string(),
-                status_code: 0,
-            })
+    async fn complete_aligned(
+        &self,
+        model: &str,
+        messages: &[Message],
+    ) -> Result<String, AgentError> {
+        match self.complete_inner(model, messages, true).await {
+            Ok(text) => Ok(text),
+            Err(e) => {
+                // Not every OpenAI-compatible endpoint accepts a tools array or
+                // `tool_choice: "none"` on a non-streaming call. Prefix alignment is
+                // an optimization; the summary itself is not optional. Fall back to
+                // the plain call so compaction still lands, and say why.
+                eprintln!(
+                    "rupi: cache-aligned summarization call failed ({}) — retrying without tools",
+                    e
+                );
+                self.complete_inner(model, messages, false).await
+            }
         }
     }
 
@@ -538,6 +596,57 @@ impl ChatProvider for OpenAIProvider {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+
+    fn body_of(messages: &[Message]) -> serde_json::Value {
+        serde_json::to_value(OpenAIProvider::build_messages(messages)).unwrap()
+    }
+
+    #[test]
+    fn cache_breakpoints_cover_the_static_head_and_the_moving_tail() {
+        let messages = vec![
+            Message::new("system", "SYSTEM"),
+            Message::new("user", "do the thing"),
+            Message::new("assistant", "on it"),
+            Message::tool_result("c1", "output"),
+        ];
+        let wire = body_of(&messages);
+
+        // The static breakpoint: the system prompt and the tool schemas never change
+        // within a session.
+        assert_eq!(wire[0]["cache_control"]["type"], "ephemeral");
+        // The moving breakpoint: without it a server that needs explicit markers
+        // caches only the system prompt and re-prefills the whole conversation.
+        assert_eq!(wire[3]["cache_control"]["type"], "ephemeral");
+        // Nothing in between, so the request stays within the usual four-breakpoint
+        // budget however long the conversation gets.
+        assert!(wire[1].get("cache_control").is_none());
+        assert!(wire[2].get("cache_control").is_none());
+    }
+
+    #[test]
+    fn the_moving_breakpoint_follows_the_tail() {
+        let mut messages = vec![Message::new("system", "SYSTEM"), Message::new("user", "one")];
+        assert_eq!(body_of(&messages)[1]["cache_control"]["type"], "ephemeral");
+
+        messages.push(Message::new("assistant", "two"));
+        let wire = body_of(&messages);
+        assert!(wire[1].get("cache_control").is_none());
+        assert_eq!(wire[2]["cache_control"]["type"], "ephemeral");
+    }
+
+    #[test]
+    fn a_system_only_request_carries_one_breakpoint() {
+        let wire = body_of(&[Message::new("system", "SYSTEM")]);
+        assert_eq!(wire.as_array().unwrap().len(), 1);
+        assert_eq!(wire[0]["cache_control"]["type"], "ephemeral");
+    }
+
+    #[test]
+    fn an_empty_request_does_not_panic() {
+        assert!(body_of(&[]).as_array().unwrap().is_empty());
+    }
+
     use super::*;
 
     #[tokio::test]

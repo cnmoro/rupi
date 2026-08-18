@@ -62,6 +62,26 @@ pub trait ChatProvider: Send + Sync {
         messages: &[Message],
     ) -> Result<String, crate::error::AgentError>;
 
+    /// Non-streaming completion that keeps the request prefix aligned with
+    /// `stream_chat`.
+    ///
+    /// Compaction replays the conversation's own system prompt and messages to the
+    /// summarizer so the call is a genuine prefix of the last routed request and the
+    /// provider's KV cache is reused. That only holds if the tool schemas are
+    /// present too, because they sit between the system prompt and the messages in
+    /// the serialized request. `complete` omits them and breaks the match, so this
+    /// method exists to send them.
+    ///
+    /// The default implementation falls back to `complete`, which is correct but
+    /// gives up the cache alignment.
+    async fn complete_aligned(
+        &self,
+        model: &str,
+        messages: &[Message],
+    ) -> Result<String, crate::error::AgentError> {
+        self.complete(model, messages).await
+    }
+
     /// Get the model info.
     fn model_info(&self) -> crate::rpc::types::ModelInfo;
 }
