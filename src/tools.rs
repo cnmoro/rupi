@@ -1,7 +1,7 @@
 use std::io::Read;
-use std::os::unix::io::AsRawFd;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 use serde_json::Value;
 
 /// Bounds for the bash tool's per-command timeout, in seconds.
@@ -331,40 +331,40 @@ fn execute_bash(args: &Value) -> String {
         // help because by then the command itself has already exited. Reading
         // what is available and moving on is the only behaviour that works for
         // both a normal command and one that deliberately outlives its shell.
-        let mut stdout = child.stdout.take();
-        let mut stderr = child.stderr.take();
-        set_nonblocking(&stdout);
-        set_nonblocking(&stderr);
+        let out = PipeReader::spawn(child.stdout.take());
+        let err = PipeReader::spawn(child.stderr.take());
 
-        let mut out_buf: Vec<u8> = Vec::new();
-        let mut err_buf: Vec<u8> = Vec::new();
         let start = std::time::Instant::now();
         let timeout = std::time::Duration::from_secs(timeout_secs);
 
         loop {
-            drain(&mut stdout, &mut out_buf);
-            drain(&mut stderr, &mut err_buf);
-
             match child.try_wait() {
                 Ok(Some(status)) => {
-                    // The command is gone; give whatever it wrote a moment to
-                    // arrive, then stop — anything still holding the pipe is a
-                    // process that outlived it and is not ours to wait for.
+                    // The command is gone. Wait for the readers to reach end of
+                    // pipe so nothing it wrote on the way out is lost, but cap the
+                    // wait — anything still holding the pipe open is a process that
+                    // outlived the command and is not ours to wait for.
                     let grace = std::time::Instant::now();
-                    while grace.elapsed() < std::time::Duration::from_millis(300) {
-                        drain(&mut stdout, &mut out_buf);
-                        drain(&mut stderr, &mut err_buf);
-                        std::thread::sleep(std::time::Duration::from_millis(20));
+                    while grace.elapsed() < std::time::Duration::from_millis(300)
+                        && !(out.finished() && err.finished())
+                    {
+                        std::thread::sleep(std::time::Duration::from_millis(10));
                     }
-                    return assemble_bash_result(command, &out_buf, &err_buf, status.code());
+                    return assemble_bash_result(
+                        command,
+                        &out.snapshot(),
+                        &err.snapshot(),
+                        status.code(),
+                    );
                 }
                 Ok(None) => {
                     if start.elapsed() > timeout {
                         let _ = child.kill();
                         let _ = child.wait();
-                        drain(&mut stdout, &mut out_buf);
-                        drain(&mut stderr, &mut err_buf);
-                        let partial = assemble_bash_result(command, &out_buf, &err_buf, None);
+                        // Let the readers pick up whatever was already in flight.
+                        std::thread::sleep(std::time::Duration::from_millis(50));
+                        let partial =
+                            assemble_bash_result(command, &out.snapshot(), &err.snapshot(), None);
                         return format!("[timed out after {}s]\n{}", timeout_secs, partial);
                     }
                     std::thread::sleep(std::time::Duration::from_millis(10));
@@ -378,31 +378,62 @@ fn execute_bash(args: &Value) -> String {
     }
 }
 
-/// Put a child pipe in non-blocking mode so a read can never park the agent.
-fn set_nonblocking<T: std::os::unix::io::AsRawFd>(pipe: &Option<T>) {
-    if let Some(p) = pipe {
-        unsafe {
-            let fd = p.as_raw_fd();
-            let flags = libc::fcntl(fd, libc::F_GETFL);
-            if flags >= 0 {
-                libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK);
-            }
-        }
-    }
+/// A child pipe drained by a background thread into a shared buffer.
+///
+/// The agent must never block on a child's output. `wait_with_output` blocks until
+/// end of pipe, and end of pipe only arrives once every holder closes it —
+/// including a process the command left running on purpose, such as a dev server.
+/// The previous fix put the pipes in non-blocking mode with `fcntl`, which works but
+/// is unix-only and stopped the crate compiling for Windows entirely.
+///
+/// A reader thread is portable and needs no `unsafe`: the blocking read happens off
+/// the agent's thread, and the caller only ever reads the buffer that thread fills.
+/// A pipe held open by an outliving process leaves one parked thread behind, which
+/// costs a stack and nothing else. The agent keeps running either way.
+struct PipeReader {
+    buffer: Arc<Mutex<Vec<u8>>>,
+    finished: Arc<AtomicBool>,
 }
 
-/// Move whatever is currently readable into `buf`. Never blocks.
-fn drain<T: std::io::Read>(pipe: &mut Option<T>, buf: &mut Vec<u8>) {
-    let Some(p) = pipe.as_mut() else { return };
-    let mut chunk = [0u8; 8192];
-    loop {
-        match p.read(&mut chunk) {
-            Ok(0) => return,
-            Ok(n) => buf.extend_from_slice(&chunk[..n]),
-            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => return,
-            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
-            Err(_) => return,
-        }
+impl PipeReader {
+    /// Start draining `pipe`. An absent pipe yields a reader that is already done.
+    fn spawn<R: Read + Send + 'static>(pipe: Option<R>) -> PipeReader {
+        let buffer = Arc::new(Mutex::new(Vec::new()));
+        let finished = Arc::new(AtomicBool::new(true));
+        let Some(mut pipe) = pipe else {
+            return PipeReader { buffer, finished };
+        };
+        finished.store(false, Ordering::SeqCst);
+
+        let sink = Arc::clone(&buffer);
+        let done = Arc::clone(&finished);
+        std::thread::spawn(move || {
+            let mut chunk = [0u8; 8192];
+            loop {
+                match pipe.read(&mut chunk) {
+                    Ok(0) => break,
+                    Ok(n) => match sink.lock() {
+                        Ok(mut buf) => buf.extend_from_slice(&chunk[..n]),
+                        Err(_) => break,
+                    },
+                    Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                    Err(_) => break,
+                }
+            }
+            done.store(true, Ordering::SeqCst);
+        });
+
+        PipeReader { buffer, finished }
+    }
+
+    /// Everything read so far.
+    fn snapshot(&self) -> Vec<u8> {
+        self.buffer.lock().map(|buf| buf.clone()).unwrap_or_default()
+    }
+
+    /// Whether the pipe reached its end and the reader stopped.
+    fn finished(&self) -> bool {
+        self.finished.load(Ordering::SeqCst)
     }
 }
 
