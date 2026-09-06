@@ -77,6 +77,7 @@ pub enum RpcCommand {
         #[serde(skip_serializing_if = "Option::is_none")]
         images: Option<Vec<ImageContent>>,
         #[serde(skip_serializing_if = "Option::is_none")]
+        #[serde(rename = "streamingBehavior", alias = "streaming_behavior")]
         streaming_behavior: Option<String>,
     },
     Steer {
@@ -429,7 +430,9 @@ mod tests {
         let json = r#"{"type":"set_model","id":"req_4","provider":"openai-compatible","model_id":"gpt-4"}"#;
         let cmd: RpcCommand = serde_json::from_str(json).unwrap();
         match cmd {
-            RpcCommand::SetModel { provider, model_id, .. } => {
+            RpcCommand::SetModel {
+                provider, model_id, ..
+            } => {
                 assert_eq!(provider, "openai-compatible");
                 assert_eq!(model_id, "gpt-4");
             }

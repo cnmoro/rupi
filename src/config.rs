@@ -48,7 +48,9 @@ impl RupiConfig {
 
     /// Resolve the effective API key — uses opencode_api_key if present.
     pub fn effective_api_key(&self) -> &str {
-        self.opencode_api_key.as_deref().unwrap_or(self.api_key.as_deref().unwrap_or(""))
+        self.opencode_api_key
+            .as_deref()
+            .unwrap_or(self.api_key.as_deref().unwrap_or(""))
     }
 
     /// Resolve the effective base URL — uses opencode URL if opencode_api_key is set.
@@ -128,7 +130,8 @@ mod tests {
     #[test]
     fn test_load_partial_config_succeeds_with_defaults() {
         // With only base_url, the other fields default to None
-        let config: RupiConfig = serde_json::from_str(r#"{"base_url":"https://example.com"}"#).unwrap();
+        let config: RupiConfig =
+            serde_json::from_str(r#"{"base_url":"https://example.com"}"#).unwrap();
         assert_eq!(config.base_url.as_deref(), Some("https://example.com"));
         assert_eq!(config.api_key, None);
         assert_eq!(config.model_tag, None);

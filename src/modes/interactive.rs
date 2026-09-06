@@ -57,8 +57,8 @@ async fn handle_command(session: &Arc<AgentSession>, line: &str) -> CommandActio
         return CommandAction::Break;
     }
 
-    if line.starts_with("/steer ") {
-        let steer_text = line[7..].trim().to_string();
+    if let Some(text) = line.strip_prefix("/steer ") {
+        let steer_text = text.trim().to_string();
         if !steer_text.is_empty() {
             session.steer(&steer_text).await;
             session.abort().await;
@@ -77,8 +77,8 @@ async fn handle_command(session: &Arc<AgentSession>, line: &str) -> CommandActio
         return CommandAction::Continue;
     }
 
-    if line.starts_with("/loop ") {
-        let loop_text = line[6..].trim().to_string();
+    if let Some(text) = line.strip_prefix("/loop ") {
+        let loop_text = text.trim().to_string();
         if !loop_text.is_empty() {
             session.set_loop(Some(loop_text.clone())).await;
             let _ = writeln!(stdout(), "Loop started: {}", loop_text);
@@ -90,8 +90,8 @@ async fn handle_command(session: &Arc<AgentSession>, line: &str) -> CommandActio
         return CommandAction::Continue;
     }
 
-    if line.starts_with("/goal ") {
-        let goal_text = line[6..].trim().to_string();
+    if let Some(text) = line.strip_prefix("/goal ") {
+        let goal_text = text.trim().to_string();
         if !goal_text.is_empty() {
             session.set_goal(Some(goal_text.clone())).await;
             let _ = writeln!(stdout(), "Goal set and starting work: {}", goal_text);
@@ -104,8 +104,12 @@ async fn handle_command(session: &Arc<AgentSession>, line: &str) -> CommandActio
     }
     if line == "/goal" {
         match session.goal_status().await {
-            Some(g) => { let _ = writeln!(stdout(), "Current goal: {}", g); }
-            None => { let _ = writeln!(stdout(), "No goal set."); }
+            Some(g) => {
+                let _ = writeln!(stdout(), "Current goal: {}", g);
+            }
+            None => {
+                let _ = writeln!(stdout(), "No goal set.");
+            }
         }
         let _ = stdout().flush();
         return CommandAction::Continue;
@@ -114,7 +118,11 @@ async fn handle_command(session: &Arc<AgentSession>, line: &str) -> CommandActio
     if line == "/compact" {
         match session.compact().await {
             Ok(result) => {
-                let _ = writeln!(stdout(), "Compaction complete: {} tokens before", result.tokens_before);
+                let _ = writeln!(
+                    stdout(),
+                    "Compaction complete: {} tokens before",
+                    result.tokens_before
+                );
             }
             Err(e) => {
                 let _ = writeln!(stdout(), "Compaction skipped: {}", e);
@@ -157,10 +165,7 @@ async fn handle_command(session: &Arc<AgentSession>, line: &str) -> CommandActio
     CommandAction::Prompt(line.to_string())
 }
 
-async fn process_prompt(
-    session: &Arc<AgentSession>,
-    initial_input: &str,
-) {
+async fn process_prompt(session: &Arc<AgentSession>, initial_input: &str) {
     let (event_tx, mut event_rx) = tokio::sync::mpsc::unbounded_channel::<AgentEvent>();
     let mut interrupted: Option<String> = None;
 
@@ -197,32 +202,27 @@ async fn process_prompt(
 
     loop {
         // Poll stdin non-blockingly for steer/follow-up
-        loop {
-            match stdin_rx.try_recv() {
-                Ok(input) => {
-                    if input == CANCEL_LOOP_SIG || input == EOF_SIG {
-                        session.cancel_loop().await;
-                        let _ = writeln!(stdout(), "\n[loop cancelled]");
-                        let _ = stdout().flush();
-                        if input == EOF_SIG {
-                            streaming_stop.store(true, std::sync::atomic::Ordering::SeqCst);
-                            return;
-                        }
-                        continue;
-                    }
-                    if input.starts_with("/steer ") {
-                        let steer_text = input[7..].trim().to_string();
-                        session.abort().await;
-                        interrupted = Some(steer_text);
-                        let _ = writeln!(stdout(), "\n[interrupted]");
-                    } else {
-                        session.follow_up(&input).await;
-                        let _ = writeln!(stdout(), "\n[queued]");
-                    }
-                    let _ = stdout().flush();
+        while let Ok(input) = stdin_rx.try_recv() {
+            if input == CANCEL_LOOP_SIG || input == EOF_SIG {
+                session.cancel_loop().await;
+                let _ = writeln!(stdout(), "\n[loop cancelled]");
+                let _ = stdout().flush();
+                if input == EOF_SIG {
+                    streaming_stop.store(true, std::sync::atomic::Ordering::SeqCst);
+                    return;
                 }
-                Err(_) => break,
+                continue;
             }
+            if let Some(text) = input.strip_prefix("/steer ") {
+                let steer_text = text.trim().to_string();
+                session.abort().await;
+                interrupted = Some(steer_text);
+                let _ = writeln!(stdout(), "\n[interrupted]");
+            } else {
+                session.follow_up(&input).await;
+                let _ = writeln!(stdout(), "\n[queued]");
+            }
+            let _ = stdout().flush();
         }
 
         // Block on next event
@@ -233,7 +233,7 @@ async fn process_prompt(
                         match &assistant_message_event {
                             AssistantMessageEvent::TextDelta { delta } => {
                                 if saw_reasoning {
-                                    let _ = write!(stdout(), "\n");
+                                    let _ = writeln!(stdout());
                                     saw_reasoning = false;
                                 }
                                 got_text = true;
@@ -332,18 +332,20 @@ async fn process_prompt(
                 }
                 if session.is_streaming().await && input.starts_with("/steer ") {
                     let t = input[7..].trim().to_string();
-                    session.abort().await;
+                    session.steer(&t).await;
                     let _ = writeln!(stdout(), "\n[interrupted]");
-                    interrupted = Some(t);
                     let _ = stdout().flush();
                 }
             }
             match event_rx.recv().await {
-                Some(AgentEvent::MessageUpdate { assistant_message_event, .. }) => {
+                Some(AgentEvent::MessageUpdate {
+                    assistant_message_event,
+                    ..
+                }) => {
                     match &assistant_message_event {
                         AssistantMessageEvent::TextDelta { delta } => {
                             if saw_reasoning {
-                                let _ = write!(stdout(), "\n");
+                                let _ = writeln!(stdout());
                                 saw_reasoning = false;
                             }
                             got2 = true;
@@ -367,7 +369,9 @@ async fn process_prompt(
                     }
                     let _ = stdout().flush();
                 }
-                Some(AgentEvent::AgentEnd { .. }) | None => { break; }
+                Some(AgentEvent::AgentEnd { .. }) | None => {
+                    break;
+                }
                 _ => {}
             }
         }

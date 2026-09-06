@@ -43,14 +43,20 @@ pub fn fetch_opencode_models(provider_id: &str) -> Result<Vec<ModelsDevModel>, S
     match result {
         Ok(models) => {
             if models.is_empty() {
-                eprintln!("rupi: models.dev returned empty list for '{}', using snapshot", provider_id);
+                eprintln!(
+                    "rupi: models.dev returned empty list for '{}', using snapshot",
+                    provider_id
+                );
                 Ok(parse_snapshot(provider_id))
             } else {
                 Ok(models)
             }
         }
         Err(e) => {
-            eprintln!("rupi: failed to fetch models from models.dev ({}), using snapshot", e);
+            eprintln!(
+                "rupi: failed to fetch models from models.dev ({}), using snapshot",
+                e
+            );
             Ok(parse_snapshot(provider_id))
         }
     }
@@ -72,9 +78,8 @@ fn try_fetch_from_api(provider_id: &str) -> Result<Vec<ModelsDevModel>, String> 
         return Err(format!("HTTP {}", resp.status()));
     }
 
-    let providers: HashMap<String, ModelsDevProvider> = resp
-        .json()
-        .map_err(|e| format!("JSON parse: {}", e))?;
+    let providers: HashMap<String, ModelsDevProvider> =
+        resp.json().map_err(|e| format!("JSON parse: {}", e))?;
 
     match providers.get(provider_id) {
         Some(p) => {
@@ -82,7 +87,10 @@ fn try_fetch_from_api(provider_id: &str) -> Result<Vec<ModelsDevModel>, String> 
             models.sort_by(|a, b| a.id.cmp(&b.id));
             Ok(models)
         }
-        None => Err(format!("Provider '{}' not found in models.dev", provider_id)),
+        None => Err(format!(
+            "Provider '{}' not found in models.dev",
+            provider_id
+        )),
     }
 }
 
@@ -96,21 +104,23 @@ fn parse_snapshot(provider_id: &str) -> Vec<ModelsDevModel> {
 
     let mut models: Vec<ModelsDevModel> = snapshot
         .iter()
-        .map(|(id, name, input_cost, output_cost, ctx, reasoning, tool_call)| ModelsDevModel {
-            id: id.to_string(),
-            name: Some(name.to_string()),
-            cost: Some(ModelCost {
-                input: *input_cost,
-                output: *output_cost,
-            }),
-            limit: Some(ModelLimit {
-                context: Some(*ctx),
-                output: Some(4096),
-            }),
-            reasoning: Some(*reasoning),
-            tool_call: Some(*tool_call),
-            status: None,
-        })
+        .map(
+            |(id, name, input_cost, output_cost, ctx, reasoning, tool_call)| ModelsDevModel {
+                id: id.to_string(),
+                name: Some(name.to_string()),
+                cost: Some(ModelCost {
+                    input: *input_cost,
+                    output: *output_cost,
+                }),
+                limit: Some(ModelLimit {
+                    context: Some(*ctx),
+                    output: Some(4096),
+                }),
+                reasoning: Some(*reasoning),
+                tool_call: Some(*tool_call),
+                status: None,
+            },
+        )
         .collect();
 
     models.sort_by(|a, b| a.id.cmp(&b.id));
@@ -120,12 +130,32 @@ fn parse_snapshot(provider_id: &str) -> Vec<ModelsDevModel> {
 /// Format and print models to stdout.
 pub fn print_models(models: &[ModelsDevModel]) {
     for m in models {
-        let name = m.name.as_deref().unwrap_or(&m.id);
-        let cost_str = m.cost.as_ref().map(|c| format!("  ${:.2}/$M in, ${:.2}/$M out", c.input, c.output)).unwrap_or_default();
-        let ctx_str = m.limit.as_ref().and_then(|l| l.context).map(|c| format!("  ctx: {}", c)).unwrap_or_default();
-        let reasoning_str = if m.reasoning.unwrap_or(false) { "  reasoning" } else { "" };
-        let tool_str = if m.tool_call.unwrap_or(false) { "  tools" } else { "" };
-        println!("{}{}{}{}{}", m.id, cost_str, ctx_str, reasoning_str, tool_str);
+        let _name = m.name.as_deref().unwrap_or(&m.id);
+        let cost_str = m
+            .cost
+            .as_ref()
+            .map(|c| format!("  ${:.2}/$M in, ${:.2}/$M out", c.input, c.output))
+            .unwrap_or_default();
+        let ctx_str = m
+            .limit
+            .as_ref()
+            .and_then(|l| l.context)
+            .map(|c| format!("  ctx: {}", c))
+            .unwrap_or_default();
+        let reasoning_str = if m.reasoning.unwrap_or(false) {
+            "  reasoning"
+        } else {
+            ""
+        };
+        let tool_str = if m.tool_call.unwrap_or(false) {
+            "  tools"
+        } else {
+            ""
+        };
+        println!(
+            "{}{}{}{}{}",
+            m.id, cost_str, ctx_str, reasoning_str, tool_str
+        );
     }
 }
 
@@ -133,22 +163,102 @@ pub fn print_models(models: &[ModelsDevModel]) {
 
 /// Opencode Go models (provider id: opencode-go)
 const OPENCODE_GO_SNAPSHOT: &[(&str, &str, f64, f64, u64, bool, bool)] = &[
-    ("deepseek-v4-flash", "DeepSeek V4 Flash", 0.30, 1.20, 204800, false, true),
-    ("deepseek-v4-pro", "DeepSeek V4 Pro", 2.00, 8.00, 204800, false, true),
+    (
+        "deepseek-v4-flash",
+        "DeepSeek V4 Flash",
+        0.30,
+        1.20,
+        204800,
+        false,
+        true,
+    ),
+    (
+        "deepseek-v4-pro",
+        "DeepSeek V4 Pro",
+        2.00,
+        8.00,
+        204800,
+        false,
+        true,
+    ),
     ("glm-5", "GLM-5", 0.30, 1.20, 128000, false, true),
-    ("glm-5-flash", "GLM-5 Flash", 0.10, 0.40, 128000, false, true),
+    (
+        "glm-5-flash",
+        "GLM-5 Flash",
+        0.10,
+        0.40,
+        128000,
+        false,
+        true,
+    ),
     ("kimi-k2.5", "Kimi K2.5", 2.00, 8.00, 128000, false, true),
-    ("minimax-m2.7", "MiniMax M2.7", 2.00, 8.00, 1048576, false, true),
-    ("mimo-v2.5-pro", "MiMo V2.5 Pro", 2.00, 8.00, 128000, false, true),
+    (
+        "minimax-m2.7",
+        "MiniMax M2.7",
+        2.00,
+        8.00,
+        1048576,
+        false,
+        true,
+    ),
+    (
+        "mimo-v2.5-pro",
+        "MiMo V2.5 Pro",
+        2.00,
+        8.00,
+        128000,
+        false,
+        true,
+    ),
 ];
 
 /// Opencode Zen models (provider id: opencode)
 const OPENCODE_ZEN_SNAPSHOT: &[(&str, &str, f64, f64, u64, bool, bool)] = &[
-    ("claude-haiku-4-5", "Claude Haiku 4.5", 1.00, 5.00, 200000, false, true),
-    ("claude-sonnet-4-6", "Claude Sonnet 4.6", 3.00, 15.00, 200000, false, true),
-    ("gemini-2-5-flash", "Gemini 2.5 Flash", 0.15, 0.60, 1048576, false, true),
-    ("gemini-3-1-pro", "Gemini 3.1 Pro", 2.00, 10.00, 2097152, false, true),
-    ("gpt-5-1-codex-max", "GPT 5.1 Codex Max", 5.00, 25.00, 131072, true, true),
+    (
+        "claude-haiku-4-5",
+        "Claude Haiku 4.5",
+        1.00,
+        5.00,
+        200000,
+        false,
+        true,
+    ),
+    (
+        "claude-sonnet-4-6",
+        "Claude Sonnet 4.6",
+        3.00,
+        15.00,
+        200000,
+        false,
+        true,
+    ),
+    (
+        "gemini-2-5-flash",
+        "Gemini 2.5 Flash",
+        0.15,
+        0.60,
+        1048576,
+        false,
+        true,
+    ),
+    (
+        "gemini-3-1-pro",
+        "Gemini 3.1 Pro",
+        2.00,
+        10.00,
+        2097152,
+        false,
+        true,
+    ),
+    (
+        "gpt-5-1-codex-max",
+        "GPT 5.1 Codex Max",
+        5.00,
+        25.00,
+        131072,
+        true,
+        true,
+    ),
     ("gpt-5-nano", "GPT 5 Nano", 0.50, 2.50, 131072, false, true),
 ];
 

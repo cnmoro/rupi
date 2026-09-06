@@ -2,7 +2,6 @@ use std::path::PathBuf;
 
 use crate::agent::session::Message;
 use crate::rpc::jsonl::serialize_json_line;
-use crate::tools::ToolCall;
 
 const SESSIONS_DIR: &str = "rupi_sessions";
 
@@ -87,8 +86,8 @@ pub fn create_session(model: &str) -> Result<PathBuf, String> {
     write_session_header(&dir.join(format!("{}.jsonl", id)), &id, model)
 }
 
-fn write_session_header(path: &PathBuf, id: &str, model: &str) -> Result<PathBuf, String> {
-    let path = path.clone();
+fn write_session_header(path: &std::path::Path, id: &str, model: &str) -> Result<PathBuf, String> {
+    let path = path.to_path_buf();
 
     // Write session header with the ID
     let header = SessionEntry {
@@ -99,7 +98,8 @@ fn write_session_header(path: &PathBuf, id: &str, model: &str) -> Result<PathBuf
         tokens_before: None,
         session_id: Some(id),
     };
-    let mut file = std::fs::File::create(&path).map_err(|e| format!("Cannot create session file: {}", e))?;
+    let mut file =
+        std::fs::File::create(&path).map_err(|e| format!("Cannot create session file: {}", e))?;
     use std::io::Write;
     writeln!(file, "{}", serialize_json_line(&header).trim())
         .map_err(|e| format!("Cannot write session header: {}", e))?;
@@ -123,13 +123,16 @@ fn open_for_append(path: &PathBuf) -> Result<std::fs::File, String> {
 /// Append a message entry to a session file.
 pub fn append_message(path: &PathBuf, msg: &Message) -> Result<(), String> {
     let tool_calls = msg.tool_calls.as_ref().map(|calls| {
-        calls.iter().map(|tc| {
-            serde_json::json!({
-                "id": tc.id,
-                "name": tc.name,
-                "arguments": tc.arguments,
+        calls
+            .iter()
+            .map(|tc| {
+                serde_json::json!({
+                    "id": tc.id,
+                    "name": tc.name,
+                    "arguments": tc.arguments,
+                })
             })
-        }).collect()
+            .collect()
     });
     let entry = SessionEntry {
         entry_type: "message",
@@ -234,8 +237,8 @@ pub fn load_session(path: &PathBuf) -> Result<Vec<Message>, String> {
     if !path.exists() {
         return Ok(Vec::new());
     }
-    let contents = std::fs::read_to_string(path)
-        .map_err(|e| format!("Cannot read session file: {}", e))?;
+    let contents =
+        std::fs::read_to_string(path).map_err(|e| format!("Cannot read session file: {}", e))?;
     let mut messages: Vec<Message> = Vec::new();
 
     for line in contents.lines() {
@@ -274,17 +277,25 @@ pub fn load_session(path: &PathBuf) -> Result<Vec<Message>, String> {
                     let content = content.as_str();
 
                     // Try to deserialize with optional tool_calls and tool_call_id
-                    if let Ok(entry) = serde_json::from_value::<SessionMessageEntry>(msg_val.clone()) {
+                    if let Ok(entry) =
+                        serde_json::from_value::<SessionMessageEntry>(msg_val.clone())
+                    {
                         let mut msg = Message::new(normalize_role(&entry.role), &entry.content);
                         msg.tool_call_id = entry.tool_call_id;
                         msg.reasoning_content = entry.reasoning_content;
                         if let Some(calls) = entry.tool_calls {
-                            let tool_calls: Vec<crate::tools::ToolCall> = calls.into_iter()
+                            let tool_calls: Vec<crate::tools::ToolCall> = calls
+                                .into_iter()
                                 .filter_map(|v| {
                                     let id = v.get("id")?.as_str()?.to_string();
                                     let name = v.get("name")?.as_str()?.to_string();
                                     let args = v.get("arguments").cloned().unwrap_or_default();
-                                    Some(crate::tools::ToolCall { id, name, arguments: args, raw_arguments: None })
+                                    Some(crate::tools::ToolCall {
+                                        id,
+                                        name,
+                                        arguments: args,
+                                        raw_arguments: None,
+                                    })
                                 })
                                 .collect();
                             if !tool_calls.is_empty() {
@@ -313,13 +324,19 @@ pub fn list_sessions() -> Result<Vec<SessionInfo>, String> {
     }
 
     let mut sessions = Vec::new();
-    let Ok(entries) = std::fs::read_dir(&dir) else { return Ok(Vec::new()) };
+    let Ok(entries) = std::fs::read_dir(&dir) else {
+        return Ok(Vec::new());
+    };
     for entry in entries.flatten() {
         let path = entry.path();
         if path.extension().and_then(|e| e.to_str()) != Some("jsonl") {
             continue;
         }
-        let id = path.file_stem().and_then(|s| s.to_str()).unwrap_or("").to_string();
+        let id = path
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or("")
+            .to_string();
         let contents = match std::fs::read_to_string(&path) {
             Ok(c) => c,
             Err(_) => continue,
@@ -329,7 +346,9 @@ pub fn list_sessions() -> Result<Vec<SessionInfo>, String> {
         let mut message_count = 0;
         for line in contents.lines() {
             let line = line.trim();
-            if line.is_empty() { continue; }
+            if line.is_empty() {
+                continue;
+            }
             if let Ok(val) = serde_json::from_str::<serde_json::Value>(line) {
                 match val["type"].as_str().unwrap_or("") {
                     "session" => {
@@ -369,12 +388,17 @@ pub fn list_sessions() -> Result<Vec<SessionInfo>, String> {
 pub fn find_session_path(id: &str) -> Option<PathBuf> {
     let dir = sessions_dir()?;
     let path = dir.join(format!("{}.jsonl", id));
-    if path.exists() { Some(path) } else { None }
+    if path.exists() {
+        Some(path)
+    } else {
+        None
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::tools::ToolCall;
     use std::fs;
 
     #[test]
@@ -391,9 +415,33 @@ mod tests {
         let path = dir.join("test_session.jsonl");
         let mut file = fs::File::create(&path).unwrap();
         use std::io::Write;
-        writeln!(file, "{}", serialize_json_line(&serde_json::json!({"type":"session","model":"gpt-4","session_id":"abc123"})).trim()).unwrap();
-        writeln!(file, "{}", serialize_json_line(&serde_json::json!({"type":"message","message":{"role":"user","content":"hello"}})).trim()).unwrap();
-        writeln!(file, "{}", serialize_json_line(&serde_json::json!({"type":"message","message":{"role":"assistant","content":"hi"}})).trim()).unwrap();
+        writeln!(
+            file,
+            "{}",
+            serialize_json_line(
+                &serde_json::json!({"type":"session","model":"gpt-4","session_id":"abc123"})
+            )
+            .trim()
+        )
+        .unwrap();
+        writeln!(
+            file,
+            "{}",
+            serialize_json_line(
+                &serde_json::json!({"type":"message","message":{"role":"user","content":"hello"}})
+            )
+            .trim()
+        )
+        .unwrap();
+        writeln!(
+            file,
+            "{}",
+            serialize_json_line(
+                &serde_json::json!({"type":"message","message":{"role":"assistant","content":"hi"}})
+            )
+            .trim()
+        )
+        .unwrap();
 
         let messages = load_session(&path).unwrap();
         assert_eq!(messages.len(), 2);
@@ -412,7 +460,12 @@ mod tests {
         let path = dir.join("append_test.jsonl");
         let mut file = fs::File::create(&path).unwrap();
         use std::io::Write;
-        writeln!(file, "{}", serialize_json_line(&serde_json::json!({"type":"session","model":"gpt-4"})).trim()).unwrap();
+        writeln!(
+            file,
+            "{}",
+            serialize_json_line(&serde_json::json!({"type":"session","model":"gpt-4"})).trim()
+        )
+        .unwrap();
         drop(file);
 
         let msg = Message::new("user", "test message");
@@ -432,7 +485,12 @@ mod tests {
         let path = dir.join("comp_test.jsonl");
         let mut file = fs::File::create(&path).unwrap();
         use std::io::Write;
-        writeln!(file, "{}", serialize_json_line(&serde_json::json!({"type":"session","model":"gpt-4"})).trim()).unwrap();
+        writeln!(
+            file,
+            "{}",
+            serialize_json_line(&serde_json::json!({"type":"session","model":"gpt-4"})).trim()
+        )
+        .unwrap();
         drop(file);
 
         append_compaction(&path, "test summary", 1000).unwrap();
@@ -453,7 +511,7 @@ mod tests {
     #[test]
     fn test_create_session_uses_uuid() {
         // Override sessions dir to temp
-        let orig_home = dirs::home_dir();
+        let _orig_home = dirs::home_dir();
         let dir = std::env::temp_dir().join(format!("rupi-sessions-uuid-{}", std::process::id()));
         fs::create_dir_all(&dir).unwrap();
 
@@ -461,8 +519,17 @@ mod tests {
         let path = create_session("gpt-4").unwrap();
         let filename = path.file_stem().unwrap().to_string_lossy().to_string();
         // UUID v4 format: 8-4-4-4-12 hex chars
-        assert_eq!(filename.len(), 36, "UUID should be 36 chars, got {}", filename);
-        assert!(filename.contains('-'), "UUID should contain dashes, got {}", filename);
+        assert_eq!(
+            filename.len(),
+            36,
+            "UUID should be 36 chars, got {}",
+            filename
+        );
+        assert!(
+            filename.contains('-'),
+            "UUID should contain dashes, got {}",
+            filename
+        );
         assert!(path.exists());
 
         // Verify header contains session_id
@@ -484,7 +551,11 @@ mod tests {
         let mut f1 = fs::File::create(&s1).unwrap();
         use std::io::Write;
         writeln!(f1, r#"{{"type":"session","model":"gpt-4","session_id":"11111111-1111-1111-1111-111111111111"}}"#).unwrap();
-        writeln!(f1, r#"{{"type":"message","message":{{"role":"user","content":"hi"}}}}"#).unwrap();
+        writeln!(
+            f1,
+            r#"{{"type":"message","message":{{"role":"user","content":"hi"}}}}"#
+        )
+        .unwrap();
         drop(f1);
 
         let s2 = dir.join("22222222-2222-2222-2222-222222222222.jsonl");
@@ -503,27 +574,47 @@ mod tests {
 
     fn list_sessions_from_dir(dir: &std::path::Path) -> Result<Vec<SessionInfo>, String> {
         let mut sessions = Vec::new();
-        let Ok(entries) = std::fs::read_dir(dir) else { return Ok(Vec::new()) };
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return Ok(Vec::new());
+        };
         for entry in entries.flatten() {
             let path = entry.path();
-            if path.extension().and_then(|e| e.to_str()) != Some("jsonl") { continue; }
-            let id = path.file_stem().and_then(|s| s.to_str()).unwrap_or("").to_string();
-            let contents = match std::fs::read_to_string(&path) { Ok(c) => c, Err(_) => continue };
+            if path.extension().and_then(|e| e.to_str()) != Some("jsonl") {
+                continue;
+            }
+            let id = path
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .unwrap_or("")
+                .to_string();
+            let contents = match std::fs::read_to_string(&path) {
+                Ok(c) => c,
+                Err(_) => continue,
+            };
             let mut model = String::new();
             let mut message_count = 0;
             for line in contents.lines() {
                 let line = line.trim();
-                if line.is_empty() { continue; }
+                if line.is_empty() {
+                    continue;
+                }
                 if let Ok(val) = serde_json::from_str::<serde_json::Value>(line) {
                     match val["type"].as_str().unwrap_or("") {
-                        "session" => { model = val["model"].as_str().unwrap_or("").to_string(); }
-                        "message" => { message_count += 1; }
+                        "session" => {
+                            model = val["model"].as_str().unwrap_or("").to_string();
+                        }
+                        "message" => {
+                            message_count += 1;
+                        }
                         _ => {}
                     }
                 }
             }
             sessions.push(SessionInfo {
-                id, model, created_at: String::new(), message_count,
+                id,
+                model,
+                created_at: String::new(),
+                message_count,
             });
         }
         Ok(sessions)
@@ -541,7 +632,7 @@ mod tests {
         let result = find_session_path(id);
         // May be None since sessions_dir points to home
         // Just verify no crash
-        assert!(result.is_none() || result.as_ref().map_or(false, |p| p.exists()));
+        assert!(result.is_none() || result.as_ref().is_some_and(|p| p.exists()));
     }
 
     #[test]
@@ -551,14 +642,32 @@ mod tests {
         let path = dir.join("tc_test.jsonl");
         let mut file = fs::File::create(&path).unwrap();
         use std::io::Write;
-        writeln!(file, "{}", serialize_json_line(&serde_json::json!({"type":"session","model":"gpt-4","session_id":"tc1"})).trim()).unwrap();
+        writeln!(
+            file,
+            "{}",
+            serialize_json_line(
+                &serde_json::json!({"type":"session","model":"gpt-4","session_id":"tc1"})
+            )
+            .trim()
+        )
+        .unwrap();
         drop(file);
 
         // Create a message with tool calls
         let mut msg = Message::new("assistant", "let me check");
         msg.tool_calls = Some(vec![
-            ToolCall { id: "call_1".into(), name: "bash".into(), arguments: serde_json::json!({"command": "ls"}), raw_arguments: None },
-            ToolCall { id: "call_2".into(), name: "read".into(), arguments: serde_json::json!({"file_path": "/tmp/x"}), raw_arguments: None },
+            ToolCall {
+                id: "call_1".into(),
+                name: "bash".into(),
+                arguments: serde_json::json!({"command": "ls"}),
+                raw_arguments: None,
+            },
+            ToolCall {
+                id: "call_2".into(),
+                name: "read".into(),
+                arguments: serde_json::json!({"file_path": "/tmp/x"}),
+                raw_arguments: None,
+            },
         ]);
         append_message(&path, &msg).unwrap();
 
@@ -570,7 +679,10 @@ mod tests {
         // Load and verify
         let loaded = load_session(&path).unwrap();
         assert_eq!(loaded.len(), 2);
-        assert!(loaded[0].tool_calls.is_some(), "Tool calls should be preserved");
+        assert!(
+            loaded[0].tool_calls.is_some(),
+            "Tool calls should be preserved"
+        );
         let calls = loaded[0].tool_calls.as_ref().unwrap();
         assert_eq!(calls.len(), 2);
         assert_eq!(calls[0].name, "bash");
@@ -584,7 +696,8 @@ mod tests {
 
     #[test]
     fn test_load_corrupt_session() {
-        let dir = std::env::temp_dir().join(format!("rupi-sessions-corrupt-{}", std::process::id()));
+        let dir =
+            std::env::temp_dir().join(format!("rupi-sessions-corrupt-{}", std::process::id()));
         let _ = fs::create_dir_all(&dir);
         let path = dir.join("corrupt.jsonl");
         let mut file = fs::File::create(&path).unwrap();
@@ -592,11 +705,19 @@ mod tests {
         // Valid header
         writeln!(file, r#"{{"type":"session","model":"gpt-4"}}"#).unwrap();
         // Valid message
-        writeln!(file, r#"{{"type":"message","message":{{"role":"user","content":"hello"}}}}"#).unwrap();
+        writeln!(
+            file,
+            r#"{{"type":"message","message":{{"role":"user","content":"hello"}}}}"#
+        )
+        .unwrap();
         // Corrupt JSON line
         writeln!(file, "this is not json at all {{").unwrap();
         // Valid message after corruption
-        writeln!(file, r#"{{"type":"message","message":{{"role":"assistant","content":"hi"}}}}"#).unwrap();
+        writeln!(
+            file,
+            r#"{{"type":"message","message":{{"role":"assistant","content":"hi"}}}}"#
+        )
+        .unwrap();
         drop(file);
 
         let loaded = load_session(&path).unwrap();
@@ -609,7 +730,8 @@ mod tests {
 
     /// Write `lines` to a throwaway session file and load it back.
     fn load_lines(tag: &str, lines: &[serde_json::Value]) -> (PathBuf, Vec<Message>) {
-        let dir = std::env::temp_dir().join(format!("rupi-sessions-{}-{}", tag, std::process::id()));
+        let dir =
+            std::env::temp_dir().join(format!("rupi-sessions-{}-{}", tag, std::process::id()));
         let _ = fs::create_dir_all(&dir);
         let path = dir.join(format!("{}.jsonl", tag));
         let mut file = fs::File::create(&path).unwrap();
@@ -639,7 +761,11 @@ mod tests {
             ],
         );
 
-        assert_eq!(loaded.len(), 2, "expected summary + post-compaction message");
+        assert_eq!(
+            loaded.len(),
+            2,
+            "expected summary + post-compaction message"
+        );
         assert!(loaded[0].content.starts_with(COMPACTION_PREFIX));
         assert!(loaded[0].content.contains("fixed Y"));
         assert_eq!(loaded[1].content, "what next?");
@@ -679,7 +805,10 @@ mod tests {
         assert_eq!(loaded.len(), 3);
         assert_eq!(loaded[0].content, "hello");
         assert_eq!(loaded[1].content, "part one\n[called tool: bash]");
-        assert_eq!(loaded[2].role, "tool", "toolResult must map to the tool role");
+        assert_eq!(
+            loaded[2].role, "tool",
+            "toolResult must map to the tool role"
+        );
         fs::remove_dir_all(&dir).unwrap();
     }
 
@@ -707,7 +836,8 @@ mod tests {
         // losing the compaction record and the generation ids with it.
         let dir = std::env::temp_dir().join(format!("rupi-sessions-gone-{}", std::process::id()));
         let _ = fs::create_dir_all(&dir);
-        let path = create_session_with_id("vanishing", "gpt-4").unwrap_or(dir.join("vanishing.jsonl"));
+        let path =
+            create_session_with_id("vanishing", "gpt-4").unwrap_or(dir.join("vanishing.jsonl"));
         let _ = fs::write(&path, "");
 
         fs::remove_file(&path).unwrap();

@@ -1,13 +1,13 @@
 use std::sync::Arc;
 
 pub type ApprovalFn = Arc<dyn Fn(&str, &str) -> bool + Send + Sync>;
-use tokio::sync::{Mutex, RwLock, watch};
 use tokio::sync::mpsc;
+use tokio::sync::{watch, Mutex, RwLock};
 
+use crate::error::AgentError;
 use crate::provider::openai::{OpenAIConfig, OpenAIProvider};
 use crate::provider::{ChatProvider, StreamEvent};
 use crate::rpc::types::*;
-use crate::error::AgentError;
 
 /// A message in the conversation.
 #[derive(Debug, Clone)]
@@ -127,13 +127,20 @@ fn capped_tool_result(result: &str) -> String {
 ///
 /// The exact time is a `date` call away when a task actually needs it.
 fn current_date_for_prompt() -> String {
-    chrono::Local::now().format("%A, %B %d, %Y (%Z)").to_string()
+    chrono::Local::now()
+        .format("%A, %B %d, %Y (%Z)")
+        .to_string()
 }
 
 /// Build the system prompt describing available tools, skills, context files, and memory.
 /// If `datetime` is provided, it is used as the current time (for KV cache stability).
 /// Otherwise, `chrono::Local::now()` is used (for one-shot prompts like goal verification).
-fn build_system_prompt(skills: &[Skill], context_files: &[ContextFile], memory_enabled: bool, datetime: Option<&str>) -> String {
+fn build_system_prompt(
+    skills: &[Skill],
+    context_files: &[ContextFile],
+    memory_enabled: bool,
+    datetime: Option<&str>,
+) -> String {
     let time_str = match datetime {
         Some(d) => d.to_string(),
         None => current_date_for_prompt(),
@@ -245,7 +252,10 @@ pub fn load_context_files(cwd: &str) -> Vec<ContextFile> {
             if path.exists() {
                 if let Ok(content) = std::fs::read_to_string(&path) {
                     // Avoid duplicates (if parent and child have same file)
-                    if !files.iter().any(|f: &ContextFile| f.name == *name && f.content == content) {
+                    if !files
+                        .iter()
+                        .any(|f: &ContextFile| f.name == *name && f.content == content)
+                    {
                         files.push(ContextFile {
                             name: name.to_string(),
                             content,
@@ -287,6 +297,9 @@ pub fn recover_anchor(messages: &[Message]) -> Option<String> {
 /// Agent session manages conversation state and model interaction.
 pub struct AgentSession {
     provider: Arc<dyn ChatProvider>,
+    lifecycle: RwLock<()>,
+    admission: Mutex<()>,
+    resetting: std::sync::atomic::AtomicBool,
     approval_fn: RwLock<Option<ApprovalFn>>,
     memory_enabled: bool,
     model: std::sync::RwLock<String>,
@@ -338,7 +351,13 @@ impl AgentSession {
         context_files: Vec<ContextFile>,
     ) -> Self {
         Self::new_with_session_path(
-            provider, model, context_window, cwd, skills, context_files, None,
+            provider,
+            model,
+            context_window,
+            cwd,
+            skills,
+            context_files,
+            None,
         )
     }
 
@@ -358,6 +377,9 @@ impl AgentSession {
         let system_prompt = build_system_prompt(&skills, &context_files, false, Some(&frozen_time));
         AgentSession {
             provider,
+            lifecycle: RwLock::new(()),
+            admission: Mutex::new(()),
+            resetting: std::sync::atomic::AtomicBool::new(false),
             approval_fn: RwLock::new(None),
             memory_enabled: false,
             model: std::sync::RwLock::new(model),
@@ -391,7 +413,10 @@ impl AgentSession {
     pub fn from_config(config: OpenAIConfig) -> Self {
         Self::from_config_with(
             config,
-            std::env::current_dir().unwrap_or_default().to_string_lossy().to_string(),
+            std::env::current_dir()
+                .unwrap_or_default()
+                .to_string_lossy()
+                .to_string(),
             Vec::new(),
             Vec::new(),
             false,
@@ -408,13 +433,25 @@ impl AgentSession {
         let context_window = config.context_window;
         let model = config.model.clone();
         let provider = Arc::new(OpenAIProvider::new(config));
-        let mut session = Self::new(provider as Arc<dyn ChatProvider>, model, context_window, cwd, skills, context_files);
+        let mut session = Self::new(
+            provider as Arc<dyn ChatProvider>,
+            model,
+            context_window,
+            cwd,
+            skills,
+            context_files,
+        );
         session.memory_enabled = memory_enabled;
         if memory_enabled {
             ensure_memory_file();
             // Rebuild system prompt with memory content included
             let frozen_time = current_date_for_prompt();
-            let prompt = build_system_prompt(&session.skills, &session.context_files, memory_enabled, Some(&frozen_time));
+            let prompt = build_system_prompt(
+                &session.skills,
+                &session.context_files,
+                memory_enabled,
+                Some(&frozen_time),
+            );
             *session.system_prompt.get_mut() = prompt;
         }
         session
@@ -435,13 +472,24 @@ impl AgentSession {
         let model = config.model.clone();
         let provider = Arc::new(OpenAIProvider::new(config));
         let mut session = Self::new_with_session_path(
-            provider as Arc<dyn ChatProvider>, model, context_window, cwd, skills, context_files, Some(session_path.clone()),
+            provider as Arc<dyn ChatProvider>,
+            model,
+            context_window,
+            cwd,
+            skills,
+            context_files,
+            Some(session_path.clone()),
         );
         session.memory_enabled = memory_enabled;
         if memory_enabled {
             ensure_memory_file();
             let frozen_time = current_date_for_prompt();
-            let prompt = build_system_prompt(&session.skills, &session.context_files, memory_enabled, Some(&frozen_time));
+            let prompt = build_system_prompt(
+                &session.skills,
+                &session.context_files,
+                memory_enabled,
+                Some(&frozen_time),
+            );
             *session.system_prompt.get_mut() = prompt;
         }
         // Load existing messages into the session
@@ -568,13 +616,24 @@ impl AgentSession {
 
     /// Reset the session (clear messages, create new session file).
     pub async fn reset(&self) {
+        self.resetting
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        self.loop_cancelled
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        self.abort().await;
+        // Wait for the generation (including blocking tools) to finish before
+        // changing either history or its transcript destination.
+        let _lifecycle = self.lifecycle.write().await;
         // Wait for any in-progress compaction to finish
         loop {
             let c = *self.is_compacting.lock().await;
-            if !c { break; }
+            if !c {
+                break;
+            }
             tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         }
-        self.is_streaming.store(false, std::sync::atomic::Ordering::SeqCst);
+        self.is_streaming
+            .store(false, std::sync::atomic::Ordering::SeqCst);
         *self.is_compacting.lock().await = false;
         self.messages.write().await.clear();
         self.recent_tool_calls.write().await.clear();
@@ -592,12 +651,24 @@ impl AgentSession {
 
         // Rebuild system prompt with a fresh frozen timestamp for the new session
         let frozen_time = current_date_for_prompt();
-        let prompt = build_system_prompt(&self.skills, &self.context_files, self.memory_enabled, Some(&frozen_time));
+        let prompt = build_system_prompt(
+            &self.skills,
+            &self.context_files,
+            self.memory_enabled,
+            Some(&frozen_time),
+        );
         *self.system_prompt.write().await = prompt;
 
         *self.abort_signal.lock().await = None;
         let new_path = sessions::create_session(&self.model()).ok();
         *self.session_path.write().await = new_path;
+        *self.abort_requested.lock().await = false;
+        *self.empty_response_retries.lock().await = 0;
+        self.tool_context
+            .cancelled
+            .store(false, std::sync::atomic::Ordering::SeqCst);
+        self.resetting
+            .store(false, std::sync::atomic::Ordering::SeqCst);
     }
 
     /// Stream a prompt to the model. Events are sent to the event_tx channel.
@@ -616,7 +687,22 @@ impl AgentSession {
         message: &str,
         event_tx: mpsc::UnboundedSender<AgentEvent>,
     ) -> Result<(), AgentError> {
-        let result = self.prompt_inner(message, event_tx.clone()).await;
+        self.prompt_with_behavior(message, event_tx, None).await
+    }
+
+    pub async fn prompt_with_behavior(
+        &self,
+        message: &str,
+        event_tx: mpsc::UnboundedSender<AgentEvent>,
+        streaming_behavior: Option<&str>,
+    ) -> Result<(), AgentError> {
+        let _lifecycle = self.lifecycle.read().await;
+        if self.resetting.load(std::sync::atomic::Ordering::SeqCst) {
+            return Err(AgentError::Cancelled);
+        }
+        let result = self
+            .prompt_inner(message, event_tx.clone(), streaming_behavior)
+            .await;
         if let Err(ref e) = result {
             eprintln!("rupi: turn ended with error: {}", e);
             let _ = event_tx.send(AgentEvent::message_end(AgentMessage {
@@ -639,25 +725,36 @@ impl AgentSession {
         &self,
         message: &str,
         event_tx: mpsc::UnboundedSender<AgentEvent>,
+        streaming_behavior: Option<&str>,
     ) -> Result<(), AgentError> {
-        // Check if already streaming (atomically set to true if currently false)
-        if self.is_streaming.compare_exchange(
-            false, true,
-            std::sync::atomic::Ordering::SeqCst,
-            std::sync::atomic::Ordering::SeqCst,
-        ).is_err() {
-            // Already streaming — queue as steer. This is the user redirecting work
-            // that is already running, so it joins the anchor rather than starting a
-            // new task.
-            self.append_task_anchor(message).await;
-            self.pending_steer.write().await.push(message.to_string());
+        let admission = self.admission.lock().await;
+        if self.is_streaming.load(std::sync::atomic::Ordering::SeqCst) {
+            if streaming_behavior == Some("steer") {
+                self.steer(message).await;
+            } else {
+                self.follow_up(message).await;
+            }
             return Ok(());
         }
+        self.is_streaming
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        *self.abort_requested.lock().await = false;
+        self.tool_context
+            .cancelled
+            .store(false, std::sync::atomic::Ordering::SeqCst);
+        let terminal_tx = event_tx;
+        let (event_tx, mut forwarded) = mpsc::unbounded_channel();
+        let output = terminal_tx.clone();
+        let forwarder = tokio::spawn(async move {
+            while let Some(event) = forwarded.recv().await {
+                if !matches!(event, AgentEvent::AgentEnd { .. }) {
+                    let _ = output.send(event);
+                }
+            }
+        });
 
-        // Anchor this request before anything can compact it away. A steer or a
-        // follow-up replaces the anchor because it redirects the task; a host-written
-        // block (a checkpoint, an anchor re-emission, a goal round) never does,
-        // because it is not the user speaking.
+        // Keep admission locked until the initial request is recorded, so a
+        // concurrently queued refinement cannot be overwritten by this anchor.
         self.set_task_anchor(message).await;
         *self.tool_results_since_user.write().await = 0;
 
@@ -665,6 +762,7 @@ impl AgentSession {
         let user_msg = Message::new("user", message);
         self.persist_message(&user_msg).await;
         self.messages.write().await.push(user_msg);
+        drop(admission);
 
         let _ = event_tx.send(AgentEvent::agent_start());
         let _ = event_tx.send(AgentEvent::turn_start());
@@ -701,7 +799,10 @@ impl AgentSession {
                 }
             });
 
-            let max_rounds = self.tool_context.goal.current()
+            let max_rounds = self
+                .tool_context
+                .goal
+                .current()
                 .map(|state| state.max_rounds)
                 .unwrap_or(crate::goal::DEFAULT_MAX_ROUNDS);
 
@@ -786,14 +887,20 @@ impl AgentSession {
             });
 
             loop {
-                if self.loop_cancelled.load(std::sync::atomic::Ordering::SeqCst) {
+                if self
+                    .loop_cancelled
+                    .load(std::sync::atomic::Ordering::SeqCst)
+                {
                     break;
                 }
                 if let Err(e) = self.run_tool_loop(wrapped_tx.clone()).await {
                     eprintln!("rupi: tool loop error in loop mode: {}", e);
                     break;
                 }
-                if self.loop_cancelled.load(std::sync::atomic::Ordering::SeqCst) {
+                if self
+                    .loop_cancelled
+                    .load(std::sync::atomic::Ordering::SeqCst)
+                {
                     break;
                 }
                 // Re-send the loop prompt
@@ -833,12 +940,20 @@ impl AgentSession {
 
         // Drain any messages queued during streaming (e.g., steer that aborted the loop)
         loop {
-            let pending = self.drain_pending().await;
-            if pending.is_empty() {
+            let admission = self.admission.lock().await;
+            if self.resetting.load(std::sync::atomic::Ordering::SeqCst) {
+                self.is_streaming
+                    .store(false, std::sync::atomic::Ordering::SeqCst);
                 break;
             }
+            let pending = self.drain_pending().await;
+            if pending.is_empty() {
+                self.is_streaming
+                    .store(false, std::sync::atomic::Ordering::SeqCst);
+                break;
+            }
+            drop(admission);
             for msg in &pending {
-                self.persist_message(msg).await;
                 self.messages.write().await.push(msg.clone());
             }
             // Send turn_start + message_start for the queued messages
@@ -856,8 +971,9 @@ impl AgentSession {
             }
         }
 
-        self.is_streaming.store(false, std::sync::atomic::Ordering::SeqCst);
-
+        drop(event_tx);
+        let _ = forwarder.await;
+        let _ = terminal_tx.send(AgentEvent::agent_end());
         Ok(())
     }
 
@@ -868,18 +984,7 @@ impl AgentSession {
     ) -> Result<(), AgentError> {
         for _turn_num in 0.. {
             // Check abort signal; also check persistent abort_requested flag
-            let abort_now = {
-                let signal = self.abort_signal.lock().await;
-                if let Some(ref tx) = *signal {
-                    *tx.borrow()
-                } else {
-                    // Signal is None — check the persistent flag (abort was called between iterations)
-                    let requested = *self.abort_requested.lock().await;
-                    // Reset the flag so subsequent iterations aren't cancelled too
-                    *self.abort_requested.lock().await = false;
-                    requested
-                }
-            };
+            let abort_now = std::mem::take(&mut *self.abort_requested.lock().await);
             if abort_now {
                 let _ = event_tx.send(AgentEvent::message_end(AgentMessage {
                     role: "assistant".to_string(),
@@ -893,12 +998,16 @@ impl AgentSession {
                 return Err(AgentError::Cancelled);
             }
 
-            // Create abort signal for this round
-            // Reset the persistent flag now that we have a fresh signal path
-            *self.abort_requested.lock().await = false;
+            self.tool_context
+                .cancelled
+                .store(false, std::sync::atomic::Ordering::SeqCst);
+            // Carry cancellations arriving between rounds into the new stream.
             let (abort_tx, abort_rx) = watch::channel(false);
             {
                 let mut signal = self.abort_signal.lock().await;
+                if *self.abort_requested.lock().await {
+                    let _ = abort_tx.send(true);
+                }
                 *signal = Some(abort_tx);
             }
 
@@ -910,6 +1019,11 @@ impl AgentSession {
                 for msg in &drained {
                     self.messages.write().await.push(msg.clone());
                 }
+            }
+
+            // Only compact at a completed tool boundary, before the next request.
+            if let Err(e) = self.check_auto_compaction().await {
+                eprintln!("rupi: compaction before request failed: {}", e);
             }
 
             // Build messages: use the cached system prompt (frozen at session creation)
@@ -941,9 +1055,11 @@ impl AgentSession {
                     Err(e) => {
                         // Retry on transient errors: timeouts, connection errors, 5xx, 429
                         let retryable = match &e {
-                            AgentError::Http(_) => true,       // timeouts, connection refused, DNS, TLS
+                            AgentError::Http(_) => true, // timeouts, connection refused, DNS, TLS
                             AgentError::Timeout => true,
-                            AgentError::Api { status_code, .. } => *status_code == 429 || *status_code >= 500,
+                            AgentError::Api { status_code, .. } => {
+                                *status_code == 429 || *status_code >= 500
+                            }
                             _ => false,
                         };
                         if !retryable || attempt == 2 {
@@ -951,7 +1067,14 @@ impl AgentSession {
                             break;
                         }
                         let delay = std::time::Duration::from_secs(1 << attempt); // 1s, 2s, 4s
-                        tokio::time::sleep(delay).await;
+                        let mut retry_signal = abort_rx.clone();
+                        tokio::select! {
+                            _ = tokio::time::sleep(delay) => {},
+                            _ = retry_signal.changed() => {
+                                last_error = Some(AgentError::Cancelled);
+                                break;
+                            }
+                        }
                     }
                 }
             }
@@ -959,10 +1082,17 @@ impl AgentSession {
             let mut rx = match rx {
                 Some(rx) => rx,
                 None => {
-                    let err = last_error.unwrap_or(AgentError::Config("Request failed after retries".into()));
+                    let err = last_error
+                        .unwrap_or(AgentError::Config("Request failed after retries".into()));
+                    if matches!(err, AgentError::Cancelled) {
+                        *self.abort_requested.lock().await = false;
+                    }
                     let _ = event_tx.send(AgentEvent::message_end(AgentMessage {
                         role: "assistant".to_string(),
-                        content: vec![],
+                        content: vec![MessageContent {
+                            content_type: "text".into(),
+                            text: Some(err.to_string()),
+                        }],
                         model: None,
                         usage: None,
                         stop_reason: Some("error".to_string()),
@@ -989,7 +1119,9 @@ impl AgentSession {
                 let event = match tokio::time::timeout(
                     std::time::Duration::from_secs(300),
                     rx.recv(),
-                ).await {
+                )
+                .await
+                {
                     Ok(Some(event)) => event,
                     Ok(None) => break,
                     Err(_) => {
@@ -1071,6 +1203,7 @@ impl AgentSession {
                         let _ = event_tx.send(AgentEvent::agent_end());
 
                         return if err == "cancelled" {
+                            *self.abort_requested.lock().await = false;
                             Err(AgentError::Cancelled)
                         } else {
                             Err(AgentError::Api {
@@ -1086,7 +1219,10 @@ impl AgentSession {
             if tool_calls.is_empty() && !full_content.is_empty() {
                 let embedded = output_parser::extract_tool_calls_from_text(&full_content);
                 if !embedded.is_empty() {
-                    eprintln!("rupi: output parser extracted {} tool call(s) from text", embedded.len());
+                    eprintln!(
+                        "rupi: output parser extracted {} tool call(s) from text",
+                        embedded.len()
+                    );
                     tool_calls = embedded;
                 }
             }
@@ -1097,11 +1233,15 @@ impl AgentSession {
                 let mut cc = self.consecutive_quality_issues.write().await;
                 let max_corrections: u32 = 2;
                 if *cc < max_corrections {
-                    let correction = quality::build_correction_message(&quality::QualityIssue::Truncated);
+                    let correction =
+                        quality::build_correction_message(&quality::QualityIssue::Truncated);
                     self.pending_follow_up.write().await.push(correction);
                     *cc += 1;
                 } else {
-                    eprintln!("rupi: truncation correction suppressed after {} corrections", *cc);
+                    eprintln!(
+                        "rupi: truncation correction suppressed after {} corrections",
+                        *cc
+                    );
                 }
             }
 
@@ -1109,7 +1249,7 @@ impl AgentSession {
             if !tool_calls.is_empty() || !full_content.is_empty() {
                 let known = quality::known_tool_names();
                 let recent = self.recent_tool_calls.read().await.clone();
-                let verdict = quality::assess_response(&full_content, &tool_calls, &recent, &known);
+                let verdict = quality::assess_response(&full_content, &tool_calls, &recent, known);
                 if !verdict.ok {
                     let issue = verdict.reason.as_ref().unwrap();
                     let mut cc = self.consecutive_quality_issues.write().await;
@@ -1121,7 +1261,10 @@ impl AgentSession {
                     let exempt = quality::is_self_limiting(issue);
                     if exempt || *cc < max_corrections {
                         let correction = quality::build_correction_message(issue);
-                        eprintln!("rupi: quality issue detected: {:?} — queuing correction", issue);
+                        eprintln!(
+                            "rupi: quality issue detected: {:?} — queuing correction",
+                            issue
+                        );
                         self.pending_follow_up.write().await.push(correction);
                         if !exempt {
                             *cc += 1;
@@ -1144,31 +1287,16 @@ impl AgentSession {
                 }
             }
 
-            // If quality corrections were queued but no tool calls, process them inline
-            if tool_calls.is_empty() && !self.pending_follow_up.read().await.is_empty() {
-                let drained = self.drain_pending().await;
-                for msg in &drained {
-                    self.messages.write().await.push(msg.clone());
-                    let _ = event_tx.send(AgentEvent::turn_start());
-                    let _ = event_tx.send(AgentEvent::message_start(AgentMessage {
-                        role: "user".to_string(),
-                        content: vec![MessageContent {
-                            content_type: "text".to_string(),
-                            text: Some(msg.content.clone()),
-                        }],
-                        model: None,
-                        usage: None,
-                        stop_reason: None,
-                    }));
-                }
-                continue;
-            }
-
             // If tool calls were made, execute them and continue to next turn
             if !tool_calls.is_empty() {
                 // Add assistant message with tool calls to history
-                let rc = if reasoning_content.is_empty() { None } else { Some(reasoning_content.clone()) };
-                let assistant_msg = Message::tool_call(&full_content, tool_calls.clone()).with_reasoning(rc);
+                let rc = if reasoning_content.is_empty() {
+                    None
+                } else {
+                    Some(reasoning_content.clone())
+                };
+                let assistant_msg =
+                    Message::tool_call(&full_content, tool_calls.clone()).with_reasoning(rc);
                 self.persist_message(&assistant_msg).await;
                 self.messages.write().await.push(assistant_msg);
 
@@ -1197,19 +1325,10 @@ impl AgentSession {
                         tc.arguments.clone(),
                     ));
 
-                    let allowed = {
-                        let guard = self.approval_fn.read().await;
-                        guard.as_ref().map(|f| {
-                            let args_str = serde_json::to_string(&tc.arguments).unwrap_or_default();
-                            f(&tc.name, &args_str)
-                        }).unwrap_or(true)
-                    };
-
-                    let result = if allowed {
-                        tools::execute_tool(tc, &self.tool_context)
-                    } else {
-                        format!("[User denied execution of tool '{}']", tc.name)
-                    };
+                    let approval = self.approval_fn.read().await.clone();
+                    let call = tc.clone();
+                    let context = self.tool_context.clone();
+                    let result = tools::execute_tool_async(call, context, approval).await;
 
                     let _ = event_tx.send(AgentEvent::tool_execution_end(
                         tc.name.clone(),
@@ -1257,7 +1376,7 @@ impl AgentSession {
             }
 
             // No tool calls. If the response is empty (stream failed silently), retry with cap.
-            if full_content.is_empty() && had_stream_events == false {
+            if full_content.is_empty() && !had_stream_events {
                 let mut retries = self.empty_response_retries.lock().await;
                 if *retries >= 5 {
                     return Err(AgentError::Api {
@@ -1274,38 +1393,23 @@ impl AgentSession {
             // No tool calls — this is the final response.
             // Reset empty response retry counter on success
             *self.empty_response_retries.lock().await = 0;
-            // Run auto-compaction check in background (fire-and-forget)
-            let auto_enabled = *self.auto_compaction_enabled.read().await;
-            if auto_enabled {
-                let msgs = self.messages.read().await.clone();
-                let total = compaction::estimate_total_tokens(&msgs);
-                if compaction::should_compact(total, self.context_window) {
-                    // Say why when it doesn't happen. Swallowing the error made a
-                    // failed compaction indistinguishable from one that never
-                    // triggered: the context silently stays over budget and every
-                    // later turn pays to summarize again.
-                    match self.compact().await {
-                        Ok(result) => eprintln!(
-                            "rupi: compacted at ~{} tokens (window {})",
-                            result.tokens_before, self.context_window
-                        ),
-                        Err(e) => eprintln!("rupi: compaction failed: {}", e),
-                    }
-                }
-            }
-
-            let cost_data = if prompt_cost.is_some() || completion_cost.is_some() || total_cost.is_some() {
-                Some(PromptCostData {
-                    prompt_cost,
-                    completion_cost,
-                    total_cost,
-                })
-            } else {
-                None
-            };
+            let cost_data =
+                if prompt_cost.is_some() || completion_cost.is_some() || total_cost.is_some() {
+                    Some(PromptCostData {
+                        prompt_cost,
+                        completion_cost,
+                        total_cost,
+                    })
+                } else {
+                    None
+                };
 
             // Add assistant message to history
-            let rc = if reasoning_content.is_empty() { None } else { Some(reasoning_content.clone()) };
+            let rc = if reasoning_content.is_empty() {
+                None
+            } else {
+                Some(reasoning_content.clone())
+            };
             let assistant_msg = Message::new("assistant", &full_content).with_reasoning(rc);
             self.persist_message(&assistant_msg).await;
             self.messages.write().await.push(assistant_msg);
@@ -1324,7 +1428,11 @@ impl AgentSession {
                     cost: cost_data,
                 }),
                 stop_reason: Some(finish_reason.unwrap_or_else(|| {
-                    if had_stream_events { "stop".to_string() } else { "error".to_string() }
+                    if had_stream_events {
+                        "stop".to_string()
+                    } else {
+                        "error".to_string()
+                    }
                 })),
             }));
             let _ = event_tx.send(AgentEvent::turn_end());
@@ -1364,7 +1472,9 @@ impl AgentSession {
                 let mut compacting = self.is_compacting.lock().await;
                 *compacting = false;
             }
-            return Err(AgentError::Config("Context not full enough to compact".into()));
+            return Err(AgentError::Config(
+                "Context not full enough to compact".into(),
+            ));
         }
 
         // Snip a copy. It sizes the kept tail — more messages survive the same token
@@ -1376,7 +1486,7 @@ impl AgentSession {
         let removed = compaction::snip_old_tool_results(&mut snipped, 6);
         let snipped_len = snipped.len();
 
-        let keep_recent = self.context_window.saturating_div(10).max(1).min(20000);
+        let keep_recent = self.context_window.saturating_div(10).clamp(1, 20000);
         let cut_index = match compaction::find_cut_point(&snipped, keep_recent) {
             Some(i) => i,
             None => {
@@ -1491,7 +1601,10 @@ impl AgentSession {
     /// Queue a follow-up message (processed after current generation finishes).
     pub async fn follow_up(&self, message: &str) {
         self.append_task_anchor(message).await;
-        self.pending_follow_up.write().await.push(message.to_string());
+        self.pending_follow_up
+            .write()
+            .await
+            .push(message.to_string());
     }
 
     /// Check if there are pending steer messages.
@@ -1552,15 +1665,12 @@ impl AgentSession {
     /// where is_streaming=false lets a new prompt() start before the old tool
     /// loop has finished cleaning up.
     pub async fn abort(&self) {
-        let mut signal = self.abort_signal.lock().await;
-        if let Some(tx) = signal.take() {
+        self.tool_context
+            .cancelled
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        *self.abort_requested.lock().await = true;
+        if let Some(tx) = self.abort_signal.lock().await.as_ref() {
             let _ = tx.send(true);
-            // Signal delivered through the watch channel — no need for the flag
-            *self.abort_requested.lock().await = false;
-        } else {
-            // No active stream — set persistent flag so the next iteration
-            // checks and aborts immediately.
-            *self.abort_requested.lock().await = true;
         }
     }
 
@@ -1666,7 +1776,9 @@ impl AgentSession {
     /// Set a goal for durable execution. When set, the agent will loop until
     /// an internal verification prompt confirms the goal is met.
     pub async fn set_goal(&self, goal: Option<String>) {
-        self.tool_context.goal.set(goal, crate::goal::DEFAULT_MAX_ROUNDS);
+        self.tool_context
+            .goal
+            .set(goal, crate::goal::DEFAULT_MAX_ROUNDS);
     }
 
     /// The objective still driving the session, or `None` once it is decided.
@@ -1698,12 +1810,14 @@ impl AgentSession {
     /// repeatedly after each agent_end until cancelled.
     pub async fn set_loop(&self, prompt: Option<String>) {
         *self.loop_prompt.write().await = prompt;
-        self.loop_cancelled.store(false, std::sync::atomic::Ordering::SeqCst);
+        self.loop_cancelled
+            .store(false, std::sync::atomic::Ordering::SeqCst);
     }
 
     /// Cancel the current loop (if any).
     pub async fn cancel_loop(&self) {
-        self.loop_cancelled.store(true, std::sync::atomic::Ordering::SeqCst);
+        self.loop_cancelled
+            .store(true, std::sync::atomic::Ordering::SeqCst);
         *self.loop_prompt.write().await = None;
         self.abort().await;
     }
@@ -1731,11 +1845,20 @@ impl AgentSession {
             .take(6)
             .map(|m| {
                 let content = if m.content.len() > 1000 {
-                    format!("{}... [truncated: {} chars]", &m.content[..1000], m.content.len())
+                    format!(
+                        "{}... [truncated: {} chars]",
+                        &m.content[..1000],
+                        m.content.len()
+                    )
                 } else {
                     m.content.clone()
                 };
-                format!("<{}>\n{}\n</{}>", m.role.to_uppercase(), content, m.role.to_uppercase())
+                format!(
+                    "<{}>\n{}\n</{}>",
+                    m.role.to_uppercase(),
+                    content,
+                    m.role.to_uppercase()
+                )
             })
             .collect::<Vec<_>>()
             .join("\n");
@@ -1797,8 +1920,14 @@ Has the assistant's output satisfied this exact condition? Reply with only YES o
             follow_up_mode: "all".to_string(),
             auto_compaction_enabled: *self.auto_compaction_enabled.read().await,
             message_count: self.messages.read().await.len(),
-            pending_message_count: self.pending_steer.read().await.len() + self.pending_follow_up.read().await.len(),
-            session_file: self.session_path.read().await.as_ref().map(|p| p.to_string_lossy().to_string()),
+            pending_message_count: self.pending_steer.read().await.len()
+                + self.pending_follow_up.read().await.len(),
+            session_file: self
+                .session_path
+                .read()
+                .await
+                .as_ref()
+                .map(|p| p.to_string_lossy().to_string()),
         }
     }
 
@@ -1845,7 +1974,10 @@ mod prefix_cache_tests {
         let prompt = build_system_prompt(&[], &[], false, None);
         let today = chrono::Local::now().format("%Y").to_string();
         assert!(prompt.contains("Current date:"), "date line missing");
-        assert!(prompt.contains(&today), "current year missing from the prompt");
+        assert!(
+            prompt.contains(&today),
+            "current year missing from the prompt"
+        );
     }
 }
 
@@ -1880,8 +2012,14 @@ mod tests {
         let session = create_test_session();
         assert_eq!(session.thinking_level().await, "off");
         assert_eq!(session.cycle_thinking_level().await.as_deref(), Some("low"));
-        assert_eq!(session.cycle_thinking_level().await.as_deref(), Some("medium"));
-        assert_eq!(session.cycle_thinking_level().await.as_deref(), Some("high"));
+        assert_eq!(
+            session.cycle_thinking_level().await.as_deref(),
+            Some("medium")
+        );
+        assert_eq!(
+            session.cycle_thinking_level().await.as_deref(),
+            Some("high")
+        );
         assert_eq!(session.cycle_thinking_level().await.as_deref(), Some("off"));
     }
 
@@ -1962,10 +2100,17 @@ mod tests {
         assert!(!session.is_loop_active().await);
         session.set_loop(Some("test prompt".to_string())).await;
         assert!(session.is_loop_active().await);
-        assert_eq!(*session.loop_prompt.read().await, Some("test prompt".to_string()));
-        assert!(!session.loop_cancelled.load(std::sync::atomic::Ordering::SeqCst));
+        assert_eq!(
+            *session.loop_prompt.read().await,
+            Some("test prompt".to_string())
+        );
+        assert!(!session
+            .loop_cancelled
+            .load(std::sync::atomic::Ordering::SeqCst));
         session.cancel_loop().await;
-        assert!(session.loop_cancelled.load(std::sync::atomic::Ordering::SeqCst));
+        assert!(session
+            .loop_cancelled
+            .load(std::sync::atomic::Ordering::SeqCst));
     }
 
     #[tokio::test]
@@ -1975,6 +2120,8 @@ mod tests {
         assert!(session.is_loop_active().await);
         session.reset().await;
         assert!(!session.is_loop_active().await);
-        assert!(!session.loop_cancelled.load(std::sync::atomic::Ordering::SeqCst));
+        assert!(!session
+            .loop_cancelled
+            .load(std::sync::atomic::Ordering::SeqCst));
     }
 }

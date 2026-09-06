@@ -29,14 +29,39 @@ async fn start_mock_server(
                 Err(_) => break,
             };
 
-            let mut buf = [0; 4096];
-            let _ = socket.read(&mut buf).await;
-
-            // Record the request body
-            let request_str = String::from_utf8_lossy(&buf);
-            let body_start = request_str.find("\r\n\r\n").map(|i| i + 4).unwrap_or(0);
-            let body: String = request_str[body_start..].trim_end_matches('\0').to_string();
-            requests_clone.lock().await.push(body);
+            let mut buf = Vec::new();
+            let body_start = loop {
+                let mut chunk = [0; 4096];
+                let n = socket.read(&mut chunk).await.unwrap();
+                if n == 0 {
+                    return;
+                }
+                buf.extend_from_slice(&chunk[..n]);
+                if let Some(i) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                    break i + 4;
+                }
+            };
+            let headers = String::from_utf8_lossy(&buf[..body_start]);
+            let len: usize = headers
+                .lines()
+                .find_map(|line| {
+                    let (name, value) = line.split_once(':')?;
+                    name.eq_ignore_ascii_case("content-length")
+                        .then(|| value.trim().parse().unwrap())
+                })
+                .unwrap_or(0);
+            while buf.len() < body_start + len {
+                let mut chunk = [0; 4096];
+                let n = socket.read(&mut chunk).await.unwrap();
+                if n == 0 {
+                    break;
+                }
+                buf.extend_from_slice(&chunk[..n]);
+            }
+            requests_clone
+                .lock()
+                .await
+                .push(String::from_utf8_lossy(&buf[body_start..]).into_owned());
 
             // Build chunked SSE response
             let mut response = format!(
@@ -66,7 +91,9 @@ async fn test_mock_server_streaming_response() {
     let chunks = vec![
         sse_chunk(r#"{"choices":[{"delta":{"content":"Hello"},"finish_reason":null}]}"#),
         sse_chunk(r#"{"choices":[{"delta":{"content":" world"},"finish_reason":null}]}"#),
-        sse_chunk(r#"{"choices":[{"delta":{"content":""},"finish_reason":"stop"}],"usage":{"prompt_tokens":10,"completion_tokens":3}}"#),
+        sse_chunk(
+            r#"{"choices":[{"delta":{"content":""},"finish_reason":"stop"}],"usage":{"prompt_tokens":10,"completion_tokens":3}}"#,
+        ),
         "data: [DONE]\n\n".to_string(),
     ];
 
@@ -78,13 +105,27 @@ async fn test_mock_server_streaming_response() {
         model: "gpt-4".into(),
         context_window: 8192,
         timeout_secs: 0,
-            reasoning: false,
+        reasoning: false,
     };
 
     let provider = OpenAIProvider::new(config);
-    let info = provider.model_info();
-    assert_eq!(info.id, "gpt-4");
-    assert_eq!(info.provider, "openai-compatible");
+    let (_cancel, signal) = tokio::sync::watch::channel(false);
+    let mut stream = provider.stream_chat("gpt-4", &[], signal).await.unwrap();
+    let mut text = String::new();
+    let mut usage = None;
+    while let Some(event) = stream.recv().await {
+        match event {
+            rupi::provider::StreamEvent::Delta(delta) => text.push_str(&delta),
+            rupi::provider::StreamEvent::Done(result) => {
+                usage = Some((result.input_tokens, result.output_tokens))
+            }
+            rupi::provider::StreamEvent::Error(error) => panic!("{error}"),
+            _ => {}
+        }
+    }
+    assert_eq!(text, "Hello world");
+    assert_eq!(usage, Some((10, 3)));
+    assert_eq!(_requests.lock().await.len(), 1);
 }
 
 #[tokio::test]
@@ -98,12 +139,23 @@ async fn test_mock_server_error_response() {
         model: "gpt-4".into(),
         context_window: 8192,
         timeout_secs: 0,
-            reasoning: false,
+        reasoning: false,
     };
 
     let provider = OpenAIProvider::new(config);
-    let info = provider.model_info();
-    assert_eq!(info.id, "gpt-4");
+    let (_cancel, signal) = tokio::sync::watch::channel(false);
+    let error = provider
+        .stream_chat("gpt-4", &[], signal)
+        .await
+        .unwrap_err();
+    assert!(matches!(
+        error,
+        rupi::error::AgentError::Api {
+            status_code: 401,
+            ..
+        }
+    ));
+    assert_eq!(_requests.lock().await.len(), 1);
 }
 
 #[tokio::test]
@@ -116,14 +168,16 @@ async fn test_rpc_ping_through_mock_server() {
         model: "gpt-4".into(),
         context_window: 8192,
         timeout_secs: 0,
-            reasoning: false,
+        reasoning: false,
     };
 
     let session = AgentSession::from_config(config);
     let handler = RpcHandler::new(session);
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
 
-    let cmd = RpcCommand::Ping { id: Some("req_1".into()) };
+    let cmd = RpcCommand::Ping {
+        id: Some("req_1".into()),
+    };
     handler.handle(cmd, tx).await;
 
     tokio::time::sleep(std::time::Duration::from_millis(100)).await;
@@ -149,7 +203,7 @@ async fn test_rpc_get_state_through_mock() {
         model: "gpt-4".into(),
         context_window: 128000,
         timeout_secs: 0,
-            reasoning: false,
+        reasoning: false,
     };
 
     let session = AgentSession::from_config(config);
@@ -185,7 +239,7 @@ async fn test_full_rpc_command_flow() {
         model: "gpt-4".into(),
         context_window: 8192,
         timeout_secs: 0,
-            reasoning: false,
+        reasoning: false,
     };
 
     let session = AgentSession::from_config(config);
@@ -193,8 +247,12 @@ async fn test_full_rpc_command_flow() {
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
 
     let commands = vec![
-        RpcCommand::Ping { id: Some("1".into()) },
-        RpcCommand::GetState { id: Some("2".into()) },
+        RpcCommand::Ping {
+            id: Some("1".into()),
+        },
+        RpcCommand::GetState {
+            id: Some("2".into()),
+        },
         RpcCommand::SetThinkingLevel {
             id: Some("3".into()),
             level: "high".into(),

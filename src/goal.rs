@@ -81,7 +81,9 @@ impl GoalRegistry {
 
     /// The active objective, if a goal is set and still running.
     pub fn active_objective(&self) -> Option<String> {
-        self.current().filter(|g| g.status == GoalStatus::Active).map(|g| g.objective)
+        self.current()
+            .filter(|g| g.status == GoalStatus::Active)
+            .map(|g| g.objective)
     }
 
     /// Open round `round` for the current goal. Only the driver calls this.
@@ -104,9 +106,9 @@ impl GoalRegistry {
     /// Report the current goal to the model.
     pub fn read_goal(&self) -> GoalToolResult {
         match self.current() {
-            None => {
-                Err("No goal is set. The goal tool only applies while a goal is active.".to_string())
-            }
+            None => Err(
+                "No goal is set. The goal tool only applies while a goal is active.".to_string(),
+            ),
             Some(state) => Ok(format!(
                 "Objective: {}\nRound: {}/{}\nStatus: {}",
                 state.objective,
@@ -176,10 +178,16 @@ Keep working and decide inside the current round.",
         state.decided_round = round;
         Ok(match status {
             GoalStatus::Complete => {
-                format!("Goal marked complete in round {}. The driver will stop.", round)
+                format!(
+                    "Goal marked complete in round {}. The driver will stop.",
+                    round
+                )
             }
             GoalStatus::Blocked => {
-                format!("Goal marked blocked in round {}. The driver will stop.", round)
+                format!(
+                    "Goal marked blocked in round {}. The driver will stop.",
+                    round
+                )
             }
             GoalStatus::Active => unreachable!("decide is never called with Active"),
         })
@@ -250,18 +258,30 @@ mod tests {
     fn a_second_decision_is_rejected() {
         let registry = running("ship it", 1);
         assert!(registry.complete(1).is_ok());
-        assert!(registry.complete(1).unwrap_err().contains("already complete"));
-        assert!(registry.block(1, "changed my mind").unwrap_err().contains("already complete"));
+        assert!(registry
+            .complete(1)
+            .unwrap_err()
+            .contains("already complete"));
+        assert!(registry
+            .block(1, "changed my mind")
+            .unwrap_err()
+            .contains("already complete"));
     }
 
     #[test]
     fn block_requires_a_reason() {
         let registry = running("ship it", 1);
-        assert!(registry.block(1, "   ").unwrap_err().contains("`reason` is required"));
+        assert!(registry
+            .block(1, "   ")
+            .unwrap_err()
+            .contains("`reason` is required"));
         assert!(registry.block(1, "the API key is missing").is_ok());
         let state = registry.current().unwrap();
         assert_eq!(state.status, GoalStatus::Blocked);
-        assert_eq!(state.block_reason.as_deref(), Some("the API key is missing"));
+        assert_eq!(
+            state.block_reason.as_deref(),
+            Some("the API key is missing")
+        );
     }
 
     #[test]

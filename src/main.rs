@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use rupi::agent::session::{self as agent_session, ApprovalFn, AgentSession};
+use rupi::agent::session::{self as agent_session, AgentSession, ApprovalFn};
 use rupi::cli::Cli;
 use rupi::config::RupiConfig;
 use rupi::provider::openai::OpenAIConfig;
@@ -8,11 +8,11 @@ use rupi::rpc::handler::RpcHandler;
 use rupi::rpc::types::RpcCommand;
 use rupi::sessions;
 use rupi::skills;
-use rupi::tools;
 use rupi::skills::Skill;
+use rupi::tools;
 
 use clap::Parser;
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, stdin, stdout};
+use tokio::io::{stdin, stdout, AsyncBufReadExt, AsyncWriteExt, BufReader};
 
 #[tokio::main]
 async fn main() {
@@ -40,7 +40,9 @@ async fn main() {
             // If opencode provider was specified via CLI, we can work without the full config
             if cli.list_opencode_models {
                 eprintln!("rupi: no config file found, but --list-opencode-models specified");
-                eprintln!("rupi: create ~/.config/rupi.json with: {{\"opencode_api_key\": \"...\"}}");
+                eprintln!(
+                    "rupi: create ~/.config/rupi.json with: {{\"opencode_api_key\": \"...\"}}"
+                );
                 // We still need the API key — try env var
                 RupiConfig {
                     base_url: None,
@@ -69,12 +71,16 @@ async fn main() {
 
     // Handle --list-opencode-models early
     if cli.list_opencode_models {
-        let provider_id = match file_config.opencode_provider.as_deref().unwrap_or(&cli.opencode_provider) {
+        let provider_id = match file_config
+            .opencode_provider
+            .as_deref()
+            .unwrap_or(&cli.opencode_provider)
+        {
             "zen" => "opencode",
             _ => "opencode-go",
         };
-        let models = rupi::opencode_models::fetch_opencode_models(provider_id)
-            .unwrap_or_else(|e| {
+        let models =
+            rupi::opencode_models::fetch_opencode_models(provider_id).unwrap_or_else(|e| {
                 eprintln!("Error fetching opencode models: {}", e);
                 std::process::exit(1);
             });
@@ -101,7 +107,10 @@ async fn main() {
     };
 
     let model = if file_config.opencode_api_key.is_some() {
-        cli.model.as_deref().unwrap_or("deepseek-v4-flash").to_string()
+        cli.model
+            .as_deref()
+            .unwrap_or("deepseek-v4-flash")
+            .to_string()
     } else if let Some(m) = cli.model.as_deref() {
         m.to_string()
     } else {
@@ -150,7 +159,10 @@ async fn main() {
         } else {
             println!("Saved sessions:");
             for s in &sessions {
-                println!("  {}  {}  {} messages  {}", s.id, s.model, s.message_count, s.created_at);
+                println!(
+                    "  {}  {}  {} messages  {}",
+                    s.id, s.model, s.message_count, s.created_at
+                );
             }
         }
         return;
@@ -162,7 +174,17 @@ async fn main() {
     match cli.mode() {
         "rpc" => run_rpc_mode(openai_config, loaded_skills, context_files, session_id).await,
         "raw" => run_raw_mode(openai_config, loaded_skills, context_files, session_id).await,
-        _ => run_interactive_mode(openai_config, loaded_skills, context_files, cli.disable_yolo, memory, session_id).await,
+        _ => {
+            run_interactive_mode(
+                openai_config,
+                loaded_skills,
+                context_files,
+                cli.disable_yolo,
+                memory,
+                session_id,
+            )
+            .await
+        }
     }
 }
 
@@ -179,24 +201,31 @@ async fn resolve_session(
         if !sid.is_empty() {
             // Not found means "start this session", not "start some other one":
             // the caller named it, so claim that name.
-            let existing = sessions::find_session_path(sid).or_else(|| {
-                match sessions::create_session_with_id(sid, &config.model) {
-                    Ok(path) => {
-                        eprintln!("rupi: starting session {}", sid);
-                        Some(path)
-                    }
-                    Err(e) => {
-                        eprintln!("rupi: cannot create session '{}': {}", sid, e);
-                        None
-                    }
-                }
-            });
+            let existing =
+                sessions::find_session_path(sid).or_else(
+                    || match sessions::create_session_with_id(sid, &config.model) {
+                        Ok(path) => {
+                            eprintln!("rupi: starting session {}", sid);
+                            Some(path)
+                        }
+                        Err(e) => {
+                            eprintln!("rupi: cannot create session '{}': {}", sid, e);
+                            None
+                        }
+                    },
+                );
             if let Some(path) = existing {
                 eprintln!("rupi: using session {}", sid);
                 match AgentSession::from_session(
-                    config.clone(), path, cwd.to_string(),
-                    skills.to_vec(), context_files.to_vec(), memory,
-                ).await {
+                    config.clone(),
+                    path,
+                    cwd.to_string(),
+                    skills.to_vec(),
+                    context_files.to_vec(),
+                    memory,
+                )
+                .await
+                {
                     Ok(session) => return session,
                     Err(e) => eprintln!("rupi: failed to resume session: {}", e),
                 }
@@ -205,7 +234,13 @@ async fn resolve_session(
             }
         }
     }
-    AgentSession::from_config_with(config.clone(), cwd.to_string(), skills.to_vec(), context_files.to_vec(), memory)
+    AgentSession::from_config_with(
+        config.clone(),
+        cwd.to_string(),
+        skills.to_vec(),
+        context_files.to_vec(),
+        memory,
+    )
 }
 
 async fn run_rpc_mode(
@@ -276,9 +311,8 @@ async fn run_interactive_mode(
         .unwrap_or_default()
         .to_string_lossy()
         .to_string();
-    let session = Arc::new(
-        resolve_session(&config, session_id, &cwd, &skills, &context_files, memory).await,
-    );
+    let session =
+        Arc::new(resolve_session(&config, session_id, &cwd, &skills, &context_files, memory).await);
 
     if disable_yolo {
         use std::io::Write;
@@ -289,7 +323,9 @@ async fn run_interactive_mode(
             let _ = std::io::stdout().flush();
             line.clear();
             match std::io::stdin().read_line(&mut line) {
-                Ok(_) => line.trim().eq_ignore_ascii_case("y") || line.trim().eq_ignore_ascii_case("yes"),
+                Ok(_) => {
+                    line.trim().eq_ignore_ascii_case("y") || line.trim().eq_ignore_ascii_case("yes")
+                }
                 Err(_) => false,
             }
         });
@@ -309,9 +345,8 @@ async fn run_raw_mode(
         .unwrap_or_default()
         .to_string_lossy()
         .to_string();
-    let session = Arc::new(
-        resolve_session(&config, session_id, &cwd, &skills, &context_files, false).await,
-    );
+    let session =
+        Arc::new(resolve_session(&config, session_id, &cwd, &skills, &context_files, false).await);
     rupi::modes::raw::run_raw(session).await;
 }
 
@@ -321,19 +356,19 @@ mod tests {
 
     #[test]
     fn test_cli_default_mode() {
-        let cli = Cli::parse_from(&["rupi"]);
+        let cli = Cli::parse_from(["rupi"]);
         assert_eq!(cli.mode(), "interactive");
     }
 
     #[test]
     fn test_cli_rpc_mode() {
-        let cli = Cli::parse_from(&["rupi", "--rpc"]);
+        let cli = Cli::parse_from(["rupi", "--rpc"]);
         assert_eq!(cli.mode(), "rpc");
     }
 
     #[test]
     fn test_cli_raw_mode() {
-        let cli = Cli::parse_from(&["rupi", "--raw"]);
+        let cli = Cli::parse_from(["rupi", "--raw"]);
         assert_eq!(cli.mode(), "raw");
     }
 }

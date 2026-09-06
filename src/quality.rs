@@ -166,7 +166,10 @@ pub fn assess_response(
         };
     }
 
-    QualityVerdict { ok: true, reason: None }
+    QualityVerdict {
+        ok: true,
+        reason: None,
+    }
 }
 
 /// Trim a canonical argument string to the reminder preview budget.
@@ -178,7 +181,11 @@ fn preview(arguments: &str) -> String {
     while end > 0 && !arguments.is_char_boundary(end) {
         end -= 1;
     }
-    format!("{}... [{} more chars]", &arguments[..end], arguments.len() - end)
+    format!(
+        "{}... [{} more chars]",
+        &arguments[..end],
+        arguments.len() - end
+    )
 }
 
 /// Build a correction message to nudge the model back on track.
@@ -203,7 +210,7 @@ pub fn build_correction_message(issue: &QualityIssue) -> String {
             // transient failure does not need a lecture. Later rungs name the tool,
             // the run length, and the exact arguments, because by then the model has
             // ignored the gentle note and needs the specifics to break out.
-            if Some(count) == REPEAT_THRESHOLDS.first().map(|t| t) {
+            if Some(count) == REPEAT_THRESHOLDS.first() {
                 "You are repeating the exact same tool call with identical arguments. \
                  Carefully analyze the previous result before calling again: if the task is \
                  not complete, try a different approach or different arguments instead of \
@@ -250,7 +257,12 @@ pub fn known_tool_names() -> &'static [&'static str] {
     // once: this runs on every assistant response, and `all_tools` rebuilds ten
     // JSON schemas each call.
     static NAMES: std::sync::OnceLock<Vec<&'static str>> = std::sync::OnceLock::new();
-    NAMES.get_or_init(|| crate::tools::all_tools().into_iter().map(|t| t.name).collect())
+    NAMES.get_or_init(|| {
+        crate::tools::all_tools()
+            .into_iter()
+            .map(|t| t.name)
+            .collect()
+    })
 }
 
 #[cfg(test)]
@@ -279,13 +291,21 @@ mod tests {
         let calls = vec![tc("nonexistent_tool", json!({}))];
         let v = assess_response("hello", &calls, &[], &["bash", "read"]);
         assert!(!v.ok);
-        assert_eq!(v.reason, Some(QualityIssue::Hallucinated("nonexistent_tool".into())));
+        assert_eq!(
+            v.reason,
+            Some(QualityIssue::Hallucinated("nonexistent_tool".into()))
+        );
     }
 
     #[test]
     fn test_valid_response_passes() {
         let calls = vec![tc("bash", json!({"command": "ls"}))];
-        let v = assess_response("Running...", &calls, &[], &["bash", "read", "write", "edit"]);
+        let v = assess_response(
+            "Running...",
+            &calls,
+            &[],
+            &["bash", "read", "write", "edit"],
+        );
         assert!(v.ok);
     }
 
@@ -307,7 +327,9 @@ mod tests {
         let v = assess_response("", &calls, &recent, &["bash", "read"]);
         assert!(!v.ok);
         match v.reason {
-            Some(QualityIssue::Repeat { count, ref tool, .. }) => {
+            Some(QualityIssue::Repeat {
+                count, ref tool, ..
+            }) => {
                 assert_eq!(count, 3);
                 assert_eq!(tool, "bash");
             }

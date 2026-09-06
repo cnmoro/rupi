@@ -90,7 +90,8 @@ fn filter_git_status(output: &str) -> String {
             || trimmed.starts_with("(use `")
             || trimmed.starts_with("(fix conflicts")
             || trimmed.contains("no changes added to commit")
-            || trimmed == "nothing added to commit but untracked files present (use \"git add\" to track)"
+            || trimmed
+                == "nothing added to commit but untracked files present (use \"git add\" to track)"
             || trimmed == "nothing to commit, working tree clean"
             || trimmed.starts_with("Changes not staged for commit:")
             || trimmed.starts_with("Changes to be committed:")
@@ -109,20 +110,31 @@ fn filter_git_status(output: &str) -> String {
             continue;
         }
         // File status lines (look for "modified:" / "new file:" / "deleted:" patterns)
-        if trimmed.contains("modified:") || trimmed.contains("new file:") || trimmed.contains("deleted:") || trimmed.contains("renamed:") {
+        if trimmed.contains("modified:")
+            || trimmed.contains("new file:")
+            || trimmed.contains("deleted:")
+            || trimmed.contains("renamed:")
+        {
             // Extract file path after the colon+space
             if let Some(pos) = trimmed.rfind(':') {
                 let file = trimmed[pos + 1..].trim().to_string();
                 if !file.is_empty() {
-                    changes.push(if trimmed.starts_with("modified:") || line.trim().starts_with("\tmodified") {
-                        format!(" M {}", file)
-                    } else if trimmed.starts_with("new file:") || line.trim().starts_with("\tnew file") {
-                        format!(" A {}", file)
-                    } else if trimmed.starts_with("deleted:") || line.trim().starts_with("\tdeleted") {
-                        format!(" D {}", file)
-                    } else {
-                        format!("  {}", file)
-                    });
+                    changes.push(
+                        if trimmed.starts_with("modified:") || line.trim().starts_with("\tmodified")
+                        {
+                            format!(" M {}", file)
+                        } else if trimmed.starts_with("new file:")
+                            || line.trim().starts_with("\tnew file")
+                        {
+                            format!(" A {}", file)
+                        } else if trimmed.starts_with("deleted:")
+                            || line.trim().starts_with("\tdeleted")
+                        {
+                            format!(" D {}", file)
+                        } else {
+                            format!("  {}", file)
+                        },
+                    );
                 }
             }
             continue;
@@ -142,8 +154,10 @@ fn filter_git_status(output: &str) -> String {
             continue;
         }
         // Modified/Created/Deleted header counts
-        if trimmed.contains("file changed") || trimmed.contains("files changed")
-            || trimmed.contains("insertion") || trimmed.contains("deletion")
+        if trimmed.contains("file changed")
+            || trimmed.contains("files changed")
+            || trimmed.contains("insertion")
+            || trimmed.contains("deletion")
         {
             continue;
         }
@@ -187,7 +201,10 @@ fn filter_git_status(output: &str) -> String {
         match status {
             '?' => untracked.push(file),
             'M' | 'A' | 'D' | 'R' => staged.push(Change { status, file }),
-            ' ' | 'm' | 'a' | 'd' => unstaged.push(Change { status: bytes[0] as char, file }),
+            ' ' | 'm' | 'a' | 'd' => unstaged.push(Change {
+                status: bytes[0] as char,
+                file,
+            }),
             _ => {}
         }
     }
@@ -244,13 +261,10 @@ fn filter_git_diff(output: &str) -> String {
             continue;
         }
         // Keep hunk headers and +/- lines (strip context lines)
-        if line.starts_with("@@ ") {
-            result.push_str(line);
-            result.push('\n');
-        } else if line.starts_with('+') && !line.starts_with("+++") {
-            result.push_str(line);
-            result.push('\n');
-        } else if line.starts_with('-') && !line.starts_with("---") {
+        if line.starts_with("@@ ")
+            || (line.starts_with('+') && !line.starts_with("+++"))
+            || (line.starts_with('-') && !line.starts_with("---"))
+        {
             result.push_str(line);
             result.push('\n');
         }
@@ -267,7 +281,13 @@ fn filter_git_log(output: &str) -> String {
     let mut result = String::new();
     for line in output.lines() {
         // Keep lines that look like oneline format (hash + message)
-        if line.len() > 8 && line.as_bytes().iter().take(7).all(|b| b.is_ascii_hexdigit()) {
+        if line.len() > 8
+            && line
+                .as_bytes()
+                .iter()
+                .take(7)
+                .all(|b| b.is_ascii_hexdigit())
+        {
             result.push_str(line);
             result.push('\n');
         }
@@ -299,8 +319,7 @@ fn filter_git_commit(output: &str) -> String {
                 if let Some(hash_start) = bracket.rfind(' ') {
                     let hash = bracket[hash_start + 1..].trim();
                     if hash.len() >= 7 {
-                        return format!("ok {} [savings: ~95%]",
-                            &hash[..7.min(hash.len())]);
+                        return format!("ok {} [savings: ~95%]", &hash[..7.min(hash.len())]);
                     }
                 }
             }
@@ -344,13 +363,8 @@ fn filter_git_branch(output: &str) -> String {
         if t.is_empty() {
             continue;
         }
-        if t.starts_with("* ") || t.starts_with("  ") || t.starts_with('+') {
-            result.push_str(t);
-            result.push('\n');
-        } else {
-            result.push_str(t);
-            result.push('\n');
-        }
+        result.push_str(t);
+        result.push('\n');
     }
     result
 }
@@ -401,7 +415,9 @@ fn filter_cargo_test(output: &str) -> String {
             passed += 1;
             continue; // skip passing tests
         }
-        if trimmed.contains("test ") && (trimmed.contains(" ... FAILED") || trimmed.contains("...FAILED")) {
+        if trimmed.contains("test ")
+            && (trimmed.contains(" ... FAILED") || trimmed.contains("...FAILED"))
+        {
             test_count += 1;
             failed += 1;
             continue; // will be shown in failure block
@@ -417,7 +433,9 @@ fn filter_cargo_test(output: &str) -> String {
         }
 
         if in_failure {
-            if trimmed.starts_with("----") || trimmed.is_empty() && failure_block.lines().count() > 1 {
+            if trimmed.starts_with("----")
+                || trimmed.is_empty() && failure_block.lines().count() > 1
+            {
                 // End of failure block
                 in_failure = false;
                 if failure_count < 10 {
@@ -447,7 +465,10 @@ fn filter_cargo_test(output: &str) -> String {
             if let Some(rest) = clean.strip_prefix("test result: ") {
                 for part in rest.split(';').map(|s| s.trim()) {
                     let part_trimmed = part.trim();
-                    if let Some(num_str) = part_trimmed.split(' ').find(|p| p.chars().all(|c| c.is_ascii_digit())) {
+                    if let Some(num_str) = part_trimmed
+                        .split(' ')
+                        .find(|p| p.chars().all(|c| c.is_ascii_digit()))
+                    {
                         if let Ok(n) = num_str.parse::<u32>() {
                             if part_trimmed.contains("passed") {
                                 passed = n;
@@ -462,7 +483,10 @@ fn filter_cargo_test(output: &str) -> String {
         }
 
         // Pass through errors
-        if trimmed.starts_with("error[") || trimmed.starts_with("error:") || trimmed.starts_with("error:") {
+        if trimmed.starts_with("error[")
+            || trimmed.starts_with("error:")
+            || trimmed.starts_with("error:")
+        {
             result.push_str(line);
             result.push('\n');
         }
@@ -476,15 +500,19 @@ fn filter_cargo_test(output: &str) -> String {
 
     // If no failures and no summary, try to produce one
     if !has_summary && test_count > 0 {
-        result.push_str(&format!("test result: {} passed, {} failed ({} tests total)\n", passed, failed, test_count));
+        result.push_str(&format!(
+            "test result: {} passed, {} failed ({} tests total)\n",
+            passed, failed, test_count
+        ));
     }
 
     // If all passed, condense to single line
     if failed == 0 && has_summary {
         // Already have summary line, but strip any passing test noise
-        let lines: Vec<&str> = result.lines().filter(|l| {
-            !l.contains("test ... ok")
-        }).collect();
+        let lines: Vec<&str> = result
+            .lines()
+            .filter(|l| !l.contains("test ... ok"))
+            .collect();
         result = lines.join("\n");
         if !result.ends_with('\n') {
             result.push('\n');
@@ -527,7 +555,10 @@ fn filter_cargo_build(output: &str) -> String {
             continue;
         }
 
-        if trimmed.starts_with("Finished ") || trimmed.starts_with("Downloading ") || trimmed.starts_with("   Downloading") {
+        if trimmed.starts_with("Finished ")
+            || trimmed.starts_with("Downloading ")
+            || trimmed.starts_with("   Downloading")
+        {
             continue;
         }
 
@@ -543,7 +574,11 @@ fn filter_cargo_build(output: &str) -> String {
         }
 
         if !block.is_empty() {
-            let ends = trimmed.starts_with("error[") || trimmed.starts_with("error:") || trimmed.starts_with("warning[") || trimmed.starts_with("warning:") || (trimmed.is_empty() && block.lines().count() > 1);
+            let ends = trimmed.starts_with("error[")
+                || trimmed.starts_with("error:")
+                || trimmed.starts_with("warning[")
+                || trimmed.starts_with("warning:")
+                || (trimmed.is_empty() && block.lines().count() > 1);
             if ends {
                 if block_type == "error" && error_count <= 10 {
                     result.push_str(&block);
@@ -609,7 +644,10 @@ fn filter_cargo_build(output: &str) -> String {
         summary.push_str(&format!("[+ {} more errors not shown]\n", error_count - 10));
     }
     if warning_count > shown_warnings {
-        summary.push_str(&format!("[+ {} more warnings not shown]\n", warning_count - shown_warnings));
+        summary.push_str(&format!(
+            "[+ {} more warnings not shown]\n",
+            warning_count - shown_warnings
+        ));
     }
 
     result = summary + &result;
@@ -705,11 +743,19 @@ fn filter_ls(output: &str) -> Option<String> {
     }
 
     let savings = if lines.len() > 10 {
-        format!(" [savings: ~{}%]", (lines.len() - result.lines().count()) * 100 / lines.len().max(1))
+        format!(
+            " [savings: ~{}%]",
+            (lines.len() - result.lines().count()) * 100 / lines.len().max(1)
+        )
     } else {
         String::new()
     };
-    result.push_str(&format!("Summary: {} files, {} dirs{}", files.len(), dirs.len(), savings));
+    result.push_str(&format!(
+        "Summary: {} files, {} dirs{}",
+        files.len(),
+        dirs.len(),
+        savings
+    ));
 
     Some(result)
 }
@@ -739,7 +785,10 @@ fn filter_find(output: &str) -> Option<String> {
                 .unwrap_or_else(|| t.to_string());
             by_dir.entry(dir).or_default().push(name);
         } else {
-            by_dir.entry(".".to_string()).or_default().push(t.to_string());
+            by_dir
+                .entry(".".to_string())
+                .or_default()
+                .push(t.to_string());
         }
     }
 
@@ -762,11 +811,7 @@ fn filter_find(output: &str) -> Option<String> {
     // Show top dirs
     let mut dirs: Vec<(&String, &Vec<String>)> = by_dir.iter().collect();
     dirs.sort_by_key(|(d, _)| d.len());
-    let mut shown = 0u32;
-    for (dir, names) in &dirs {
-        if shown >= 20 {
-            break;
-        }
+    for (dir, names) in dirs.iter().take(20) {
         if names.len() == 1 {
             result.push_str(&format!("{}/{}\n", dir, names[0]));
         } else {
@@ -778,7 +823,6 @@ fn filter_find(output: &str) -> Option<String> {
                 result.push_str(&format!("  ... +{} more\n", names.len() - 5));
             }
         }
-        shown += 1;
     }
     if dirs.len() > 20 {
         result.push_str(&format!("... +{} more directories\n", dirs.len() - 20));
@@ -789,7 +833,11 @@ fn filter_find(output: &str) -> Option<String> {
     exts.sort_by(|a, b| b.1.cmp(a.1));
     if !exts.is_empty() {
         result.push_str("Extensions: ");
-        let ext_parts: Vec<String> = exts.iter().take(5).map(|(e, c)| format!("{}({})", e, c)).collect();
+        let ext_parts: Vec<String> = exts
+            .iter()
+            .take(5)
+            .map(|(e, c)| format!("{}({})", e, c))
+            .collect();
         result.push_str(&ext_parts.join(", "));
         if exts.len() > 5 {
             result.push_str(&format!(", +{} more", exts.len() - 5));
@@ -863,7 +911,10 @@ fn filter_generic(output: &str) -> String {
     let new_lines = result.lines().count();
     if new_lines > 0 && original_lines > new_lines {
         let pct = (original_lines - new_lines) * 100 / original_lines.max(1);
-        result.push_str(&format!("[filtered: {} lines -> {} ({}% savings)]", original_lines, new_lines, pct));
+        result.push_str(&format!(
+            "[filtered: {} lines -> {} ({}% savings)]",
+            original_lines, new_lines, pct
+        ));
     }
 
     result
@@ -877,7 +928,9 @@ fn strip_ansi(s: &str) -> String {
         if in_escape {
             if c == 'm' || c == 'H' || c == 'J' || c == 'K' || (c as u8) < 0x20 {
                 in_escape = false;
-                if c == 'm' { continue; }
+                if c == 'm' {
+                    continue;
+                }
             }
             continue;
         }
@@ -908,7 +961,11 @@ mod tests {
         let filtered = filter_git_status(out);
         assert!(!filtered.contains("(use \""));
         assert!(filtered.contains("src/main.rs") || filtered.contains("main.rs"));
-        assert!(filtered.contains("staged") || filtered.contains("unstaged") || filtered.contains("untracked"));
+        assert!(
+            filtered.contains("staged")
+                || filtered.contains("unstaged")
+                || filtered.contains("untracked")
+        );
     }
 
     #[test]

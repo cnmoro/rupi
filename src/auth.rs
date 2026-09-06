@@ -88,33 +88,21 @@ mod tests {
 
     #[test]
     fn test_resolve_from_sources_cli() {
-        let result = resolve_api_key_from_sources(
-            "config-key",
-            "TEST_ENV_KEY",
-            Some("cli-key"),
-        );
+        let result = resolve_api_key_from_sources("config-key", "TEST_ENV_KEY", Some("cli-key"));
         assert_eq!(result, "cli-key");
     }
 
     #[test]
     fn test_resolve_from_sources_env() {
         std::env::set_var("TEST_AUTH_ENV", "env-key");
-        let result = resolve_api_key_from_sources(
-            "config-key",
-            "TEST_AUTH_ENV",
-            None,
-        );
+        let result = resolve_api_key_from_sources("config-key", "TEST_AUTH_ENV", None);
         assert_eq!(result, "env-key");
         std::env::remove_var("TEST_AUTH_ENV");
     }
 
     #[test]
     fn test_resolve_from_sources_config() {
-        let result = resolve_api_key_from_sources(
-            "config-key",
-            "NONEXISTENT_ENV_VAR_12345",
-            None,
-        );
+        let result = resolve_api_key_from_sources("config-key", "NONEXISTENT_ENV_VAR_12345", None);
         assert_eq!(result, "config-key");
     }
 

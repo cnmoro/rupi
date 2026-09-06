@@ -80,7 +80,10 @@ impl TodoStore {
 
     /// A copy of the current list.
     pub fn snapshot(&self) -> Vec<TodoItem> {
-        self.items.read().map(|list| list.clone()).unwrap_or_default()
+        self.items
+            .read()
+            .map(|list| list.clone())
+            .unwrap_or_default()
     }
 
     /// Replace the whole list.
@@ -89,7 +92,10 @@ impl TodoStore {
     /// with two active steps tells the reader nothing about what the agent is doing
     /// now.
     pub fn replace(&self, items: Vec<TodoItem>) -> Result<String, String> {
-        let active = items.iter().filter(|i| i.status == Status::InProgress).count();
+        let active = items
+            .iter()
+            .filter(|i| i.status == Status::InProgress)
+            .count();
         if active > 1 {
             return Err(format!(
                 "Rejected: {} todos are in_progress. Keep AT MOST ONE in_progress at a time. \
@@ -129,7 +135,10 @@ fn render_list(items: &[TodoItem]) -> String {
     if items.is_empty() {
         return "Todo list cleared. No tasks are tracked.".to_string();
     }
-    let done = items.iter().filter(|i| i.status == Status::Completed).count();
+    let done = items
+        .iter()
+        .filter(|i| i.status == Status::Completed)
+        .count();
     let mut out = format!("Todo list updated ({}/{} complete):\n", done, items.len());
     for item in items {
         out.push_str(&format!("{} {}\n", item.status.marker(), item.content));
@@ -153,14 +162,20 @@ pub fn parse_items(value: &serde_json::Value) -> Result<Vec<TodoItem>, String> {
             .get("content")
             .and_then(|c| c.as_str())
             .ok_or_else(|| format!("Rejected: todo {} has no `content` string.", index))?;
-        let raw_status = entry.get("status").and_then(|s| s.as_str()).unwrap_or("pending");
+        let raw_status = entry
+            .get("status")
+            .and_then(|s| s.as_str())
+            .unwrap_or("pending");
         let status = Status::parse(raw_status).ok_or_else(|| {
             format!(
                 "Rejected: todo {} has status {:?}. Use pending, in_progress, or completed.",
                 index, raw_status
             )
         })?;
-        items.push(TodoItem { content: content.to_string(), status });
+        items.push(TodoItem {
+            content: content.to_string(),
+            status,
+        });
     }
     Ok(items)
 }
@@ -171,7 +186,10 @@ mod tests {
     use serde_json::json;
 
     fn item(content: &str, status: Status) -> TodoItem {
-        TodoItem { content: content.to_string(), status }
+        TodoItem {
+            content: content.to_string(),
+            status,
+        }
     }
 
     #[test]
@@ -183,7 +201,10 @@ mod tests {
         ]);
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("AT MOST ONE"));
-        assert!(store.snapshot().is_empty(), "a rejected call must not mutate the list");
+        assert!(
+            store.snapshot().is_empty(),
+            "a rejected call must not mutate the list"
+        );
     }
 
     #[test]
@@ -259,12 +280,16 @@ mod tests {
     #[test]
     fn a_store_tracks_its_own_list() {
         let store = TodoStore::new();
-        store.replace(vec![item("only", Status::InProgress)]).unwrap();
+        store
+            .replace(vec![item("only", Status::InProgress)])
+            .unwrap();
         assert_eq!(store.snapshot().len(), 1);
         assert!(!store.all_complete());
         assert!(store.render_current().is_some());
 
-        store.replace(vec![item("only", Status::Completed)]).unwrap();
+        store
+            .replace(vec![item("only", Status::Completed)])
+            .unwrap();
         assert!(store.all_complete());
 
         store.reset();
@@ -285,9 +310,14 @@ mod tests {
     fn replace_is_whole_list_replacement() {
         let store = TodoStore::new();
         store
-            .replace(vec![item("one", Status::Pending), item("two", Status::Pending)])
+            .replace(vec![
+                item("one", Status::Pending),
+                item("two", Status::Pending),
+            ])
             .unwrap();
-        store.replace(vec![item("three", Status::InProgress)]).unwrap();
+        store
+            .replace(vec![item("three", Status::InProgress)])
+            .unwrap();
         let items = store.snapshot();
         assert_eq!(items.len(), 1);
         assert_eq!(items[0].content, "three");

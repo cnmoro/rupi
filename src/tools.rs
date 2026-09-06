@@ -1,8 +1,7 @@
-use std::io::Read;
+use serde_json::Value;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use serde_json::Value;
 
 /// Bounds for the bash tool's per-command timeout, in seconds.
 ///
@@ -70,6 +69,7 @@ pub struct ToolCall {
 /// cannot overwrite each other's plan or objective.
 #[derive(Debug, Default, Clone)]
 pub struct ToolContext {
+    pub cancelled: Arc<AtomicBool>,
     pub todos: std::sync::Arc<crate::todo::TodoStore>,
     pub goal: std::sync::Arc<crate::goal::GoalRegistry>,
 }
@@ -257,7 +257,7 @@ pub fn serialize_tools(tools: &[ToolDef]) -> Vec<Value> {
 /// Execute a tool call and return the result.
 pub fn execute_tool(tool_call: &ToolCall, ctx: &ToolContext) -> String {
     match tool_call.name.as_str() {
-        "bash" => execute_bash(&tool_call.arguments),
+        "bash" => execute_bash_with_cancel(&tool_call.arguments, ctx.cancelled.clone()),
         "read" => execute_read(&tool_call.arguments),
         "write" => execute_write(tool_call),
         "edit" => execute_edit(&tool_call.arguments),
@@ -269,6 +269,45 @@ pub fn execute_tool(tool_call: &ToolCall, ctx: &ToolContext) -> String {
         "goal" => execute_goal(&tool_call.arguments, ctx),
         _ => format!("Unknown tool: {}", tool_call.name),
     }
+}
+
+/// Keep blocking tools and approval callbacks off Tokio's IO workers. The global
+/// permit bounds concurrent filesystem/indexing work across embedded sessions.
+pub async fn execute_tool_async(
+    call: ToolCall,
+    context: ToolContext,
+    approval: Option<crate::agent::session::ApprovalFn>,
+) -> String {
+    static WORKERS: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(4);
+    let cancellation = async {
+        while !context.cancelled.load(Ordering::SeqCst) {
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+    };
+    let permit = tokio::select! {
+        permit = WORKERS.acquire() => permit.expect("tool semaphore remains open"),
+        _ = cancellation => return "[cancelled]".into(),
+    };
+    tokio::task::spawn_blocking(move || {
+        // Keep the slot occupied until the actual blocking work finishes, even
+        // if the async caller is dropped.
+        let _permit = permit;
+        if context.cancelled.load(Ordering::SeqCst) {
+            return "[cancelled]".into();
+        }
+        if let Some(approval) = approval {
+            let args = serde_json::to_string(&call.arguments).unwrap_or_default();
+            if !approval(&call.name, &args) {
+                return format!("[User denied execution of tool '{}']", call.name);
+            }
+        }
+        if context.cancelled.load(Ordering::SeqCst) {
+            return "[cancelled]".into();
+        }
+        execute_tool(&call, &context)
+    })
+    .await
+    .unwrap_or_else(|e| format!("Tool execution failed: {e}"))
 }
 
 fn get_arg<'a>(args: &'a Value, name: &str) -> Option<&'a str> {
@@ -299,142 +338,136 @@ fn resolve_path(path_str: &str) -> PathBuf {
 }
 
 // ---- bash ----
+#[cfg(test)]
 fn execute_bash(args: &Value) -> String {
-    let command = match get_arg(args, "command") {
-        Some(cmd) => cmd,
-        None => return "Error: missing 'command' argument".to_string(),
+    execute_bash_with_cancel(args, Arc::new(AtomicBool::new(false)))
+}
+
+fn execute_bash_with_cancel(args: &Value, cancelled: Arc<AtomicBool>) -> String {
+    // Called on a blocking worker; a local IO runtime lets us cancel pipe reads
+    // portably without leaving threads parked behind background children.
+    std::thread::scope(|scope| {
+        scope
+            .spawn(move || {
+                match tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                {
+                    Ok(runtime) => runtime.block_on(run_bash(args, cancelled)),
+                    Err(e) => format!("Failed to create bash IO runtime: {e}"),
+                }
+            })
+            .join()
+            .unwrap_or_else(|_| "Error: bash execution panicked".into())
+    })
+}
+
+const MAX_CAPTURE_BYTES: usize = 1024 * 1024;
+
+async fn drain_pipe<R: tokio::io::AsyncRead + Unpin>(mut pipe: R, sink: Arc<Mutex<Vec<u8>>>) {
+    use tokio::io::AsyncReadExt;
+    let mut chunk = [0; 8192];
+    while let Ok(n) = pipe.read(&mut chunk).await {
+        if n == 0 {
+            break;
+        }
+        let mut buffer = sink.lock().unwrap_or_else(|e| e.into_inner());
+        let remaining = MAX_CAPTURE_BYTES.saturating_sub(buffer.len());
+        buffer.extend_from_slice(&chunk[..n.min(remaining)]);
+        // Continue draining excess output so a noisy command cannot deadlock.
+    }
+}
+
+async fn kill_process_tree(child: &mut tokio::process::Child) {
+    if let Some(pid) = child.id() {
+        #[cfg(unix)]
+        // The child is the leader of the private process group created below.
+        unsafe {
+            libc::kill(-(pid as i32), libc::SIGKILL);
+        }
+        #[cfg(windows)]
+        {
+            let _ = tokio::process::Command::new("taskkill")
+                .args(["/PID", &pid.to_string(), "/T", "/F"])
+                .output()
+                .await;
+        }
+    }
+    let _ = child.kill().await;
+    let _ = child.wait().await;
+}
+
+async fn run_bash(args: &Value, cancelled: Arc<AtomicBool>) -> String {
+    let Some(command) = get_arg(args, "command") else {
+        return "Error: missing 'command' argument".into();
     };
-    let timeout_secs: u64 = args
+    if cancelled.load(Ordering::SeqCst) {
+        return "[cancelled]".into();
+    }
+    let timeout_secs = args
         .get("timeout")
-        .and_then(|t| t.as_u64())
+        .and_then(Value::as_u64)
         .unwrap_or_else(bash_timeout_default)
         .min(bash_timeout_max());
-
-    match std::panic::catch_unwind(|| {
-        let mut child = match std::process::Command::new("bash")
-            .arg("-c")
-            .arg(command)
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped())
-            .spawn()
-        {
-            Ok(c) => c,
-            Err(e) => return format!("Failed to spawn bash: {}", e),
-        };
-
-        // Read the pipes without blocking on them.
-        //
-        // `wait_with_output()` reads until EOF, and EOF only arrives when every
-        // holder of the pipe closes it — including processes the command left
-        // running on purpose (a browser, a dev server, anything backgrounded).
-        // Those keep the agent waiting forever, and the timeout below cannot
-        // help because by then the command itself has already exited. Reading
-        // what is available and moving on is the only behaviour that works for
-        // both a normal command and one that deliberately outlives its shell.
-        let out = PipeReader::spawn(child.stdout.take());
-        let err = PipeReader::spawn(child.stderr.take());
-
-        let start = std::time::Instant::now();
-        let timeout = std::time::Duration::from_secs(timeout_secs);
-
-        loop {
-            match child.try_wait() {
-                Ok(Some(status)) => {
-                    // The command is gone. Wait for the readers to reach end of
-                    // pipe so nothing it wrote on the way out is lost, but cap the
-                    // wait — anything still holding the pipe open is a process that
-                    // outlived the command and is not ours to wait for.
-                    let grace = std::time::Instant::now();
-                    while grace.elapsed() < std::time::Duration::from_millis(300)
-                        && !(out.finished() && err.finished())
-                    {
-                        std::thread::sleep(std::time::Duration::from_millis(10));
-                    }
-                    return assemble_bash_result(
-                        command,
-                        &out.snapshot(),
-                        &err.snapshot(),
-                        status.code(),
-                    );
-                }
-                Ok(None) => {
-                    if start.elapsed() > timeout {
-                        let _ = child.kill();
-                        let _ = child.wait();
-                        // Let the readers pick up whatever was already in flight.
-                        std::thread::sleep(std::time::Duration::from_millis(50));
-                        let partial =
-                            assemble_bash_result(command, &out.snapshot(), &err.snapshot(), None);
-                        return format!("[timed out after {}s]\n{}", timeout_secs, partial);
-                    }
-                    std::thread::sleep(std::time::Duration::from_millis(10));
-                }
-                Err(e) => return format!("Error waiting for bash: {}", e),
-            }
+    let mut process = tokio::process::Command::new("bash");
+    process
+        .arg("-c")
+        .arg(command)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .kill_on_drop(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        process.as_std_mut().process_group(0);
+    }
+    let mut child = match process.spawn() {
+        Ok(child) => child,
+        Err(e) => return format!("Failed to spawn bash: {e}"),
+    };
+    let out = Arc::new(Mutex::new(Vec::new()));
+    let err = Arc::new(Mutex::new(Vec::new()));
+    let mut readers = tokio::task::JoinSet::new();
+    if let Some(pipe) = child.stdout.take() {
+        readers.spawn(drain_pipe(pipe, out.clone()));
+    }
+    if let Some(pipe) = child.stderr.take() {
+        readers.spawn(drain_pipe(pipe, err.clone()));
+    }
+    let cancellation = async {
+        while !cancelled.load(Ordering::SeqCst) {
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
         }
-    }) {
-        Ok(r) => r,
-        Err(_) => "Error: bash execution panicked".to_string(),
+    };
+    let (status, notice) = tokio::select! {
+        status = child.wait() => (status.ok().and_then(|s| s.code()), String::new()),
+        _ = tokio::time::sleep(std::time::Duration::from_secs(timeout_secs)) => {
+            kill_process_tree(&mut child).await;
+            (None, format!("[timed out after {timeout_secs}s]\n"))
+        },
+        _ = cancellation => {
+            kill_process_tree(&mut child).await;
+            (None, "[cancelled]\n".into())
+        },
+    };
+    // Drain normal exits, but close our pipe handles when descendants outlive
+    // their shell. The tasks are joined before returning, even on cancellation.
+    let _ = tokio::time::timeout(std::time::Duration::from_millis(300), async {
+        while readers.join_next().await.is_some() {}
+    })
+    .await;
+    readers.shutdown().await;
+    let out = out.lock().unwrap_or_else(|e| e.into_inner());
+    let err = err.lock().unwrap_or_else(|e| e.into_inner());
+    let mut result = format!(
+        "{notice}{}",
+        assemble_bash_result(command, &out, &err, status)
+    );
+    if out.len() == MAX_CAPTURE_BYTES || err.len() == MAX_CAPTURE_BYTES {
+        result.push_str("\n[output capture capped at 1 MiB per stream]");
     }
-}
-
-/// A child pipe drained by a background thread into a shared buffer.
-///
-/// The agent must never block on a child's output. `wait_with_output` blocks until
-/// end of pipe, and end of pipe only arrives once every holder closes it —
-/// including a process the command left running on purpose, such as a dev server.
-/// The previous fix put the pipes in non-blocking mode with `fcntl`, which works but
-/// is unix-only and stopped the crate compiling for Windows entirely.
-///
-/// A reader thread is portable and needs no `unsafe`: the blocking read happens off
-/// the agent's thread, and the caller only ever reads the buffer that thread fills.
-/// A pipe held open by an outliving process leaves one parked thread behind, which
-/// costs a stack and nothing else. The agent keeps running either way.
-struct PipeReader {
-    buffer: Arc<Mutex<Vec<u8>>>,
-    finished: Arc<AtomicBool>,
-}
-
-impl PipeReader {
-    /// Start draining `pipe`. An absent pipe yields a reader that is already done.
-    fn spawn<R: Read + Send + 'static>(pipe: Option<R>) -> PipeReader {
-        let buffer = Arc::new(Mutex::new(Vec::new()));
-        let finished = Arc::new(AtomicBool::new(true));
-        let Some(mut pipe) = pipe else {
-            return PipeReader { buffer, finished };
-        };
-        finished.store(false, Ordering::SeqCst);
-
-        let sink = Arc::clone(&buffer);
-        let done = Arc::clone(&finished);
-        std::thread::spawn(move || {
-            let mut chunk = [0u8; 8192];
-            loop {
-                match pipe.read(&mut chunk) {
-                    Ok(0) => break,
-                    Ok(n) => match sink.lock() {
-                        Ok(mut buf) => buf.extend_from_slice(&chunk[..n]),
-                        Err(_) => break,
-                    },
-                    Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
-                    Err(_) => break,
-                }
-            }
-            done.store(true, Ordering::SeqCst);
-        });
-
-        PipeReader { buffer, finished }
-    }
-
-    /// Everything read so far.
-    fn snapshot(&self) -> Vec<u8> {
-        self.buffer.lock().map(|buf| buf.clone()).unwrap_or_default()
-    }
-
-    /// Whether the pipe reached its end and the reader stopped.
-    fn finished(&self) -> bool {
-        self.finished.load(Ordering::SeqCst)
-    }
+    result
 }
 
 fn assemble_bash_result(command: &str, out: &[u8], err: &[u8], exit_code: Option<i32>) -> String {
@@ -457,7 +490,9 @@ fn assemble_bash_result(command: &str, out: &[u8], err: &[u8], exit_code: Option
     if result.trim().is_empty() {
         return format!(
             "[command completed with exit code {}]",
-            exit_code.map(|c| c.to_string()).unwrap_or_else(|| "unknown".into())
+            exit_code
+                .map(|c| c.to_string())
+                .unwrap_or_else(|| "unknown".into())
         );
     }
     // Apply RTK-style output compression
@@ -527,9 +562,15 @@ fn execute_write(tool_call: &ToolCall) -> String {
             // Try to extract file_path and content from raw JSON
             if let Ok(raw_val) = serde_json::from_str::<Value>(raw) {
                 file_path = file_path.or_else(|| {
-                    raw_val.get("file_path").and_then(|v| v.as_str()).map(|s| s.to_string())
+                    raw_val
+                        .get("file_path")
+                        .and_then(|v| v.as_str())
+                        .map(|s| s.to_string())
                 });
-                content = raw_val.get("content").and_then(|v| v.as_str()).map(|s| s.to_string());
+                content = raw_val
+                    .get("content")
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_string());
                 truncated = true;
             } else {
                 // Even raw JSON is malformed — try to extract file_path with regex-like approach
@@ -621,7 +662,11 @@ fn execute_write(tool_call: &ToolCall) -> String {
                     path.display()
                 )
             } else {
-                format!("Successfully wrote {} lines to {}", line_count, path.display())
+                format!(
+                    "Successfully wrote {} lines to {}",
+                    line_count,
+                    path.display()
+                )
             }
         }
         Err(e) => format!("Error writing file: {}", e),
@@ -641,23 +686,32 @@ fn execute_edit(args: &Value) -> String {
     }
 
     // Collect edits from either the singular old_text/new_text or the edits array
-    let edits: Vec<(String, String)> = if let Some(edits_val) = args.get("edits").and_then(|v| v.as_array()) {
+    let edits: Vec<(String, String)> = if let Some(edits_val) =
+        args.get("edits").and_then(|v| v.as_array())
+    {
         if edits_val.is_empty() {
             return "Error: edits array is empty".to_string();
         }
-        edits_val.iter().filter_map(|e| {
-            let old = e.get("old_text")?.as_str()?.to_string();
-            let new = e.get("new_text")?.as_str()?.to_string();
-            Some((old, new))
-        }).collect()
+        edits_val
+            .iter()
+            .filter_map(|e| {
+                let old = e.get("old_text")?.as_str()?.to_string();
+                let new = e.get("new_text")?.as_str()?.to_string();
+                Some((old, new))
+            })
+            .collect()
     } else {
         let old_text = match get_arg(args, "old_text") {
             Some(t) => t,
-            None => return "Error: missing 'old_text' argument (or provide 'edits' array)".to_string(),
+            None => {
+                return "Error: missing 'old_text' argument (or provide 'edits' array)".to_string()
+            }
         };
         let new_text = match get_arg(args, "new_text") {
             Some(t) => t,
-            None => return "Error: missing 'new_text' argument (or provide 'edits' array)".to_string(),
+            None => {
+                return "Error: missing 'new_text' argument (or provide 'edits' array)".to_string()
+            }
         };
         vec![(old_text.to_string(), new_text.to_string())]
     };
@@ -725,7 +779,11 @@ fn execute_edit(args: &Value) -> String {
                     if positions.len() == 1 {
                         format!("Successfully applied edit to {}", path.display())
                     } else {
-                        format!("Successfully applied {} edits to {}", positions.len(), path.display())
+                        format!(
+                            "Successfully applied {} edits to {}",
+                            positions.len(),
+                            path.display()
+                        )
                     }
                 }
                 Err(e) => format!("Error writing file: {}", e),
@@ -780,7 +838,9 @@ fn execute_grep(args: &Value) -> String {
             // Fallback to grep if rg is not available
             let mut cmd = std::process::Command::new("grep");
             cmd.arg("-rn");
-            if ignore_case { cmd.arg("-i"); }
+            if ignore_case {
+                cmd.arg("-i");
+            }
             if !include.is_empty() {
                 cmd.arg("--include").arg(include);
             }
@@ -790,9 +850,16 @@ fn execute_grep(args: &Value) -> String {
             match cmd.output() {
                 Ok(o) => {
                     let mut r = String::new();
-                    if !o.stdout.is_empty() { r.push_str(&String::from_utf8_lossy(&o.stdout)); }
-                    if r.is_empty() { r = "No matches found.".to_string(); }
-                    if r.len() > 10000 { r.truncate(10000); r.push_str("\n... [output truncated]"); }
+                    if !o.stdout.is_empty() {
+                        r.push_str(&String::from_utf8_lossy(&o.stdout));
+                    }
+                    if r.is_empty() {
+                        r = "No matches found.".to_string();
+                    }
+                    if r.len() > 10000 {
+                        r.truncate(10000);
+                        r.push_str("\n... [output truncated]");
+                    }
                     r
                 }
                 Err(e2) => format!("Error running grep: {} (rg also unavailable: {})", e2, e),
@@ -824,7 +891,10 @@ fn execute_find(args: &Value) -> String {
             }
             if result.len() > 5000 {
                 result.truncate(5000);
-                result.push_str(&format!("\n... [{} results total, truncated]", result.matches('\n').count()));
+                result.push_str(&format!(
+                    "\n... [{} results total, truncated]",
+                    result.matches('\n').count()
+                ));
             }
             result
         }
@@ -836,9 +906,16 @@ fn execute_find(args: &Value) -> String {
             match cmd.output() {
                 Ok(o) => {
                     let mut r = String::new();
-                    if !o.stdout.is_empty() { r.push_str(&String::from_utf8_lossy(&o.stdout)); }
-                    if r.is_empty() { r = "No files found.".to_string(); }
-                    if r.len() > 5000 { r.truncate(5000); r.push_str("\n... [truncated]"); }
+                    if !o.stdout.is_empty() {
+                        r.push_str(&String::from_utf8_lossy(&o.stdout));
+                    }
+                    if r.is_empty() {
+                        r = "No files found.".to_string();
+                    }
+                    if r.len() > 5000 {
+                        r.truncate(5000);
+                        r.push_str("\n... [truncated]");
+                    }
                     r
                 }
                 Err(e) => format!("Error running find: {}", e),
@@ -907,7 +984,11 @@ fn execute_search_code(args: &Value) -> String {
         None => return "Error: missing 'query' argument".to_string(),
     };
     let search_path = get_arg(args, "path").unwrap_or(".");
-    let top_k = args.get("top_k").and_then(|v| v.as_u64()).unwrap_or(5).min(50) as usize;
+    let top_k = args
+        .get("top_k")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(5)
+        .min(50) as usize;
 
     let path = resolve_path(search_path);
     if !path.exists() {
@@ -918,14 +999,14 @@ fn execute_search_code(args: &Value) -> String {
     }
 
     // Try semantic search first (requires model), fall back to keyword search
-    match crate::code_search::CodeSearchIndex::build(&path) {
+    let start = std::time::Instant::now();
+    match crate::code_search::cached_index(&path) {
         Ok(index) => {
-            let start = std::time::Instant::now();
             let results = index.search(query, top_k);
             let elapsed = start.elapsed();
             let mut out = crate::code_search::format_results(query, &results);
             out.push_str(&format!(
-                "[{} chunks indexed, searched in {:?}]",
+                "[{} chunks indexed, total search time {:?}]",
                 index.len(),
                 elapsed
             ));
@@ -1084,7 +1165,12 @@ mod stateful_tool_tests {
     use super::*;
 
     fn call(name: &str, args: Value) -> ToolCall {
-        ToolCall { id: "t1".into(), name: name.into(), arguments: args, raw_arguments: None }
+        ToolCall {
+            id: "t1".into(),
+            name: name.into(),
+            arguments: args,
+            raw_arguments: None,
+        }
     }
 
     fn context_with_open_round(round: u32) -> ToolContext {
@@ -1097,10 +1183,17 @@ mod stateful_tool_tests {
     #[test]
     fn goal_round_accepts_every_spelling_of_the_number() {
         // Models emit 1, 1.0, and "1" interchangeably. All three name round 1.
-        for round in [serde_json::json!(1), serde_json::json!(1.0), serde_json::json!("1")] {
+        for round in [
+            serde_json::json!(1),
+            serde_json::json!(1.0),
+            serde_json::json!("1"),
+        ] {
             let ctx = context_with_open_round(1);
             let result = execute_tool(
-                &call("goal", serde_json::json!({"operation": "complete", "round": round})),
+                &call(
+                    "goal",
+                    serde_json::json!({"operation": "complete", "round": round}),
+                ),
                 &ctx,
             );
             assert!(
@@ -1115,7 +1208,10 @@ mod stateful_tool_tests {
     #[test]
     fn goal_requires_a_round_for_a_decision() {
         let ctx = context_with_open_round(1);
-        let result = execute_tool(&call("goal", serde_json::json!({"operation": "complete"})), &ctx);
+        let result = execute_tool(
+            &call("goal", serde_json::json!({"operation": "complete"})),
+            &ctx,
+        );
         assert!(result.contains("`round` is required"), "{}", result);
         assert!(!ctx.goal.is_decided());
     }
@@ -1124,7 +1220,10 @@ mod stateful_tool_tests {
     fn goal_rejects_an_unknown_operation() {
         let ctx = context_with_open_round(1);
         let result = execute_tool(
-            &call("goal", serde_json::json!({"operation": "finish", "round": 1})),
+            &call(
+                "goal",
+                serde_json::json!({"operation": "finish", "round": 1}),
+            ),
             &ctx,
         );
         assert!(result.contains("unknown operation"), "{}", result);
@@ -1133,7 +1232,10 @@ mod stateful_tool_tests {
     #[test]
     fn goal_read_needs_no_round() {
         let ctx = context_with_open_round(2);
-        let result = execute_tool(&call("goal", serde_json::json!({"operation": "read"})), &ctx);
+        let result = execute_tool(
+            &call("goal", serde_json::json!({"operation": "read"})),
+            &ctx,
+        );
         assert!(result.contains("Objective: ship the fix"));
         assert!(result.contains("Round: 2/5"));
     }
@@ -1158,7 +1260,10 @@ mod stateful_tool_tests {
         );
         assert!(result.contains("[~] do the thing"), "{}", result);
         assert_eq!(ctx.todos.snapshot().len(), 1);
-        assert!(other.todos.snapshot().is_empty(), "contexts must stay independent");
+        assert!(
+            other.todos.snapshot().is_empty(),
+            "contexts must stay independent"
+        );
     }
 }
 
@@ -1166,6 +1271,32 @@ mod stateful_tool_tests {
 mod tests {
     use super::*;
     use std::fs;
+
+    #[tokio::test]
+    async fn pipe_capture_is_bounded_and_drains_excess() {
+        use tokio::io::AsyncWriteExt;
+        let (mut writer, reader) = tokio::io::duplex(8192);
+        let sink = Arc::new(Mutex::new(Vec::new()));
+        let task = tokio::spawn(drain_pipe(reader, sink.clone()));
+        writer
+            .write_all(&vec![b'x'; MAX_CAPTURE_BYTES * 3])
+            .await
+            .unwrap();
+        drop(writer);
+        task.await.unwrap();
+        assert_eq!(sink.lock().unwrap().len(), MAX_CAPTURE_BYTES);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn bash_timeout_kills_descendants() {
+        let marker = std::env::temp_dir().join(format!("rupi-descendant-{}", uuid::Uuid::new_v4()));
+        let command = format!("(sleep 2; echo survived > '{}') & wait", marker.display());
+        let result = execute_bash(&serde_json::json!({"command":command,"timeout":1}));
+        assert!(result.contains("timed out"));
+        std::thread::sleep(std::time::Duration::from_millis(1300));
+        assert!(!marker.exists(), "descendant survived the timeout");
+    }
 
     #[test]
     fn test_bash_echo() {
@@ -1176,7 +1307,7 @@ mod tests {
 
     #[test]
     fn test_read_file() {
-        let dir = std::env::temp_dir().join("rupi-tools-test-read-file".to_string());
+        let dir = std::env::temp_dir().join("rupi-tools-test-read-file");
         fs::create_dir_all(&dir).unwrap();
         let path = dir.join("test.txt");
         fs::write(&path, "line1\nline2\nline3\n").unwrap();
@@ -1190,12 +1321,13 @@ mod tests {
 
     #[test]
     fn test_read_file_with_offset() {
-        let dir = std::env::temp_dir().join("rupi-tools-test-read-offset".to_string());
+        let dir = std::env::temp_dir().join("rupi-tools-test-read-offset");
         fs::create_dir_all(&dir).unwrap();
         let path = dir.join("test.txt");
         fs::write(&path, "line1\nline2\nline3\nline4\nline5\n").unwrap();
 
-        let args = serde_json::json!({"file_path": path.to_string_lossy(), "offset": 3, "limit": 2});
+        let args =
+            serde_json::json!({"file_path": path.to_string_lossy(), "offset": 3, "limit": 2});
         let result = execute_read(&args);
         assert!(result.contains("line3"));
         assert!(result.contains("line4"));
@@ -1205,7 +1337,7 @@ mod tests {
 
     #[test]
     fn test_write_creates_new_file() {
-        let dir = std::env::temp_dir().join("rupi-tools-test-write-file".to_string());
+        let dir = std::env::temp_dir().join("rupi-tools-test-write-file");
         fs::create_dir_all(&dir).unwrap();
         let path = dir.join("new_file.txt");
 
@@ -1225,7 +1357,7 @@ mod tests {
 
     #[test]
     fn test_write_refuses_on_existing_file() {
-        let dir = std::env::temp_dir().join("rupi-tools-test-write-refuse".to_string());
+        let dir = std::env::temp_dir().join("rupi-tools-test-write-refuse");
         fs::create_dir_all(&dir).unwrap();
         let path = dir.join("existing.txt");
         fs::write(&path, "original content").unwrap();
@@ -1246,7 +1378,7 @@ mod tests {
 
     #[test]
     fn test_write_guard_returns_edit_recipe() {
-        let dir = std::env::temp_dir().join("rupi-tools-test-write-recipe".to_string());
+        let dir = std::env::temp_dir().join("rupi-tools-test-write-recipe");
         fs::create_dir_all(&dir).unwrap();
         let path = dir.join("existing.txt");
         fs::write(&path, "content").unwrap();
@@ -1266,7 +1398,7 @@ mod tests {
 
     #[test]
     fn test_edit_singular() {
-        let dir = std::env::temp_dir().join("rupi-tools-test-edit-file".to_string());
+        let dir = std::env::temp_dir().join("rupi-tools-test-edit-file");
         fs::create_dir_all(&dir).unwrap();
         let path = dir.join("edit.txt");
         fs::write(&path, "hello world\n").unwrap();
@@ -1281,7 +1413,7 @@ mod tests {
 
     #[test]
     fn test_edit_multi_edits() {
-        let dir = std::env::temp_dir().join("rupi-tools-test-edit-multi".to_string());
+        let dir = std::env::temp_dir().join("rupi-tools-test-edit-multi");
         fs::create_dir_all(&dir).unwrap();
         let path = dir.join("multi.txt");
         fs::write(&path, "AAA line\nBBB line\nCCC line\n").unwrap();
@@ -1302,7 +1434,7 @@ mod tests {
 
     #[test]
     fn test_edit_not_found() {
-        let dir = std::env::temp_dir().join("rupi-tools-test-edit-not-found".to_string());
+        let dir = std::env::temp_dir().join("rupi-tools-test-edit-not-found");
         fs::create_dir_all(&dir).unwrap();
         let path = dir.join("edit.txt");
         fs::write(&path, "hello world\n").unwrap();
@@ -1315,7 +1447,7 @@ mod tests {
 
     #[test]
     fn test_edit_multiple_matches_singular() {
-        let dir = std::env::temp_dir().join("rupi-tools-test-edit-multi-singular".to_string());
+        let dir = std::env::temp_dir().join("rupi-tools-test-edit-multi-singular");
         fs::create_dir_all(&dir).unwrap();
         let path = dir.join("edit.txt");
         fs::write(&path, "hello hello\n").unwrap();
@@ -1328,7 +1460,7 @@ mod tests {
 
     #[test]
     fn test_edit_multi_overlap_detected() {
-        let dir = std::env::temp_dir().join("rupi-tools-test-edit-overlap".to_string());
+        let dir = std::env::temp_dir().join("rupi-tools-test-edit-overlap");
         fs::create_dir_all(&dir).unwrap();
         let path = dir.join("overlap.txt");
         fs::write(&path, "hello world foo\n").unwrap();
@@ -1347,7 +1479,7 @@ mod tests {
 
     #[test]
     fn test_edit_multi_one_fails_all_fail() {
-        let dir = std::env::temp_dir().join("rupi-tools-test-edit-partial".to_string());
+        let dir = std::env::temp_dir().join("rupi-tools-test-edit-partial");
         fs::create_dir_all(&dir).unwrap();
         let path = dir.join("partial.txt");
         fs::write(&path, "AAA line\nBBB line\n").unwrap();
@@ -1369,7 +1501,7 @@ mod tests {
 
     #[test]
     fn test_grep() {
-        let dir = std::env::temp_dir().join("rupi-tools-test-grep".to_string());
+        let dir = std::env::temp_dir().join("rupi-tools-test-grep");
         fs::create_dir_all(&dir).unwrap();
         fs::write(dir.join("test.txt"), "hello world\nfoo bar\n").unwrap();
 
@@ -1381,7 +1513,7 @@ mod tests {
 
     #[test]
     fn test_ls() {
-        let dir = std::env::temp_dir().join("rupi-tools-test-ls".to_string());
+        let dir = std::env::temp_dir().join("rupi-tools-test-ls");
         fs::create_dir_all(&dir).unwrap();
         fs::write(dir.join("a.txt"), "a").unwrap();
         fs::write(dir.join("b.txt"), "b").unwrap();
@@ -1411,7 +1543,8 @@ mod tests {
     #[test]
     fn test_execute_unknown_tool() {
         let tc = ToolCall {
-            id: "call_1".into(), name: "nonexistent".into(),
+            id: "call_1".into(),
+            name: "nonexistent".into(),
             arguments: serde_json::json!({}),
             raw_arguments: None,
         };
@@ -1435,7 +1568,7 @@ mod tests {
 
     #[test]
     fn test_write_creates_parent_dirs() {
-        let dir = std::env::temp_dir().join("rupi-tools-test-write-parent".to_string());
+        let dir = std::env::temp_dir().join("rupi-tools-test-write-parent");
         let nested = dir.join("nested").join("deep").join("file.txt");
         let tc = ToolCall {
             id: "test".into(),
@@ -1451,7 +1584,7 @@ mod tests {
 
     #[test]
     fn test_write_creates_new_even_if_parent_doesnt_exist() {
-        let dir = std::env::temp_dir().join("rupi-tools-test-write-deep".to_string());
+        let dir = std::env::temp_dir().join("rupi-tools-test-write-deep");
         let nested = dir.join("a").join("b").join("c").join("f.txt");
         let tc = ToolCall {
             id: "test".into(),
@@ -1467,7 +1600,7 @@ mod tests {
 
     #[test]
     fn test_write_truncation_recovery_valid_json() {
-        let dir = std::env::temp_dir().join("rupi-tools-test-trunc-valid".to_string());
+        let dir = std::env::temp_dir().join("rupi-tools-test-trunc-valid");
         let _ = fs::remove_dir_all(&dir);
         let file_path = dir.join("truncated.html");
         // Simulate truncated JSON: valid JSON but with raw_arguments containing partial content
@@ -1479,7 +1612,11 @@ mod tests {
             raw_arguments: Some(raw.to_string()),
         };
         let result = execute_write(&tc);
-        assert!(result.contains("truncated"), "Expected truncation warning, got: {}", result);
+        assert!(
+            result.contains("truncated"),
+            "Expected truncation warning, got: {}",
+            result
+        );
         assert!(file_path.exists());
         let written = fs::read_to_string(&file_path).unwrap();
         assert!(written.contains("<html>"));
@@ -1489,7 +1626,7 @@ mod tests {
 
     #[test]
     fn test_write_truncation_recovery_malformed_json() {
-        let dir = std::env::temp_dir().join("rupi-tools-test-trunc-malformed".to_string());
+        let dir = std::env::temp_dir().join("rupi-tools-test-trunc-malformed");
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
         let file_path = dir.join("broken.html");
@@ -1505,7 +1642,11 @@ mod tests {
             raw_arguments: Some(raw),
         };
         let result = execute_write(&tc);
-        assert!(result.contains("truncated"), "Expected truncation warning, got: {}", result);
+        assert!(
+            result.contains("truncated"),
+            "Expected truncation warning, got: {}",
+            result
+        );
         assert!(file_path.exists());
         let written = fs::read_to_string(&file_path).unwrap();
         assert!(written.contains("<html>"));
@@ -1530,13 +1671,16 @@ mod tests {
         for tool in all_tools() {
             assert!(!tool.name.is_empty());
             assert!(!tool.description.is_empty());
-            assert!(tool.parameters.get("properties").is_some() || tool.parameters.get("type").is_some());
+            assert!(
+                tool.parameters.get("properties").is_some()
+                    || tool.parameters.get("type").is_some()
+            );
         }
     }
 
     #[test]
     fn test_edit_empty_edits_array() {
-        let dir = std::env::temp_dir().join("rupi-tools-test-empty-edits".to_string());
+        let dir = std::env::temp_dir().join("rupi-tools-test-empty-edits");
         fs::create_dir_all(&dir).unwrap();
         let path = dir.join("file.txt");
         fs::write(&path, "content").unwrap();
@@ -1598,7 +1742,10 @@ mod tests {
         let args = serde_json::json!({"command": "echo PARCIAL; sleep 30", "timeout": 1});
         let result = execute_bash(&args);
         assert!(result.contains("timed out"), "{result}");
-        assert!(result.contains("PARCIAL"), "partial output was discarded: {result}");
+        assert!(
+            result.contains("PARCIAL"),
+            "partial output was discarded: {result}"
+        );
     }
 
     #[test]
@@ -1618,7 +1765,8 @@ mod tests {
     #[test]
     fn test_search_code_missing_query() {
         let tc = ToolCall {
-            id: "e1".into(), name: "search_code".into(),
+            id: "e1".into(),
+            name: "search_code".into(),
             arguments: serde_json::json!({"path": "."}),
             raw_arguments: None,
         };

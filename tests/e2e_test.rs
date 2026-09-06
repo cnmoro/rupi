@@ -9,7 +9,27 @@ use rupi::rpc::handler::RpcHandler;
 use rupi::rpc::types::{AgentEvent, RpcCommand, RpcResponse};
 
 fn load_e2e_config() -> Option<RupiConfig> {
-    // Try the canonical location first
+    // Live-test credentials can be supplied without writing a config file.
+    // Environment values take precedence over personal/developer config files.
+    rupi::sessions::set_sessions_dir(
+        std::env::temp_dir().join(format!("rupi-live-sessions-{}", std::process::id())),
+    );
+    if let (Ok(base_url), Ok(api_key), Ok(model_tag)) = (
+        std::env::var("RUPI_BASE_URL"),
+        std::env::var("RUPI_API_KEY"),
+        std::env::var("RUPI_MODEL"),
+    ) {
+        if !base_url.is_empty() && !api_key.is_empty() && !model_tag.is_empty() {
+            return Some(RupiConfig {
+                base_url: Some(base_url),
+                api_key: Some(api_key),
+                model_tag: Some(model_tag),
+                opencode_api_key: None,
+                opencode_provider: None,
+            });
+        }
+    }
+    // Fall back to config files.
     let config_paths = [
         std::path::PathBuf::from("/mnt/nvme1tb/pi-clone/.env"),
         rupi::config::config_path().unwrap_or_default(),
@@ -21,9 +41,9 @@ fn load_e2e_config() -> Option<RupiConfig> {
             let contents = std::fs::read_to_string(path).ok()?;
             // Try JSON format first (rupi config)
             if let Ok(config) = serde_json::from_str::<RupiConfig>(&contents) {
-                let has_standard = config.base_url.as_deref().unwrap_or("").len() > 0
-                    && config.api_key.as_deref().unwrap_or("").len() > 0
-                    && config.model_tag.as_deref().unwrap_or("").len() > 0;
+                let has_standard = !config.base_url.as_deref().unwrap_or("").is_empty()
+                    && !config.api_key.as_deref().unwrap_or("").is_empty()
+                    && !config.model_tag.as_deref().unwrap_or("").is_empty();
                 if has_standard || config.opencode_api_key.is_some() {
                     return Some(config);
                 }
@@ -51,7 +71,9 @@ fn load_e2e_config() -> Option<RupiConfig> {
                     }
                 }
             }
-            let base_url = std::env::var("RUPI_BASE_URL").ok().filter(|s| !s.is_empty());
+            let base_url = std::env::var("RUPI_BASE_URL")
+                .ok()
+                .filter(|s| !s.is_empty());
             let api_key = std::env::var("RUPI_API_KEY").ok().filter(|s| !s.is_empty());
             let model = std::env::var("RUPI_MODEL").ok().filter(|s| !s.is_empty());
             if let (Some(base_url), Some(api_key), Some(model)) = (base_url, api_key, model) {
@@ -75,36 +97,63 @@ fn make_config(config: &RupiConfig) -> OpenAIConfig {
         model: config.model_tag.clone().unwrap_or_default(),
         context_window: 128000,
         timeout_secs: 0,
-            reasoning: false,
+        reasoning: false,
     }
 }
 
 #[tokio::test]
+#[ignore = "requires live provider credentials or downloaded model; run explicitly with --ignored"]
 async fn e2e_test_api_reachable() {
-    let config = match load_e2e_config() {
-        Some(c) => c,
-        None => {
-            eprintln!("Skipping e2e test: credentials not set");
-            return;
-        }
-    };
+    let config = load_e2e_config().expect("live tests require explicit provider credentials");
 
     let provider = rupi::provider::openai::OpenAIProvider::new(make_config(&config));
-    let info = provider.model_info();
-    assert_eq!(info.id, config.model_tag.as_deref().unwrap_or(""));
-    assert_eq!(info.provider, "openai-compatible");
-    assert!(info.context_window > 0);
+    let (_cancel, signal) = tokio::sync::watch::channel(false);
+    let model = config.model_tag.as_deref().unwrap();
+    let mut stream = tokio::time::timeout(
+        std::time::Duration::from_secs(90),
+        provider.stream_chat(
+            model,
+            &[rupi::agent::session::Message::new(
+                "user",
+                "Reply with exactly: Olá 🌍",
+            )],
+            signal,
+        ),
+    )
+    .await
+    .expect("live request timed out")
+    .expect("live HTTP request failed");
+    let result = tokio::time::timeout(std::time::Duration::from_secs(90), async {
+        while let Some(event) = stream.recv().await {
+            match event {
+                rupi::provider::StreamEvent::Done(result) => return result,
+                rupi::provider::StreamEvent::Error(error) => panic!("live stream failed: {error}"),
+                _ => {}
+            }
+        }
+        panic!("live stream ended without a completion");
+    })
+    .await
+    .expect("live stream timed out");
+    assert_eq!(result.content.trim(), "Olá 🌍");
+    assert!(
+        result.input_tokens > 0,
+        "live provider must report input usage"
+    );
+    assert!(
+        result.output_tokens > 0,
+        "live provider must report output usage"
+    );
+    eprintln!(
+        "Live streaming OK: model={model}, input={}, output={}, content={}",
+        result.input_tokens, result.output_tokens, result.content
+    );
 }
 
 #[tokio::test]
+#[ignore = "requires live provider credentials or downloaded model; run explicitly with --ignored"]
 async fn e2e_test_rpc_get_state() {
-    let config = match load_e2e_config() {
-        Some(c) => c,
-        None => {
-            eprintln!("Skipping e2e test: credentials not set");
-            return;
-        }
-    };
+    let config = load_e2e_config().expect("live tests require explicit provider credentials");
 
     let session = AgentSession::from_config(make_config(&config));
     let state = session.get_state().await;
@@ -117,14 +166,9 @@ async fn e2e_test_rpc_get_state() {
 }
 
 #[tokio::test]
+#[ignore = "requires live provider credentials or downloaded model; run explicitly with --ignored"]
 async fn e2e_test_rpc_set_and_get_thinking_level() {
-    let config = match load_e2e_config() {
-        Some(c) => c,
-        None => {
-            eprintln!("Skipping e2e test: credentials not set");
-            return;
-        }
-    };
+    let config = load_e2e_config().expect("live tests require explicit provider credentials");
 
     let session = AgentSession::from_config(make_config(&config));
     assert_eq!(session.thinking_level().await, "off");
@@ -137,14 +181,9 @@ async fn e2e_test_rpc_set_and_get_thinking_level() {
 }
 
 #[tokio::test]
+#[ignore = "requires live provider credentials or downloaded model; run explicitly with --ignored"]
 async fn e2e_test_rpc_new_session_clears_messages() {
-    let config = match load_e2e_config() {
-        Some(c) => c,
-        None => {
-            eprintln!("Skipping e2e test: credentials not set");
-            return;
-        }
-    };
+    let config = load_e2e_config().expect("live tests require explicit provider credentials");
 
     let session = AgentSession::from_config(make_config(&config));
     assert_eq!(session.get_state().await.message_count, 0);
@@ -153,14 +192,9 @@ async fn e2e_test_rpc_new_session_clears_messages() {
 }
 
 #[tokio::test]
+#[ignore = "requires live provider credentials or downloaded model; run explicitly with --ignored"]
 async fn e2e_test_rpc_available_models() {
-    let config = match load_e2e_config() {
-        Some(c) => c,
-        None => {
-            eprintln!("Skipping e2e test: credentials not set");
-            return;
-        }
-    };
+    let config = load_e2e_config().expect("live tests require explicit provider credentials");
 
     let session = AgentSession::from_config(make_config(&config));
     let info = session.provider_model_info();
@@ -169,14 +203,9 @@ async fn e2e_test_rpc_available_models() {
 }
 
 #[tokio::test]
+#[ignore = "requires live provider credentials or downloaded model; run explicitly with --ignored"]
 async fn e2e_test_rpc_set_model() {
-    let config = match load_e2e_config() {
-        Some(c) => c,
-        None => {
-            eprintln!("Skipping e2e test: credentials not set");
-            return;
-        }
-    };
+    let config = load_e2e_config().expect("live tests require explicit provider credentials");
 
     let session = AgentSession::from_config(make_config(&config));
     let handler = RpcHandler::new(session);
@@ -199,18 +228,16 @@ async fn e2e_test_rpc_set_model() {
             }
         }
     }
-    assert!(found, "Should have received a successful set_model response");
+    assert!(
+        found,
+        "Should have received a successful set_model response"
+    );
 }
 
 #[tokio::test]
+#[ignore = "requires live provider credentials or downloaded model; run explicitly with --ignored"]
 async fn e2e_test_rpc_abort() {
-    let config = match load_e2e_config() {
-        Some(c) => c,
-        None => {
-            eprintln!("Skipping e2e test: credentials not set");
-            return;
-        }
-    };
+    let config = load_e2e_config().expect("live tests require explicit provider credentials");
 
     let session = AgentSession::from_config(make_config(&config));
     let handler = RpcHandler::new(session);
@@ -235,14 +262,9 @@ async fn e2e_test_rpc_abort() {
 }
 
 #[tokio::test]
+#[ignore = "requires live provider credentials or downloaded model; run explicitly with --ignored"]
 async fn e2e_test_rpc_prompt_and_stream() {
-    let config = match load_e2e_config() {
-        Some(c) => c,
-        None => {
-            eprintln!("Skipping e2e test: credentials not set");
-            return;
-        }
-    };
+    let config = load_e2e_config().expect("live tests require explicit provider credentials");
 
     let session = AgentSession::from_config(make_config(&config));
     let handler = RpcHandler::new(session);
@@ -288,21 +310,19 @@ async fn e2e_test_rpc_prompt_and_stream() {
         }
     }
 
-    assert!(prompt_response_found, "Should have received a prompt response");
+    assert!(
+        prompt_response_found,
+        "Should have received a prompt response"
+    );
     assert!(agent_end_found, "Agent should have completed");
     // With tools available, the model might use bash instead of just text
     // So we don't require text deltas for the test to pass
 }
 
 #[tokio::test]
+#[ignore = "requires live provider credentials or downloaded model; run explicitly with --ignored"]
 async fn e2e_test_full_conversation_flow() {
-    let config = match load_e2e_config() {
-        Some(c) => c,
-        None => {
-            eprintln!("Skipping e2e test: credentials not set");
-            return;
-        }
-    };
+    let config = load_e2e_config().expect("live tests require explicit provider credentials");
 
     let session = AgentSession::from_config(make_config(&config));
     let state = session.get_state().await;
@@ -357,14 +377,9 @@ async fn e2e_test_full_conversation_flow() {
 }
 
 #[tokio::test]
+#[ignore = "requires live provider credentials or downloaded model; run explicitly with --ignored"]
 async fn e2e_test_compaction_and_continuation() {
-    let config = match load_e2e_config() {
-        Some(c) => c,
-        None => {
-            eprintln!("Skipping e2e test: credentials not set");
-            return;
-        }
-    };
+    let config = load_e2e_config().expect("live tests require explicit provider credentials");
 
     // Create a session with a tiny context window (500 tokens) so
     // compaction triggers immediately after a few messages.
@@ -374,7 +389,7 @@ async fn e2e_test_compaction_and_continuation() {
         model: config.model_tag.clone().unwrap_or_default(),
         context_window: 500,
         timeout_secs: 0,
-            reasoning: false,
+        reasoning: false,
     };
 
     let session = AgentSession::from_config(openai_config);
@@ -386,9 +401,17 @@ async fn e2e_test_compaction_and_continuation() {
     let secret = format!("secret-value-{}", std::process::id());
     for i in 0..3 {
         let msg = if i == 0 {
-            format!("IMPORTANT: Remember this secret code: {}. Reply with: stored", secret)
+            format!(
+                "IMPORTANT: Remember this secret code: {}. Reply with: stored",
+                secret
+            )
         } else {
-            format!("Reply with: message-{}", i)
+            format!(
+                "{} Reply with: message-{}",
+                "This is fixture padding for the compaction test; do not repeat the padding. "
+                    .repeat(4),
+                i
+            )
         };
         session.prompt(&msg, tx.clone()).await.unwrap();
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
@@ -396,38 +419,74 @@ async fn e2e_test_compaction_and_continuation() {
         while std::time::Instant::now() < deadline {
             tokio::time::sleep(std::time::Duration::from_millis(50)).await;
             while let Ok(event) = rx.try_recv() {
-                if matches!(event, AgentEvent::AgentEnd { .. }) { found = true; }
+                if matches!(event, AgentEvent::AgentEnd { .. }) {
+                    found = true;
+                }
             }
-            if found { break; }
+            if found {
+                break;
+            }
         }
     }
 
-    // Compact
+    // The fixture must exceed the retained-tail budget independently of how
+    // terse the model is. Otherwise "Nothing to compact" is correct behavior.
+    let before = session.messages().await;
+    let cut = rupi::compaction::find_cut_point(&before, 50)
+        .expect("fixture must contain a removable prefix");
+    assert!(before[..cut].iter().any(|m| m.content.contains(&secret)));
     let result = session.compact().await;
-    assert!(result.is_ok(), "Compaction should succeed: {:?}", result.err());
+    assert!(
+        result.is_ok(),
+        "Compaction should succeed: {:?}",
+        result.err()
+    );
     let result = result.unwrap();
-    assert!(!result.summary.is_empty(), "Compaction summary should not be empty");
+    assert!(
+        !result.summary.is_empty(),
+        "Compaction summary should not be empty"
+    );
     assert!(result.tokens_before > 0, "tokens_before should be > 0");
+    assert!(
+        result.summary.contains(&secret),
+        "live summary must preserve the secret"
+    );
+    assert!(
+        !session
+            .messages()
+            .await
+            .iter()
+            .any(|m| m.content.starts_with("IMPORTANT: Remember")),
+        "original secret-bearing message should have been replaced by the summary"
+    );
     eprintln!("Compaction OK: {} tokens before", result.tokens_before);
 
     // Ask about the fact — the agent should remember via the compaction summary
     let (tx2, mut rx2) = mpsc::unbounded_channel::<AgentEvent>();
-    session.prompt(
-        &format!("What was the secret code I asked you to remember? Reply with just the code."),
-        tx2.clone(),
-    ).await.unwrap();
+    session
+        .prompt(
+            "What was the secret code I asked you to remember? Reply with just the code.",
+            tx2.clone(),
+        )
+        .await
+        .unwrap();
 
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
     let mut full = String::new();
     while std::time::Instant::now() < deadline {
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         while let Ok(event) = rx2.try_recv() {
-            if let AgentEvent::MessageUpdate { assistant_message_event, .. } = &event {
-                if let rupi::rpc::types::AssistantMessageEvent::TextDelta { delta } = assistant_message_event {
-                    full.push_str(delta);
-                }
+            if let AgentEvent::MessageUpdate {
+                assistant_message_event:
+                    rupi::rpc::types::AssistantMessageEvent::TextDelta { delta },
+                ..
+            } = &event
+            {
+                full.push_str(delta);
             }
-            if matches!(event, AgentEvent::AgentEnd { .. }) { break; }
+            if matches!(event, AgentEvent::AgentEnd { .. }) {
+                break;
+            }
         }
         if full.contains(&secret) {
             break;
@@ -437,31 +496,16 @@ async fn e2e_test_compaction_and_continuation() {
     assert!(
         full.contains(&secret),
         "Agent should remember the secret code from before compaction. Expected '{}' in '{}'",
-        secret, full
+        secret,
+        full
     );
     eprintln!("Agent remembered the secret code after compaction: confirmed");
 }
 
-/// Helper: wait for an AgentEnd event from an event channel.
-async fn wait_for_agent_end(rx: &mut mpsc::UnboundedReceiver<AgentEvent>, timeout_secs: u64) {
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(timeout_secs);
-    while std::time::Instant::now() < deadline {
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-        while let Ok(event) = rx.try_recv() {
-            if matches!(event, AgentEvent::AgentEnd { .. }) { return; }
-        }
-    }
-}
-
 #[tokio::test]
+#[ignore = "requires live provider credentials or downloaded model; run explicitly with --ignored"]
 async fn e2e_test_compaction_via_rpc_and_continue() {
-    let config = match load_e2e_config() {
-        Some(c) => c,
-        None => {
-            eprintln!("Skipping e2e test: credentials not set");
-            return;
-        }
-    };
+    let config = load_e2e_config().expect("live tests require explicit provider credentials");
 
     let openai_config = OpenAIConfig {
         base_url: config.base_url.clone().unwrap_or_default(),
@@ -469,7 +513,7 @@ async fn e2e_test_compaction_via_rpc_and_continue() {
         model: config.model_tag.clone().unwrap_or_default(),
         context_window: 500,
         timeout_secs: 0,
-            reasoning: false,
+        reasoning: false,
     };
 
     let session = AgentSession::from_config(openai_config);
@@ -484,7 +528,12 @@ async fn e2e_test_compaction_via_rpc_and_continue() {
         let msg = if i == 0 {
             format!("Remember this secret: {}. Reply: stored", secret)
         } else {
-            format!("Reply with: msg-{}", i)
+            format!(
+                "{} Reply with: msg-{}",
+                "This is fixture padding for the compaction test; do not repeat the padding. "
+                    .repeat(4),
+                i
+            )
         };
         let cmd = RpcCommand::Prompt {
             id: Some(format!("c1-{}", i)),
@@ -498,13 +547,18 @@ async fn e2e_test_compaction_via_rpc_and_continue() {
     eprintln!("Step 1: {} prompts done", 3);
 
     // Step 2: compact
-    let compact_cmd = RpcCommand::Compact { id: Some("c2".into()), custom_instructions: None };
+    let compact_cmd = RpcCommand::Compact {
+        id: Some("c2".into()),
+        custom_instructions: None,
+    };
     handler.handle(compact_cmd, tx.clone()).await;
     let events = wait_events_rpc(&mut rx, 60, &["response"]).await;
     let compact_success = events.iter().any(|e| {
         if let Ok(resp) = serde_json::from_str::<RpcResponse>(e) {
             resp.command == "compact" && resp.success
-        } else { false }
+        } else {
+            false
+        }
     });
     assert!(compact_success, "Compaction RPC should succeed");
     eprintln!("Step 2: compaction done");
@@ -524,27 +578,41 @@ async fn e2e_test_compaction_via_rpc_and_continue() {
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         while let Ok(line) = rx.try_recv() {
             if let Ok(event) = serde_json::from_str::<AgentEvent>(line.trim()) {
-                if let AgentEvent::MessageUpdate { assistant_message_event, .. } = &event {
-                    if let rupi::rpc::types::AssistantMessageEvent::TextDelta { delta } = assistant_message_event {
-                        full.push_str(delta);
-                    }
+                if let AgentEvent::MessageUpdate {
+                    assistant_message_event:
+                        rupi::rpc::types::AssistantMessageEvent::TextDelta { delta },
+                    ..
+                } = &event
+                {
+                    full.push_str(delta);
                 }
-                if matches!(event, AgentEvent::AgentEnd { .. }) { break; }
+                if matches!(event, AgentEvent::AgentEnd { .. }) {
+                    break;
+                }
             }
         }
-        if std::time::Instant::now() > deadline { break; }
-        if full.contains(&secret) { break; }
+        if std::time::Instant::now() > deadline {
+            break;
+        }
+        if full.contains(&secret) {
+            break;
+        }
     }
 
     assert!(
         full.contains(&secret),
         "After compaction, agent should remember '{}' but got: {}",
-        secret, full
+        secret,
+        full
     );
     eprintln!("Step 3: agent remembered after compaction: confirmed");
 }
 
-async fn wait_events_rpc(rx: &mut mpsc::UnboundedReceiver<String>, timeout_secs: u64, targets: &[&str]) -> Vec<String> {
+async fn wait_events_rpc(
+    rx: &mut mpsc::UnboundedReceiver<String>,
+    timeout_secs: u64,
+    targets: &[&str],
+) -> Vec<String> {
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(timeout_secs);
     let mut collected = Vec::new();
     let mut found = std::collections::HashSet::new();
@@ -553,23 +621,22 @@ async fn wait_events_rpc(rx: &mut mpsc::UnboundedReceiver<String>, timeout_secs:
         while let Ok(line) = rx.try_recv() {
             collected.push(line.clone());
             for t in targets {
-                if line.contains(t) { found.insert(t.to_string()); }
+                if line.contains(t) {
+                    found.insert(t.to_string());
+                }
             }
         }
-        if found.len() == targets.len() { break; }
+        if found.len() == targets.len() {
+            break;
+        }
     }
     collected
 }
 
 #[tokio::test]
+#[ignore = "requires live provider credentials or downloaded model; run explicitly with --ignored"]
 async fn e2e_test_goal_completes() {
-    let config = match load_e2e_config() {
-        Some(c) => c,
-        None => {
-            eprintln!("Skipping e2e test: credentials not set");
-            return;
-        }
-    };
+    let config = load_e2e_config().expect("live tests require explicit provider credentials");
 
     let openai_config = OpenAIConfig {
         base_url: config.base_url.clone().unwrap_or_default(),
@@ -577,16 +644,20 @@ async fn e2e_test_goal_completes() {
         model: config.model_tag.clone().unwrap_or_default(),
         context_window: 128000,
         timeout_secs: 0,
-            reasoning: false,
+        reasoning: false,
     };
 
     let session = AgentSession::from_config(openai_config);
     // Set a simple, quickly achievable goal
-    session.set_goal(Some("Say the word 'pineapple' in your response.".into())).await;
+    session
+        .set_goal(Some("Say the word 'pineapple' in your response.".into()))
+        .await;
 
     let (tx, mut rx) = mpsc::unbounded_channel::<AgentEvent>();
 
-    let result = session.prompt("What is 2+2? Reply briefly.", tx.clone()).await;
+    let result = session
+        .prompt("What is 2+2? Reply briefly.", tx.clone())
+        .await;
     assert!(result.is_ok(), "Goal prompt should complete");
 
     // Collect all events — should eventually get agent_end
@@ -597,28 +668,32 @@ async fn e2e_test_goal_completes() {
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         while let Ok(event) = rx.try_recv() {
             match &event {
-                AgentEvent::MessageEnd { .. } => { got_message_end = true; }
-                AgentEvent::AgentEnd { .. } => { got_agent_end = true; }
+                AgentEvent::MessageEnd { .. } => {
+                    got_message_end = true;
+                }
+                AgentEvent::AgentEnd { .. } => {
+                    got_agent_end = true;
+                }
                 _ => {}
             }
         }
-        if got_agent_end { break; }
+        if got_agent_end {
+            break;
+        }
     }
 
-    assert!(got_agent_end, "Agent should have completed after goal was achieved");
+    assert!(
+        got_agent_end,
+        "Agent should have completed after goal was achieved"
+    );
     assert!(got_message_end, "Should have message end");
     eprintln!("Goal test: agent completed after goal achieved");
 }
 
 #[tokio::test]
+#[ignore = "requires live provider credentials or downloaded model; run explicitly with --ignored"]
 async fn e2e_test_goal_nudge_detected() {
-    let config = match load_e2e_config() {
-        Some(c) => c,
-        None => {
-            eprintln!("Skipping e2e test: credentials not set");
-            return;
-        }
-    };
+    let config = load_e2e_config().expect("live tests require explicit provider credentials");
 
     let openai_config = OpenAIConfig {
         base_url: config.base_url.clone().unwrap_or_default(),
@@ -626,19 +701,26 @@ async fn e2e_test_goal_nudge_detected() {
         model: config.model_tag.clone().unwrap_or_default(),
         context_window: 128000,
         timeout_secs: 0,
-            reasoning: false,
+        reasoning: false,
     };
 
     let session = AgentSession::from_config(openai_config);
     // Goal requires a specific phrase. The prompt does NOT mention this phrase,
     // so the first response won't satisfy it. Verification fails → nudge → agent tries again.
     let required_phrase = "nudge_xyz_789";
-    session.set_goal(Some(format!("Your response must include the exact phrase '{}'.", required_phrase))).await;
+    session
+        .set_goal(Some(format!(
+            "Your response must include the exact phrase '{}'.",
+            required_phrase
+        )))
+        .await;
 
     let (tx, mut rx) = mpsc::unbounded_channel::<AgentEvent>();
 
     // Deliberately do NOT mention the required phrase in the prompt
-    let result = session.prompt("Say exactly 'hello world', nothing else.", tx.clone()).await;
+    let result = session
+        .prompt("Say exactly 'hello world', nothing else.", tx.clone())
+        .await;
     assert!(result.is_ok(), "Goal prompt should complete");
 
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(120);
@@ -657,11 +739,15 @@ async fn e2e_test_goal_nudge_detected() {
                         user_message_after_first = true;
                     }
                 }
-                AgentEvent::AgentEnd { .. } => { got_agent_end = true; }
+                AgentEvent::AgentEnd { .. } => {
+                    got_agent_end = true;
+                }
                 _ => {}
             }
         }
-        if got_agent_end { break; }
+        if got_agent_end {
+            break;
+        }
     }
 
     assert!(got_agent_end, "Agent should complete");
@@ -670,21 +756,13 @@ async fn e2e_test_goal_nudge_detected() {
         "Expected a nudge (second user message). msg_count={}",
         msg_count
     );
-    eprintln!(
-        "Nudge test PASSED: msg_count={}, nudge detected",
-        msg_count
-    );
+    eprintln!("Nudge test PASSED: msg_count={}, nudge detected", msg_count);
 }
 
 #[tokio::test]
+#[ignore = "requires live provider credentials or downloaded model; run explicitly with --ignored"]
 async fn e2e_test_goal_no_goal_normal_flow() {
-    let config = match load_e2e_config() {
-        Some(c) => c,
-        None => {
-            eprintln!("Skipping e2e test: credentials not set");
-            return;
-        }
-    };
+    let config = load_e2e_config().expect("live tests require explicit provider credentials");
 
     let openai_config = OpenAIConfig {
         base_url: config.base_url.clone().unwrap_or_default(),
@@ -692,7 +770,7 @@ async fn e2e_test_goal_no_goal_normal_flow() {
         model: config.model_tag.clone().unwrap_or_default(),
         context_window: 128000,
         timeout_secs: 0,
-            reasoning: false,
+        reasoning: false,
     };
 
     // No goal set — normal flow
@@ -708,23 +786,22 @@ async fn e2e_test_goal_no_goal_normal_flow() {
     while std::time::Instant::now() < deadline {
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         while let Ok(event) = rx.try_recv() {
-            if matches!(event, AgentEvent::AgentEnd { .. }) { got_end = true; }
+            if matches!(event, AgentEvent::AgentEnd { .. }) {
+                got_end = true;
+            }
         }
-        if got_end { break; }
+        if got_end {
+            break;
+        }
     }
     assert!(got_end, "Normal flow should complete with agent_end");
     eprintln!("No-goal test: normal flow completed");
 }
 
 #[tokio::test]
+#[ignore = "requires live provider credentials or downloaded model; run explicitly with --ignored"]
 async fn e2e_test_goal_rpc_set_and_run() {
-    let config = match load_e2e_config() {
-        Some(c) => c,
-        None => {
-            eprintln!("Skipping e2e test: credentials not set");
-            return;
-        }
-    };
+    let config = load_e2e_config().expect("live tests require explicit provider credentials");
 
     let openai_config = OpenAIConfig {
         base_url: config.base_url.clone().unwrap_or_default(),
@@ -732,11 +809,15 @@ async fn e2e_test_goal_rpc_set_and_run() {
         model: config.model_tag.clone().unwrap_or_default(),
         context_window: 128000,
         timeout_secs: 0,
-            reasoning: false,
+        reasoning: false,
     };
 
     let session = AgentSession::from_config(openai_config);
-    session.set_goal(Some("Say the word 'done' at the end of your response.".into())).await;
+    session
+        .set_goal(Some(
+            "Say the word 'done' at the end of your response.".into(),
+        ))
+        .await;
 
     let handler = RpcHandler::new(session);
     let (tx, mut rx) = mpsc::unbounded_channel::<String>();
@@ -755,22 +836,25 @@ async fn e2e_test_goal_rpc_set_and_run() {
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         while let Ok(line) = rx.try_recv() {
             if let Ok(event) = serde_json::from_str::<AgentEvent>(line.trim()) {
-                if matches!(event, AgentEvent::AgentEnd { .. }) { got_agent_end = true; }
+                if matches!(event, AgentEvent::AgentEnd { .. }) {
+                    got_agent_end = true;
+                }
             }
         }
-        if got_agent_end { break; }
-    }
-    assert!(got_agent_end, "RPC goal mode should complete with agent_end");
-    eprintln!("RPC goal test: completed");
-}#[tokio::test]
-async fn e2e_test_approval_deny_tool() {
-    let config = match load_e2e_config() {
-        Some(c) => c,
-        None => {
-            eprintln!("Skipping e2e test: credentials not set");
-            return;
+        if got_agent_end {
+            break;
         }
-    };
+    }
+    assert!(
+        got_agent_end,
+        "RPC goal mode should complete with agent_end"
+    );
+    eprintln!("RPC goal test: completed");
+}
+#[tokio::test]
+#[ignore = "requires live provider credentials or downloaded model; run explicitly with --ignored"]
+async fn e2e_test_approval_deny_tool() {
+    let config = load_e2e_config().expect("live tests require explicit provider credentials");
 
     let openai_config = OpenAIConfig {
         base_url: config.base_url.clone().unwrap_or_default(),
@@ -778,7 +862,7 @@ async fn e2e_test_approval_deny_tool() {
         model: config.model_tag.clone().unwrap_or_default(),
         context_window: 128000,
         timeout_secs: 0,
-            reasoning: false,
+        reasoning: false,
     };
 
     let session = AgentSession::from_config(openai_config);
@@ -791,7 +875,10 @@ async fn e2e_test_approval_deny_tool() {
     let (tx, mut rx) = mpsc::unbounded_channel::<AgentEvent>();
 
     // Send a prompt that explicitly asks to use bash
-    session.prompt("Use bash to check the current date and time.", tx.clone()).await.unwrap();
+    session
+        .prompt("Use bash to check the current date and time.", tx.clone())
+        .await
+        .unwrap();
 
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
     let mut saw_denied = false;
@@ -801,7 +888,9 @@ async fn e2e_test_approval_deny_tool() {
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         while let Ok(event) = rx.try_recv() {
             match &event {
-                AgentEvent::ToolExecutionEnd { tool_name, result, .. } => {
+                AgentEvent::ToolExecutionEnd {
+                    tool_name, result, ..
+                } => {
                     if tool_name == "bash" && result.contains("denied") {
                         saw_denied = true;
                     }
@@ -812,7 +901,9 @@ async fn e2e_test_approval_deny_tool() {
                 _ => {}
             }
         }
-        if saw_denied && agent_ended { break; }
+        if saw_denied && agent_ended {
+            break;
+        }
     }
 
     assert!(saw_denied, "Should have seen a denied tool execution");
@@ -821,14 +912,9 @@ async fn e2e_test_approval_deny_tool() {
 }
 
 #[tokio::test]
+#[ignore = "requires live provider credentials or downloaded model; run explicitly with --ignored"]
 async fn e2e_test_approval_allow_tool() {
-    let config = match load_e2e_config() {
-        Some(c) => c,
-        None => {
-            eprintln!("Skipping e2e test: credentials not set");
-            return;
-        }
-    };
+    let config = load_e2e_config().expect("live tests require explicit provider credentials");
 
     let openai_config = OpenAIConfig {
         base_url: config.base_url.clone().unwrap_or_default(),
@@ -836,7 +922,7 @@ async fn e2e_test_approval_allow_tool() {
         model: config.model_tag.clone().unwrap_or_default(),
         context_window: 128000,
         timeout_secs: 0,
-            reasoning: false,
+        reasoning: false,
     };
 
     let session = AgentSession::from_config(openai_config);
@@ -848,7 +934,10 @@ async fn e2e_test_approval_allow_tool() {
 
     let (tx, mut rx) = mpsc::unbounded_channel::<AgentEvent>();
 
-    session.prompt("Use bash to check the current date.", tx.clone()).await.unwrap();
+    session
+        .prompt("Use bash to check the current date.", tx.clone())
+        .await
+        .unwrap();
 
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
     let mut saw_allowed = false;
@@ -858,7 +947,9 @@ async fn e2e_test_approval_allow_tool() {
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         while let Ok(event) = rx.try_recv() {
             match &event {
-                AgentEvent::ToolExecutionEnd { tool_name, result, .. } => {
+                AgentEvent::ToolExecutionEnd {
+                    tool_name, result, ..
+                } => {
                     if tool_name == "bash" && !result.contains("denied") {
                         saw_allowed = true;
                     }
@@ -869,7 +960,9 @@ async fn e2e_test_approval_allow_tool() {
                 _ => {}
             }
         }
-        if saw_allowed && agent_ended { break; }
+        if saw_allowed && agent_ended {
+            break;
+        }
     }
 
     assert!(saw_allowed, "Should have seen an allowed tool execution");
@@ -878,14 +971,9 @@ async fn e2e_test_approval_allow_tool() {
 }
 
 #[tokio::test]
+#[ignore = "requires live provider credentials or downloaded model; run explicitly with --ignored"]
 async fn e2e_test_approval_yolo_default() {
-    let config = match load_e2e_config() {
-        Some(c) => c,
-        None => {
-            eprintln!("Skipping e2e test: credentials not set");
-            return;
-        }
-    };
+    let config = load_e2e_config().expect("live tests require explicit provider credentials");
 
     let openai_config = OpenAIConfig {
         base_url: config.base_url.clone().unwrap_or_default(),
@@ -893,14 +981,17 @@ async fn e2e_test_approval_yolo_default() {
         model: config.model_tag.clone().unwrap_or_default(),
         context_window: 128000,
         timeout_secs: 0,
-            reasoning: false,
+        reasoning: false,
     };
 
     let session = AgentSession::from_config(openai_config);
     // No approval fn set = YOLO mode (tools always allowed)
     let (tx, mut rx) = mpsc::unbounded_channel::<AgentEvent>();
 
-    session.prompt("Use bash to check the current date.", tx.clone()).await.unwrap();
+    session
+        .prompt("Use bash to check the current date.", tx.clone())
+        .await
+        .unwrap();
 
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
     let mut saw_tool = false;
@@ -921,23 +1012,23 @@ async fn e2e_test_approval_yolo_default() {
                 _ => {}
             }
         }
-        if saw_tool && agent_ended { break; }
+        if saw_tool && agent_ended {
+            break;
+        }
     }
 
-    assert!(saw_tool, "Should have seen a bash tool execution in YOLO mode");
+    assert!(
+        saw_tool,
+        "Should have seen a bash tool execution in YOLO mode"
+    );
     assert!(agent_ended, "Agent should complete");
     eprintln!("YOLO test passed: tool ran without approval prompt");
 }
 
 #[tokio::test]
+#[ignore = "requires live provider credentials or downloaded model; run explicitly with --ignored"]
 async fn e2e_test_steer_queues_during_streaming() {
-    let config = match load_e2e_config() {
-        Some(c) => c,
-        None => {
-            eprintln!("Skipping e2e test: credentials not set");
-            return;
-        }
-    };
+    let config = load_e2e_config().expect("live tests require explicit provider credentials");
 
     let openai_config = OpenAIConfig {
         base_url: config.base_url.clone().unwrap_or_default(),
@@ -962,12 +1053,13 @@ async fn e2e_test_steer_queues_during_streaming() {
 
     // Queue a steer very soon after starting (before the agent finishes)
     tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-    session.steer("Also, check how long the system has been running (uptime).").await;
+    session
+        .steer("Also, check how long the system has been running (uptime).")
+        .await;
 
     // Wait for completion
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
     let mut agent_ended = false;
-    let mut steer_processed = false;
 
     while std::time::Instant::now() < deadline {
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
@@ -976,20 +1068,28 @@ async fn e2e_test_steer_queues_during_streaming() {
                 agent_ended = true;
             }
         }
-        if agent_ended { break; }
+        if agent_ended {
+            break;
+        }
     }
 
     // After completion, check that the steer message is in the conversation history
     let msgs = session.messages().await;
-    steer_processed = msgs.iter().any(|m| m.content.contains("uptime"));
+    let steer_processed = msgs.iter().any(|m| m.content.contains("uptime"));
 
     assert!(agent_ended, "Agent should complete after steer");
-    assert!(steer_processed, "Steer message should be in conversation history. Messages: {:?}",
-        msgs.iter().map(|m| format!("{}: {}", m.role, &m.content[..m.content.len().min(60)])).collect::<Vec<_>>());
+    assert!(
+        steer_processed,
+        "Steer message should be in conversation history. Messages: {:?}",
+        msgs.iter()
+            .map(|m| format!("{}: {}", m.role, &m.content[..m.content.len().min(60)]))
+            .collect::<Vec<_>>()
+    );
     eprintln!("Steer test: completed, steer was processed");
 }
 
 #[tokio::test]
+#[ignore = "requires live provider credentials or downloaded model; run explicitly with --ignored"]
 async fn e2e_test_code_search_semantic() {
     // Build a small index with known code and verify semantic search finds the right chunk.
     let dir = std::env::temp_dir().join("rupi-e2e-code-search");
@@ -1056,7 +1156,11 @@ fn handle_connection(mut stream: TcpStream) {
 
     // Test 1: Build semantic index and search
     let index_result = rupi::code_search::CodeSearchIndex::build(&dir);
-    assert!(index_result.is_ok(), "Index should build: {:?}", index_result.err());
+    assert!(
+        index_result.is_ok(),
+        "Index should build: {:?}",
+        index_result.err()
+    );
     let index = index_result.unwrap();
     assert!(index.len() >= 3, "Should have at least 3 chunks");
 
@@ -1064,21 +1168,38 @@ fn handle_connection(mut stream: TcpStream) {
     let results = index.search("user authentication login", 5);
     assert!(!results.is_empty(), "Should find auth code");
     let has_auth = results.iter().any(|r| r.chunk.file_path.contains("auth"));
-    assert!(has_auth, "Should find auth.rs in results: {:?}",
-        results.iter().map(|r| format!("{}:{:.2}", r.chunk.file_path, r.score)).collect::<Vec<_>>());
-    eprintln!("e2e: semantic search found auth.rs (score={:.4})", results[0].score);
+    assert!(
+        has_auth,
+        "Should find auth.rs in results: {:?}",
+        results
+            .iter()
+            .map(|r| format!("{}:{:.2}", r.chunk.file_path, r.score))
+            .collect::<Vec<_>>()
+    );
+    eprintln!(
+        "e2e: semantic search found auth.rs (score={:.4})",
+        results[0].score
+    );
 
     // Test 3: Search for network/server code
     let results2 = index.search("tcp network server connection", 5);
     assert!(!results2.is_empty(), "Should find server code");
-    let has_server = results2.iter().any(|r| r.chunk.file_path.contains("server"));
+    let has_server = results2
+        .iter()
+        .any(|r| r.chunk.file_path.contains("server"));
     assert!(has_server, "Should find server.rs in results");
-    eprintln!("e2e: semantic search found server.rs (score={:.4})", results2[0].score);
+    eprintln!(
+        "e2e: semantic search found server.rs (score={:.4})",
+        results2[0].score
+    );
 
     // Test 4: Keyword search fallback
     let chunks = rupi::code_search::index_path(&dir);
     let kw_results = rupi::code_search::search_keyword(&chunks, "connect database", 5);
-    assert!(!kw_results.is_empty(), "Keyword search should find database code");
+    assert!(
+        !kw_results.is_empty(),
+        "Keyword search should find database code"
+    );
     let has_db = kw_results.iter().any(|r| r.chunk.file_path.contains("db"));
     assert!(has_db, "Keyword search should find db.rs");
     eprintln!("e2e: keyword search found db.rs");
@@ -1092,6 +1213,7 @@ fn handle_connection(mut stream: TcpStream) {
 }
 
 #[tokio::test]
+#[ignore = "requires live provider credentials or downloaded model; run explicitly with --ignored"]
 async fn e2e_test_code_search_via_tool() {
     // Test the search_code tool through execute_tool
     let dir = std::env::temp_dir().join("rupi-e2e-code-search-tool");
@@ -1121,7 +1243,10 @@ async fn e2e_test_code_search_via_tool() {
     };
     let result = rupi::tools::execute_tool(&tc, &rupi::tools::ToolContext::new());
     assert!(!result.contains("Error:"), "Should not error: {}", result);
-    assert!(result.contains("calc.rs") || result.contains("add"), "Should find add function");
+    assert!(
+        result.contains("calc.rs") || result.contains("add"),
+        "Should find add function"
+    );
     eprintln!("e2e: search_code tool result found calc.rs");
 
     std::fs::remove_dir_all(&dir).unwrap();
@@ -1129,37 +1254,34 @@ async fn e2e_test_code_search_via_tool() {
 }
 
 #[tokio::test]
+#[ignore = "requires live provider credentials or downloaded model; run explicitly with --ignored"]
 async fn e2e_test_session_resume() {
     // Create a session with a prompt, get its path, then resume it
-    let config = match load_e2e_config() {
-        Some(c) => c,
-        None => {
-            eprintln!("Skipping e2e test: credentials not set");
-            return;
-        }
-    };
+    let config = load_e2e_config().expect("live tests require explicit provider credentials");
 
     let openai_config = make_config(&config);
-    let model = openai_config.model.clone();
-    let cwd = std::env::current_dir().unwrap().to_string_lossy().to_string();
+    let _model = openai_config.model.clone();
+    let cwd = std::env::current_dir()
+        .unwrap()
+        .to_string_lossy()
+        .to_string();
 
     // Step 1: Create a session and send a message
-    let session1 = AgentSession::from_config_with(
-        openai_config.clone(),
-        cwd.clone(),
-        vec![],
-        vec![],
-        false,
-    );
+    let session1 =
+        AgentSession::from_config_with(openai_config.clone(), cwd.clone(), vec![], vec![], false);
     let session_path = session1.session_path().await;
     assert!(session_path.is_some(), "Session should have a path");
     let path = session_path.unwrap();
-    let session_id = path.file_stem().and_then(|s| s.to_str()).unwrap().to_string();
+    let session_id = path
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap()
+        .to_string();
     eprintln!("e2e: session_id = {}", session_id);
 
     // Send a message to the session
     let (tx, mut rx) = mpsc::unbounded_channel::<AgentEvent>();
-    let msg = format!("Reply with just the word 'pineapple' in lowercase, nothing else.");
+    let msg = "Reply with just the word 'pineapple' in lowercase, nothing else.".to_string();
     let result = session1.prompt(&msg, tx.clone()).await;
     assert!(result.is_ok(), "Prompt should succeed");
 
@@ -1168,9 +1290,13 @@ async fn e2e_test_session_resume() {
     while std::time::Instant::now() < deadline {
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         while let Ok(event) = rx.try_recv() {
-            if matches!(event, AgentEvent::AgentEnd { .. }) { got_end = true; }
+            if matches!(event, AgentEvent::AgentEnd { .. }) {
+                got_end = true;
+            }
         }
-        if got_end { break; }
+        if got_end {
+            break;
+        }
     }
     assert!(got_end, "Agent should complete");
     drop(session1);
@@ -1179,7 +1305,11 @@ async fn e2e_test_session_resume() {
     assert!(path.exists(), "Session file should exist: {:?}", path);
     let messages = rupi::sessions::load_session(&path).unwrap();
     assert!(!messages.is_empty(), "Session should have messages");
-    eprintln!("e2e: session has {} messages, session_id={}", messages.len(), session_id);
+    eprintln!(
+        "e2e: session has {} messages, session_id={}",
+        messages.len(),
+        session_id
+    );
 
     // Step 3: Resume the session
     let session2 = AgentSession::from_session(
@@ -1189,18 +1319,32 @@ async fn e2e_test_session_resume() {
         vec![],
         vec![],
         false,
-    ).await.unwrap();
-    assert_eq!(session2.messages().await.len(), messages.len(), "Resumed session should have same messages");
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        session2.messages().await.len(),
+        messages.len(),
+        "Resumed session should have same messages"
+    );
     let state = session2.get_state().await;
-    assert!(state.session_file.as_deref().map_or(false, |p| p.contains(&session_id)));
-    eprintln!("e2e: resumed session with {} messages", session2.messages().await.len());
+    assert!(state
+        .session_file
+        .as_deref()
+        .is_some_and(|p| p.contains(&session_id)));
+    eprintln!(
+        "e2e: resumed session with {} messages",
+        session2.messages().await.len()
+    );
 
     // Step 4: Continue the conversation — ask about the previous message
     let (tx2, mut rx2) = mpsc::unbounded_channel::<AgentEvent>();
-    let result2 = session2.prompt(
-        "What word did you just say? Reply with just that word.",
-        tx2.clone(),
-    ).await;
+    let result2 = session2
+        .prompt(
+            "What word did you just say? Reply with just that word.",
+            tx2.clone(),
+        )
+        .await;
     assert!(result2.is_ok(), "Continuation prompt should succeed");
 
     let deadline2 = std::time::Instant::now() + std::time::Duration::from_secs(30);
@@ -1209,31 +1353,36 @@ async fn e2e_test_session_resume() {
     while std::time::Instant::now() < deadline2 {
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         while let Ok(event) = rx2.try_recv() {
-            if let AgentEvent::MessageUpdate { assistant_message_event, .. } = &event {
-                if let rupi::rpc::types::AssistantMessageEvent::TextDelta { delta } = assistant_message_event {
-                    full_text.push_str(delta);
-                }
+            if let AgentEvent::MessageUpdate {
+                assistant_message_event:
+                    rupi::rpc::types::AssistantMessageEvent::TextDelta { delta },
+                ..
+            } = &event
+            {
+                full_text.push_str(delta);
             }
-            if matches!(event, AgentEvent::AgentEnd { .. }) { got_end2 = true; }
+            if matches!(event, AgentEvent::AgentEnd { .. }) {
+                got_end2 = true;
+            }
         }
-        if got_end2 { break; }
+        if got_end2 {
+            break;
+        }
     }
     assert!(got_end2, "Continued agent should complete");
-    assert!(full_text.to_lowercase().contains("pineapple"),
-        "Continued agent should remember 'pineapple' from previous session. Got: {}", full_text);
+    assert!(
+        full_text.to_lowercase().contains("pineapple"),
+        "Continued agent should remember 'pineapple' from previous session. Got: {}",
+        full_text
+    );
     eprintln!("e2e: resumed session correctly remembered previous context");
 }
 
 #[tokio::test]
+#[ignore = "requires live provider credentials or downloaded model; run explicitly with --ignored"]
 async fn e2e_test_session_resume_rpc_list() {
     // Verify list_sessions works through RPC
-    let config = match load_e2e_config() {
-        Some(c) => c,
-        None => {
-            eprintln!("Skipping e2e test: credentials not set");
-            return;
-        }
-    };
+    let config = load_e2e_config().expect("live tests require explicit provider credentials");
 
     let openai_config = make_config(&config);
     let session = AgentSession::from_config(openai_config);
@@ -1243,32 +1392,39 @@ async fn e2e_test_session_resume_rpc_list() {
     // Verify we can list sessions
     let sessions = rupi::sessions::list_sessions().unwrap_or_default();
     let found = sessions.iter().any(|s| {
-        path.as_ref().map_or(false, |p| {
-            p.to_string_lossy().contains(&s.id)
-        })
+        path.as_ref()
+            .is_some_and(|p| p.to_string_lossy().contains(&s.id))
     });
     // The session might not show up in list (directory mismatch) but at least it doesn't crash
-    eprintln!("e2e: list_sessions returned {} entries, found={}", sessions.len(), found);
+    eprintln!(
+        "e2e: list_sessions returned {} entries, found={}",
+        sessions.len(),
+        found
+    );
 }
 
 #[tokio::test]
+#[ignore = "requires live provider credentials or downloaded model; run explicitly with --ignored"]
 async fn e2e_test_session_create_and_find() {
     // Test create_session uses UUID and find_session_path works
-    let config = match load_e2e_config() {
-        Some(c) => c,
-        None => {
-            eprintln!("Skipping e2e test: credentials not set");
-            return;
-        }
-    };
+    let config = load_e2e_config().expect("live tests require explicit provider credentials");
 
     let openai_config = make_config(&config);
     let session = AgentSession::from_config(openai_config);
     let path = session.session_path().await;
     assert!(path.is_some(), "Session should have a path");
     let path = path.unwrap();
-    let id = path.file_stem().and_then(|s| s.to_str()).unwrap().to_string();
-    assert_eq!(id.len(), 36, "Session ID should be UUID format, got: {}", id);
+    let id = path
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap()
+        .to_string();
+    assert_eq!(
+        id.len(),
+        36,
+        "Session ID should be UUID format, got: {}",
+        id
+    );
 
     // Verify find_session_path works
     let found = rupi::sessions::find_session_path(&id);
@@ -1278,27 +1434,26 @@ async fn e2e_test_session_create_and_find() {
 }
 
 #[tokio::test]
+#[ignore = "requires live provider credentials or downloaded model; run explicitly with --ignored"]
 async fn e2e_test_loop_mode() {
-    let config = match load_e2e_config() {
-        Some(c) => c,
-        None => {
-            eprintln!("Skipping e2e test: credentials not set");
-            return;
-        }
-    };
+    let config = load_e2e_config().expect("live tests require explicit provider credentials");
 
     let openai_config = make_config(&config);
     let session = Arc::new(AgentSession::from_config(openai_config));
 
     // Set loop mode with a simple prompt
-    session.set_loop(Some("Say hello and nothing else.".to_string())).await;
+    session
+        .set_loop(Some("Say hello and nothing else.".to_string()))
+        .await;
 
     let (tx, mut rx) = mpsc::unbounded_channel::<AgentEvent>();
 
     // Start the prompt (this will loop)
     let s = session.clone();
     let prompt_handle = tokio::spawn(async move {
-        s.prompt("Say hello and nothing else.", tx.clone()).await.unwrap();
+        s.prompt("Say hello and nothing else.", tx.clone())
+            .await
+            .unwrap();
     });
 
     // Wait for several turn_end events (agent_end is suppressed in loop mode)
@@ -1314,26 +1469,27 @@ async fn e2e_test_loop_mode() {
                 }
             }
         }
-        if turn_end_count >= 2 { break; }
+        if turn_end_count >= 2 {
+            break;
+        }
     }
 
     // Cancel the loop
     session.cancel_loop().await;
     let _ = prompt_handle.await;
 
-    assert!(turn_end_count >= 2, "Loop should have run at least 2 iterations (turn_end count: {})", turn_end_count);
+    assert!(
+        turn_end_count >= 2,
+        "Loop should have run at least 2 iterations (turn_end count: {})",
+        turn_end_count
+    );
     eprintln!("Loop test: {} turn_end events seen", turn_end_count);
 }
 
 #[tokio::test]
+#[ignore = "requires live provider credentials or downloaded model; run explicitly with --ignored"]
 async fn e2e_test_loop_mode_prompt_repeated() {
-    let config = match load_e2e_config() {
-        Some(c) => c,
-        None => {
-            eprintln!("Skipping e2e test: credentials not set");
-            return;
-        }
-    };
+    let config = load_e2e_config().expect("live tests require explicit provider credentials");
 
     let openai_config = make_config(&config);
     let session = Arc::new(AgentSession::from_config(openai_config));
@@ -1361,17 +1517,33 @@ async fn e2e_test_loop_mode_prompt_repeated() {
                 }
             }
         }
-        if turn_end_count >= 2 { break; }
+        if turn_end_count >= 2 {
+            break;
+        }
     }
 
     session.cancel_loop().await;
     let _ = prompt_handle.await;
 
-    assert!(turn_end_count >= 2, "Loop should have run at least 2 iterations, got {}", turn_end_count);
+    assert!(
+        turn_end_count >= 2,
+        "Loop should have run at least 2 iterations, got {}",
+        turn_end_count
+    );
 
     // The "Say goodbye." prompt should appear multiple times in conversation
     let msgs = session.messages().await;
-    let goodbye_count = msgs.iter().filter(|m| m.content.contains("goodbye")).count();
-    eprintln!("Loop repeat test: {} 'goodbye' messages in conversation", goodbye_count);
-    assert!(goodbye_count >= 2, "Should have at least 2 'goodbye' messages, got {}", goodbye_count);
+    let goodbye_count = msgs
+        .iter()
+        .filter(|m| m.content.contains("goodbye"))
+        .count();
+    eprintln!(
+        "Loop repeat test: {} 'goodbye' messages in conversation",
+        goodbye_count
+    );
+    assert!(
+        goodbye_count >= 2,
+        "Should have at least 2 'goodbye' messages, got {}",
+        goodbye_count
+    );
 }

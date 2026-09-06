@@ -12,12 +12,16 @@ const SNIP_PRESERVE_TURNS: usize = 6;
 /// Runs before LLM-based compaction (auto-compact) to reduce token count without API cost.
 /// Keeps first ~40% + last ~30% of each old tool result (preserving beginning and end).
 /// Returns the number of characters removed.
-pub fn snip_old_tool_results(messages: &mut Vec<Message>, preserve_turns: usize) -> u64 {
+pub fn snip_old_tool_results(messages: &mut [Message], preserve_turns: usize) -> u64 {
     if messages.len() < 4 {
         return 0;
     }
 
-    let preserve_turns = if preserve_turns == 0 { SNIP_PRESERVE_TURNS } else { preserve_turns };
+    let preserve_turns = if preserve_turns == 0 {
+        SNIP_PRESERVE_TURNS
+    } else {
+        preserve_turns
+    };
 
     // Count backwards to find the preserve boundary.
     // When we find user #(preserve_turns+1), everything up to the end of
@@ -125,7 +129,7 @@ pub fn estimate_message_tokens(msg: &Message) -> u64 {
 
 /// Estimate total tokens for a slice of messages.
 pub fn estimate_total_tokens(messages: &[Message]) -> u64 {
-    messages.iter().map(|m| estimate_message_tokens(m)).sum()
+    messages.iter().map(estimate_message_tokens).sum()
 }
 
 /// Whether compaction should trigger given current token count and context window.
@@ -155,10 +159,7 @@ pub fn tool_pairing_balanced_before(messages: &[Message], cut: usize) -> bool {
     if cut == 0 {
         return true;
     }
-    match messages[cut - 1].tool_calls {
-        Some(ref calls) if !calls.is_empty() => false,
-        _ => true,
-    }
+    !matches!(messages[cut - 1].tool_calls, Some(ref calls) if !calls.is_empty())
 }
 
 /// Whether `messages[cut..]` is a well-formed request suffix.
@@ -290,7 +291,9 @@ pub const COMPACTION_INSTRUCTION: &str = concat!(
 /// Used only for logging and for the merge assertion in tests. The instruction
 /// itself always states the merge rule, so the summarizer needs no extra prompt.
 pub fn region_contains_checkpoint(messages: &[Message]) -> bool {
-    messages.iter().any(|m| m.content.contains(SUMMARY_OPEN_TAG))
+    messages
+        .iter()
+        .any(|m| m.content.contains(SUMMARY_OPEN_TAG))
 }
 
 /// Build the exact message list sent to the summarizer.
@@ -313,7 +316,12 @@ pub fn build_summarization_request(
 
 /// Wrap a raw summary in the tags that let a later compaction recognize it.
 pub fn frame_summary(summary: &str) -> String {
-    format!("{}\n{}\n{}", SUMMARY_OPEN_TAG, summary.trim(), SUMMARY_CLOSE_TAG)
+    format!(
+        "{}\n{}\n{}",
+        SUMMARY_OPEN_TAG,
+        summary.trim(),
+        SUMMARY_CLOSE_TAG
+    )
 }
 
 /// Build the full checkpoint message body that replaces the summarized region.
@@ -586,7 +594,10 @@ mod tests {
         let plain = vec![Message::new("user", "hello")];
         assert!(!region_contains_checkpoint(&plain));
 
-        let carried = vec![Message::new("user", &build_checkpoint_body("## Summary\n- did things"))];
+        let carried = vec![Message::new(
+            "user",
+            &build_checkpoint_body("## Summary\n- did things"),
+        )];
         assert!(region_contains_checkpoint(&carried));
     }
 
@@ -649,8 +660,16 @@ mod tests {
         // First tool result (turn 1 of 3) should be snipped (exceeds preserve_turns=2)
         assert!(msgs[2].content.contains("[snip:"));
         // Second and third tool results should NOT be snipped (within last 2 turns)
-        assert!(!msgs[5].content.contains("[snip:"), "second tool should be preserved: {}", msgs[5].content);
-        assert!(!msgs[8].content.contains("[snip:"), "third tool should be preserved: {}", msgs[8].content);
+        assert!(
+            !msgs[5].content.contains("[snip:"),
+            "second tool should be preserved: {}",
+            msgs[5].content
+        );
+        assert!(
+            !msgs[8].content.contains("[snip:"),
+            "third tool should be preserved: {}",
+            msgs[8].content
+        );
     }
 
     #[test]
@@ -695,10 +714,16 @@ mod tests {
             timeout_secs: 0,
             reasoning: false,
         };
-        let provider: Arc<dyn ChatProvider> = Arc::new(crate::provider::openai::OpenAIProvider::new(config));
-        let msgs = vec![Message::new("user", "hi"), Message::new("assistant", "hello")];
+        let provider: Arc<dyn ChatProvider> =
+            Arc::new(crate::provider::openai::OpenAIProvider::new(config));
+        let msgs = vec![
+            Message::new("user", "hi"),
+            Message::new("assistant", "hello"),
+        ];
 
-        let result = rt.block_on(run_compaction(&provider, "gpt-4", None, &msgs, false, 128000));
+        let result = rt.block_on(run_compaction(
+            &provider, "gpt-4", None, &msgs, false, 128000,
+        ));
         assert!(result.is_ok());
         assert!(result.unwrap().is_none());
     }
@@ -714,10 +739,16 @@ mod tests {
             timeout_secs: 0,
             reasoning: false,
         };
-        let provider: Arc<dyn ChatProvider> = Arc::new(crate::provider::openai::OpenAIProvider::new(config));
-        let msgs = vec![Message::new("user", "hi"), Message::new("assistant", "hello")];
+        let provider: Arc<dyn ChatProvider> =
+            Arc::new(crate::provider::openai::OpenAIProvider::new(config));
+        let msgs = vec![
+            Message::new("user", "hi"),
+            Message::new("assistant", "hello"),
+        ];
 
-        let result = rt.block_on(run_compaction(&provider, "gpt-4", None, &msgs, true, 128000));
+        let result = rt.block_on(run_compaction(
+            &provider, "gpt-4", None, &msgs, true, 128000,
+        ));
         assert!(result.is_ok());
         // Below threshold, should return None
         assert!(result.unwrap().is_none());

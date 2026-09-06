@@ -12,17 +12,13 @@ pub const EOF_SIG: &str = "\x04";
 pub fn read_line_edited(prompt: &str) -> Option<String> {
     use rustyline::{Cmd, DefaultEditor, KeyCode, KeyEvent, Modifiers};
 
-    let config = rustyline::config::Builder::new()
-        .build();
+    let config = rustyline::config::Builder::new().build();
     let mut rl = match DefaultEditor::with_config(config) {
         Ok(rl) => rl,
         Err(_) => return None,
     };
     // Bind Alt+Enter to insert a newline
-    rl.bind_sequence(
-        KeyEvent(KeyCode::Enter, Modifiers::ALT),
-        Cmd::Newline,
-    );
+    rl.bind_sequence(KeyEvent(KeyCode::Enter, Modifiers::ALT), Cmd::Newline);
 
     match rl.readline(prompt) {
         Ok(line) => {
@@ -120,7 +116,11 @@ fn ensure_cooked_mode() {
     let fd = std::io::stdin().as_raw_fd();
     if let Ok(mut termios) = unsafe {
         let mut t: libc::termios = std::mem::zeroed();
-        if libc::tcgetattr(fd, &mut t) == 0 { Ok(t) } else { Err(()) }
+        if libc::tcgetattr(fd, &mut t) == 0 {
+            Ok(t)
+        } else {
+            Err(())
+        }
     } {
         // Only restore if terminal is in non-canonical mode
         if termios.c_lflag & libc::ICANON == 0 {
@@ -138,18 +138,16 @@ fn ensure_cooked_mode() {}
 fn read_escape_seq(stdin: &std::io::Stdin) -> std::io::Result<()> {
     let mut byte = [0u8; 1];
     let mut handle = stdin.lock();
-    handle.read(&mut byte)?;
+    handle.read_exact(&mut byte)?;
     match byte[0] {
-        b'[' => {
-            loop {
-                handle.read(&mut byte)?;
-                if byte[0] >= 0x40 && byte[0] <= 0x7e {
-                    break;
-                }
+        b'[' => loop {
+            handle.read_exact(&mut byte)?;
+            if byte[0] >= 0x40 && byte[0] <= 0x7e {
+                break;
             }
-        }
+        },
         b'O' => {
-            handle.read(&mut byte)?;
+            handle.read_exact(&mut byte)?;
         }
         _ => {}
     }

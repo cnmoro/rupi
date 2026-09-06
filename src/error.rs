@@ -17,7 +17,10 @@ impl fmt::Display for AgentError {
             AgentError::Io(e) => write!(f, "IO error: {}", e),
             AgentError::Serde(e) => write!(f, "JSON error: {}", e),
             AgentError::Http(e) => write!(f, "HTTP error: {}", e),
-            AgentError::Api { message, status_code } => {
+            AgentError::Api {
+                message,
+                status_code,
+            } => {
                 write!(f, "API error ({}): {}", status_code, message)
             }
             AgentError::Config(msg) => write!(f, "Config error: {}", msg),

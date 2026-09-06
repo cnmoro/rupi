@@ -26,16 +26,30 @@ pub struct SpillRef {
 
 /// Directory that holds spill artifacts for one session.
 pub fn spill_dir(session_id: &str) -> Option<PathBuf> {
-    Some(crate::sessions::sessions_dir()?.join("spill").join(sanitize(session_id)))
+    Some(
+        crate::sessions::sessions_dir()?
+            .join("spill")
+            .join(sanitize(session_id)),
+    )
 }
 
 /// Reduce an identifier to characters that are safe in a path segment.
 fn sanitize(name: &str) -> String {
     let cleaned: String = name
         .chars()
-        .map(|c| if c.is_ascii_alphanumeric() || c == '-' || c == '_' { c } else { '_' })
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+                c
+            } else {
+                '_'
+            }
+        })
         .collect();
-    if cleaned.is_empty() { "session".to_string() } else { cleaned }
+    if cleaned.is_empty() {
+        "session".to_string()
+    } else {
+        cleaned
+    }
 }
 
 /// Persist the full text of one tool result.
@@ -43,7 +57,12 @@ fn sanitize(name: &str) -> String {
 /// Returns `None` when no sessions directory is available or the write fails.
 /// Both cases are normal degraded operation, not errors the caller must handle.
 pub fn save_text(session_id: &str, tool_name: &str, content: &str) -> Option<SpillRef> {
-    save_text_in(&crate::sessions::sessions_dir()?, session_id, tool_name, content)
+    save_text_in(
+        &crate::sessions::sessions_dir()?,
+        session_id,
+        tool_name,
+        content,
+    )
 }
 
 /// Persist the full text of one tool result under an explicit base directory.
@@ -65,7 +84,10 @@ pub fn save_text_in(
     if std::fs::write(&path, content).is_err() {
         return None;
     }
-    Some(SpillRef { path, bytes: content.len() })
+    Some(SpillRef {
+        path,
+        bytes: content.len(),
+    })
 }
 
 /// The retrieval hint appended to a truncated result that has a spill artifact.
@@ -103,7 +125,11 @@ mod tests {
         let base = scratch("traverse");
         let body = "secret";
         let spill = save_text_in(&base, "../../escape", "bash", body).unwrap();
-        assert!(spill.path.starts_with(&base), "spill escaped its base: {:?}", spill.path);
+        assert!(
+            spill.path.starts_with(&base),
+            "spill escaped its base: {:?}",
+            spill.path
+        );
         let _ = std::fs::remove_dir_all(&base);
     }
 

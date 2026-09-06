@@ -95,29 +95,32 @@ mod tests {
 
     #[test]
     fn test_default_mode_is_interactive() {
-        let cli = Cli::parse_from(&["rupi"]);
+        let cli = Cli::parse_from(["rupi"]);
         assert_eq!(cli.mode(), "interactive");
     }
 
     #[test]
     fn test_rpc_mode() {
-        let cli = Cli::parse_from(&["rupi", "--rpc"]);
+        let cli = Cli::parse_from(["rupi", "--rpc"]);
         assert_eq!(cli.mode(), "rpc");
     }
 
     #[test]
     fn test_raw_mode() {
-        let cli = Cli::parse_from(&["rupi", "--raw"]);
+        let cli = Cli::parse_from(["rupi", "--raw"]);
         assert_eq!(cli.mode(), "raw");
     }
 
     #[test]
     fn test_cli_overrides() {
-        let cli = Cli::parse_from(&[
+        let cli = Cli::parse_from([
             "rupi",
-            "--base-url", "https://custom.api.com",
-            "--api-key", "sk-custom",
-            "--model", "custom-model",
+            "--base-url",
+            "https://custom.api.com",
+            "--api-key",
+            "sk-custom",
+            "--model",
+            "custom-model",
         ]);
         assert_eq!(cli.base_url.as_deref(), Some("https://custom.api.com"));
         assert_eq!(cli.api_key.as_deref(), Some("sk-custom"));
@@ -126,7 +129,7 @@ mod tests {
 
     #[test]
     fn test_default_values() {
-        let cli = Cli::parse_from(&["rupi"]);
+        let cli = Cli::parse_from(["rupi"]);
         assert_eq!(cli.context_window, 128000);
         assert!(!cli.reasoning);
         assert!(!cli.rpc);
@@ -135,11 +138,14 @@ mod tests {
 
     #[test]
     fn test_env_var_names() {
-        let cli = Cli::parse_from(&[
+        let cli = Cli::parse_from([
             "rupi",
-            "--base-url", "https://api.example.com",
-            "--api-key", "sk-test",
-            "--model", "gpt-4",
+            "--base-url",
+            "https://api.example.com",
+            "--api-key",
+            "sk-test",
+            "--model",
+            "gpt-4",
         ]);
         assert_eq!(cli.base_url.as_deref(), Some("https://api.example.com"));
         assert_eq!(cli.api_key.as_deref(), Some("sk-test"));

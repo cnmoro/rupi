@@ -1,8 +1,9 @@
+use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex, OnceLock};
 
-use ndarray::Array2;
 use model2vec_rs::model::StaticModel;
+use ndarray::Array2;
 use tree_sitter::{Language, Parser};
 
 use crate::error::AgentError;
@@ -28,12 +29,15 @@ pub struct CodeSearchResult {
 pub struct CodeSearchIndex {
     chunks: Vec<CodeChunk>,
     embeddings: Array2<f32>,
+    boosts: Vec<f32>,
 }
 
 static MODEL: Mutex<Option<StaticModel>> = Mutex::new(None);
 
 fn get_model() -> Result<std::sync::MutexGuard<'static, Option<StaticModel>>, AgentError> {
-    let mut guard = MODEL.lock().map_err(|_| AgentError::Config("Model lock poisoned".into()))?;
+    let mut guard = MODEL
+        .lock()
+        .map_err(|_| AgentError::Config("Model lock poisoned".into()))?;
     if guard.is_none() {
         *guard = Some(
             StaticModel::from_pretrained(
@@ -43,13 +47,11 @@ fn get_model() -> Result<std::sync::MutexGuard<'static, Option<StaticModel>>, Ag
                 None::<&str>,
             )
             .map_err(|e| {
-                AgentError::Config(
-                    format!(
-                        "Failed to load code search model: {}. \
+                AgentError::Config(format!(
+                    "Failed to load code search model: {}. \
                          The model will be downloaded on first use from HuggingFace Hub.",
-                        e
-                    ),
-                )
+                    e
+                ))
             })?,
         );
     }
@@ -109,16 +111,39 @@ fn tree_sitter_language(lang: &str) -> Option<Language> {
 
 /// Standard file extensions for code files.
 const CODE_EXTENSIONS: &[&str] = &[
-    "rs", "py", "js", "jsx", "ts", "tsx", "go", "java", "rb", "c", "h", "cpp", "hpp", "cc",
-    "cs", "swift", "kt", "kts", "scala", "php", "r", "lua", "sh", "bash", "zsh", "sql",
+    "rs", "py", "js", "jsx", "ts", "tsx", "go", "java", "rb", "c", "h", "cpp", "hpp", "cc", "cs",
+    "swift", "kt", "kts", "scala", "php", "r", "lua", "sh", "bash", "zsh", "sql",
 ];
 
 /// Directories to always skip.
 const SKIP_DIRS: &[&str] = &[
-    ".git", "node_modules", "target", "build", "dist", ".next", "venv", ".venv",
-    "__pycache__", ".cache", ".svelte-kit", ".nuxt", "out", ".idea", ".vscode",
-    ".claude", "coverage", "vendor", ".gradle", ".tox", ".eggs", "egg-info",
-    "site-packages", ".bzr", ".hg", ".svn", "CVS",
+    ".git",
+    "node_modules",
+    "target",
+    "build",
+    "dist",
+    ".next",
+    "venv",
+    ".venv",
+    "__pycache__",
+    ".cache",
+    ".svelte-kit",
+    ".nuxt",
+    "out",
+    ".idea",
+    ".vscode",
+    ".claude",
+    "coverage",
+    "vendor",
+    ".gradle",
+    ".tox",
+    ".eggs",
+    "egg-info",
+    "site-packages",
+    ".bzr",
+    ".hg",
+    ".svn",
+    "CVS",
 ];
 
 /// Desired chunk length in characters (matching seemb's 1500).
@@ -127,21 +152,26 @@ const DESIRED_CHUNK_LENGTH: usize = 1500;
 /// Walk files in a directory matching code extensions.
 pub fn walk_code_files(path: &Path) -> Vec<PathBuf> {
     let mut files = Vec::new();
-    walk_dir(path, path, &mut files);
+    walk_dir(path, &mut files);
     files
 }
 
-fn walk_dir(root: &Path, dir: &Path, files: &mut Vec<PathBuf>) {
-    let Ok(entries) = std::fs::read_dir(dir) else { return };
+fn walk_dir(dir: &Path, files: &mut Vec<PathBuf>) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
     for entry in entries.flatten() {
         let path = entry.path();
         let file_name = entry.file_name().to_string_lossy().to_string();
         if file_name.starts_with('.') {
             continue;
         }
+        if entry.file_type().map_or(true, |kind| kind.is_symlink()) {
+            continue;
+        }
         if path.is_dir() {
             if !SKIP_DIRS.contains(&file_name.as_str()) {
-                walk_dir(root, &path, files);
+                walk_dir(&path, files);
             }
         } else if path.is_file() {
             if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
@@ -172,7 +202,9 @@ fn merge_node_inner(node: &tree_sitter::Node, desired_length: usize) -> Vec<Chun
 
     let mut groups: Vec<ChunkBoundary> = Vec::new();
     let mut index = 0;
-    let children: Vec<_> = (0..node.child_count()).filter_map(|i| node.child(i)).collect();
+    let children: Vec<_> = (0..node.child_count())
+        .filter_map(|i| node.child(i))
+        .collect();
 
     while index < children.len() {
         let child = &children[index];
@@ -221,7 +253,10 @@ fn merge_adjacent_chunks(chunks: &[ChunkBoundary], desired_length: usize) -> Vec
         let length = group.end - group.start;
 
         if current_length + length > desired_length {
-            merged.push(ChunkBoundary { start: current_start, end: current_end });
+            merged.push(ChunkBoundary {
+                start: current_start,
+                end: current_end,
+            });
             current_start = group.start;
             current_end = group.end;
             current_length = length;
@@ -231,7 +266,10 @@ fn merge_adjacent_chunks(chunks: &[ChunkBoundary], desired_length: usize) -> Vec
         }
     }
 
-    merged.push(ChunkBoundary { start: current_start, end: current_end });
+    merged.push(ChunkBoundary {
+        start: current_start,
+        end: current_end,
+    });
     merged
 }
 
@@ -279,7 +317,10 @@ fn chunk_lines(source: &str, desired_length: usize) -> Vec<ChunkBoundary> {
 
 /// Convert byte offset to 1-indexed line number.
 fn byte_to_line(source: &str, byte_offset: usize) -> usize {
-    source[..byte_offset.min(source.len())].lines().count().max(1)
+    source[..byte_offset.min(source.len())]
+        .lines()
+        .count()
+        .max(1)
 }
 
 /// Split a file's content into chunks using AST-aware or line-based chunking.
@@ -290,7 +331,8 @@ pub fn chunk_file(file_path: &str, content: &str, language: Option<String>) -> V
     }
 
     // Try AST chunking if language is supported
-    let boundaries = language.as_deref()
+    let boundaries = language
+        .as_deref()
         .and_then(tree_sitter_language)
         .map(|lang| chunk_ast(content, &lang, DESIRED_CHUNK_LENGTH))
         .unwrap_or_else(|| chunk_lines(content, DESIRED_CHUNK_LENGTH));
@@ -300,16 +342,19 @@ pub fn chunk_file(file_path: &str, content: &str, language: Option<String>) -> V
     }
 
     let source_len = content.len();
-    boundaries.into_iter().map(|b| {
-        let end = b.end.min(source_len);
-        CodeChunk {
-            file_path: file_path.to_string(),
-            start_line: byte_to_line(content, b.start),
-            end_line: byte_to_line(content, end.saturating_sub(1)),
-            content: content[b.start..end].to_string(),
-            language: language.clone(),
-        }
-    }).collect()
+    boundaries
+        .into_iter()
+        .map(|b| {
+            let end = b.end.min(source_len);
+            CodeChunk {
+                file_path: file_path.to_string(),
+                start_line: byte_to_line(content, b.start),
+                end_line: byte_to_line(content, end.saturating_sub(1)),
+                content: content[b.start..end].to_string(),
+                language: language.clone(),
+            }
+        })
+        .collect()
 }
 
 /// Find all chunks in a directory.
@@ -317,6 +362,9 @@ pub fn index_path(path: &Path) -> Vec<CodeChunk> {
     let files = walk_code_files(path);
     let mut all_chunks = Vec::new();
     for file_path in &files {
+        if std::fs::metadata(file_path).map_or(true, |m| m.len() > 1_000_000) {
+            continue;
+        }
         let content = match std::fs::read_to_string(file_path) {
             Ok(c) => c,
             Err(_) => continue,
@@ -337,11 +385,188 @@ pub fn index_path(path: &Path) -> Vec<CodeChunk> {
     all_chunks
 }
 
+#[derive(PartialEq, Eq)]
+struct FileStamp {
+    modified: Option<std::time::SystemTime>,
+    len: u64,
+}
+
+struct CachedFile {
+    stamp: FileStamp,
+    chunks: Vec<CodeChunk>,
+    embeddings: Vec<Vec<f32>>,
+}
+
+#[derive(Default)]
+struct CachedRepository {
+    files: BTreeMap<PathBuf, CachedFile>,
+    index: Option<Arc<CodeSearchIndex>>,
+}
+
+impl CachedRepository {
+    fn refresh(
+        &mut self,
+        root: &Path,
+        mut encode: impl FnMut(&[String]) -> Result<Vec<Vec<f32>>, AgentError>,
+    ) -> Result<Arc<CodeSearchIndex>, AgentError> {
+        let mut paths = walk_code_files(root);
+        paths.sort();
+        let mut changed = false;
+        let old_len = self.files.len();
+        self.files
+            .retain(|path, _| paths.binary_search(path).is_ok());
+        changed |= old_len != self.files.len();
+        if changed {
+            self.index = None;
+        }
+        for path in paths {
+            let metadata = std::fs::metadata(&path)?;
+            let stamp = FileStamp {
+                modified: metadata.modified().ok(),
+                len: metadata.len(),
+            };
+            if self
+                .files
+                .get(&path)
+                .is_some_and(|file| file.stamp == stamp)
+            {
+                continue;
+            }
+            let chunks = if stamp.len > 1_000_000 {
+                Vec::new()
+            } else {
+                let content = std::fs::read_to_string(&path).unwrap_or_default();
+                let relative = path.strip_prefix(root).unwrap_or(&path).to_string_lossy();
+                let language = path
+                    .extension()
+                    .and_then(|e| e.to_str())
+                    .and_then(language_for_ext)
+                    .map(str::to_owned);
+                chunk_file(&relative, &content, language)
+            };
+            let texts: Vec<_> = chunks.iter().map(|chunk| chunk.content.clone()).collect();
+            let embeddings = if texts.is_empty() {
+                Vec::new()
+            } else {
+                encode(&texts)?
+            };
+            if embeddings.len() != chunks.len() {
+                return Err(AgentError::Config(
+                    "Embedding count does not match chunks".into(),
+                ));
+            }
+            self.index = None;
+            self.files.insert(
+                path,
+                CachedFile {
+                    stamp,
+                    chunks,
+                    embeddings,
+                },
+            );
+            changed = true;
+        }
+        if changed || self.index.is_none() {
+            let chunks: Vec<_> = self
+                .files
+                .values()
+                .flat_map(|file| file.chunks.clone())
+                .collect();
+            let rows: Vec<_> = self
+                .files
+                .values()
+                .flat_map(|file| file.embeddings.iter())
+                .collect();
+            let dim = rows.first().map_or(0, |row| row.len());
+            let embeddings = Array2::from_shape_vec(
+                (rows.len(), dim),
+                rows.into_iter().flatten().copied().collect(),
+            )
+            .map_err(|e| AgentError::Config(format!("Invalid embedding matrix: {e}")))?;
+            let boosts = chunks.iter().map(ranking_boost).collect();
+            self.index = Some(Arc::new(CodeSearchIndex {
+                chunks,
+                embeddings,
+                boosts,
+            }));
+        }
+        Ok(self.index.as_ref().expect("index initialized").clone())
+    }
+}
+
+/// A bounded cache keyed by canonical repository path. Unchanged files keep
+/// their chunks and embeddings; edits, additions, and deletions refresh the index.
+pub fn cached_index(path: &Path) -> Result<Arc<CodeSearchIndex>, AgentError> {
+    static CACHE: OnceLock<Mutex<HashMap<PathBuf, CachedRepository>>> = OnceLock::new();
+    let root = path.canonicalize()?;
+    let mut cache = CACHE
+        .get_or_init(Default::default)
+        .lock()
+        .map_err(|_| AgentError::Config("Search cache lock poisoned".into()))?;
+    if cache.len() >= 4 && !cache.contains_key(&root) {
+        if let Some(key) = cache.keys().next().cloned() {
+            cache.remove(&key);
+        }
+    }
+    cache
+        .entry(root.clone())
+        .or_default()
+        .refresh(&root, |texts| {
+            let guard = get_model()?;
+            let model = guard
+                .as_ref()
+                .ok_or_else(|| AgentError::Config("Model not loaded".into()))?;
+            Ok(model.encode(texts))
+        })
+}
+
+fn ranking_boost(chunk: &CodeChunk) -> f32 {
+    let has_def = chunk.content.lines().any(|line| {
+        let line = line.trim();
+        [
+            "fn ",
+            "def ",
+            "class ",
+            "struct ",
+            "impl ",
+            "trait ",
+            "enum ",
+            "type ",
+            "interface ",
+            "function ",
+            "public ",
+            "async ",
+            "pub ",
+        ]
+        .iter()
+        .any(|prefix| line.starts_with(prefix))
+    });
+    let mut boost = if has_def { 1.15 } else { 1.0 };
+    if chunk.file_path.contains("/test") || chunk.file_path.starts_with("test") {
+        boost *= 0.85;
+    }
+    if chunk.file_path.contains("/example") {
+        boost *= 0.9;
+    }
+    boost
+}
+
+fn select_top_k(scored: &mut Vec<(usize, f32)>, k: usize) {
+    let compare = |a: &(usize, f32), b: &(usize, f32)| b.1.total_cmp(&a.1).then(a.0.cmp(&b.0));
+    if k < scored.len() {
+        scored.select_nth_unstable_by(k, compare);
+        scored.truncate(k);
+    }
+    scored.sort_by(compare);
+}
+
 impl CodeSearchIndex {
     /// Build an index from a directory.
     pub fn build(path: &Path) -> Result<Self, AgentError> {
         let guard = get_model()?;
-        let model = guard.as_ref().ok_or_else(|| AgentError::Config("Model not loaded".into()))?;
+        let model = guard
+            .as_ref()
+            .ok_or_else(|| AgentError::Config("Model not loaded".into()))?;
         let chunks = index_path(path);
         if chunks.is_empty() {
             return Err(AgentError::Config("No code files found to index".into()));
@@ -354,14 +579,20 @@ impl CodeSearchIndex {
         let dim = if n == 0 { 0 } else { raw[0].len() };
         let flat: Vec<f32> = raw.into_iter().flatten().collect();
         let embeddings = if n > 0 && dim > 0 {
-            Array2::from_shape_vec((n, dim), flat)
-                .map_err(|e| AgentError::Config(format!("Failed to build embedding matrix: {}", e)))?
+            Array2::from_shape_vec((n, dim), flat).map_err(|e| {
+                AgentError::Config(format!("Failed to build embedding matrix: {}", e))
+            })?
         } else {
             Array2::from_shape_vec((0, 0), vec![])
                 .map_err(|e| AgentError::Config(format!("Empty index: {}", e)))?
         };
 
-        Ok(CodeSearchIndex { chunks, embeddings })
+        let boosts = chunks.iter().map(ranking_boost).collect();
+        Ok(CodeSearchIndex {
+            chunks,
+            embeddings,
+            boosts,
+        })
     }
 
     /// Search with a natural language query.
@@ -393,49 +624,21 @@ impl CodeSearchIndex {
         // Compute cosine similarity scores
         let mut scored: Vec<(usize, f32)> = (0..n)
             .map(|i| {
-                let dot: f32 = self.embeddings.row(i).iter().zip(query_emb.iter()).map(|(a, b)| a * b).sum();
+                let dot: f32 = self
+                    .embeddings
+                    .row(i)
+                    .iter()
+                    .zip(query_emb.iter())
+                    .map(|(a, b)| a * b)
+                    .sum();
                 (i, dot) // embeddings and query are already L2-normalized by model2vec
             })
             .collect();
 
-        // Apply ranking boosts
-        for (i, score) in scored.iter_mut() {
-            let chunk = &self.chunks[*i];
-
-            // Definition boost: lines starting with fn/def/class/struct/impl/trait
-            let has_def = chunk.content.lines().any(|l| {
-                let t = l.trim();
-                t.starts_with("fn ")
-                    || t.starts_with("def ")
-                    || t.starts_with("class ")
-                    || t.starts_with("struct ")
-                    || t.starts_with("impl ")
-                    || t.starts_with("trait ")
-                    || t.starts_with("enum ")
-                    || t.starts_with("type ")
-                    || t.starts_with("interface ")
-                    || t.starts_with("function ")
-                    || t.starts_with("public ")
-                    || t.starts_with("async ")
-                    || t.starts_with("pub ")
-            });
-            if has_def {
-                *score *= 1.15;
-            }
-
-            // Noise penalty for test files
-            if chunk.file_path.contains("/test") || chunk.file_path.contains("/tests/") || chunk.file_path.starts_with("test") {
-                *score *= 0.85;
-            }
-
-            // Noise penalty for examples
-            if chunk.file_path.contains("/example") || chunk.file_path.contains("/examples/") {
-                *score *= 0.9;
-            }
+        for (i, score) in &mut scored {
+            *score *= self.boosts[*i];
         }
-
-        // Sort by score descending
-        scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        select_top_k(&mut scored, top_k);
 
         // Take top-k
         let k = top_k.min(scored.len());
@@ -446,6 +649,10 @@ impl CodeSearchIndex {
                 score,
             })
             .collect()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.chunks.is_empty()
     }
 
     /// Total number of indexed chunks.
@@ -529,7 +736,7 @@ pub fn search_keyword(chunks: &[CodeChunk], query: &str, top_k: usize) -> Vec<Co
         }
     }
 
-    scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+    select_top_k(&mut scored, top_k);
     let k = top_k.min(scored.len());
     scored[..k]
         .iter()
@@ -543,6 +750,48 @@ pub fn search_keyword(chunks: &[CodeChunk], query: &str, top_k: usize) -> Vec<Co
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cached_index_reuses_embeddings_and_refreshes_changes() {
+        let root = std::env::temp_dir().join(format!("rupi-cache-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("one.rs"), "fn one() {}\n").unwrap();
+        std::fs::write(root.join("two.rs"), "fn two() {}\n").unwrap();
+        let mut cache = CachedRepository::default();
+        let mut encoded = 0;
+        let mut encode = |texts: &[String]| -> Result<Vec<Vec<f32>>, AgentError> {
+            encoded += texts.len();
+            Ok(texts.iter().map(|_| vec![1.0, 0.0]).collect())
+        };
+        let first = cache.refresh(&root, &mut encode).unwrap();
+        let second = cache.refresh(&root, &mut encode).unwrap();
+        assert!(Arc::ptr_eq(&first, &second));
+        std::fs::write(root.join("one.rs"), "fn changed_name() {}\n").unwrap();
+        let third = cache.refresh(&root, &mut encode).unwrap();
+        assert!(!Arc::ptr_eq(&second, &third));
+        assert!(third
+            .chunks
+            .iter()
+            .any(|c| c.content.contains("changed_name")));
+        std::fs::remove_file(root.join("two.rs")).unwrap();
+        let fourth = cache.refresh(&root, &mut encode).unwrap();
+        assert_eq!(fourth.len(), 1);
+        assert_eq!(encoded, 3, "only the edited file should be re-embedded");
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn top_k_matches_full_sort() {
+        let all = vec![(0, 0.3), (1, 0.9), (2, 0.9), (3, -0.1), (4, 0.5)];
+        for k in 0..=all.len() + 1 {
+            let mut scored = all.clone();
+            select_top_k(&mut scored, k);
+            let mut expected = all.clone();
+            expected.sort_by(|a, b| b.1.total_cmp(&a.1).then(a.0.cmp(&b.0)));
+            expected.truncate(k);
+            assert_eq!(scored, expected);
+        }
+    }
 
     #[test]
     fn test_chunk_file_small() {
@@ -584,7 +833,11 @@ impl Config {
         // AST chunking should produce meaningful chunks
         assert!(!chunks.is_empty());
         // Should contain the function definitions
-        let all_content: String = chunks.iter().map(|c| c.content.as_str()).collect::<Vec<_>>().join("\n");
+        let all_content: String = chunks
+            .iter()
+            .map(|c| c.content.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
         assert!(all_content.contains("fn main"));
         assert!(all_content.contains("fn helper"));
     }
@@ -604,7 +857,11 @@ class Foo:
 "#;
         let chunks = chunk_file("test.py", content, Some("python".into()));
         assert!(!chunks.is_empty());
-        let all_content: String = chunks.iter().map(|c| c.content.as_str()).collect::<Vec<_>>().join("\n");
+        let all_content: String = chunks
+            .iter()
+            .map(|c| c.content.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
         assert!(all_content.contains("def hello"));
         assert!(all_content.contains("class Foo"));
     }
@@ -629,7 +886,11 @@ class Foo:
         }
         let chunks = chunk_file("test.rs", &content, Some("rust".into()));
         // Should produce multiple chunks for a large file
-        assert!(chunks.len() > 1, "Expected multiple chunks, got {}", chunks.len());
+        assert!(
+            chunks.len() > 1,
+            "Expected multiple chunks, got {}",
+            chunks.len()
+        );
     }
 
     #[test]
@@ -676,7 +937,9 @@ class Foo:
         std::fs::write(dir.join("main.js"), "const x = 1;").unwrap();
 
         let files = walk_code_files(&dir);
-        assert!(!files.iter().any(|f| f.to_string_lossy().contains("node_modules")));
+        assert!(!files
+            .iter()
+            .any(|f| f.to_string_lossy().contains("node_modules")));
         assert!(files.iter().any(|f| f.ends_with("main.js")));
         std::fs::remove_dir_all(&dir).unwrap();
     }

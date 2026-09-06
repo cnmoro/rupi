@@ -8,12 +8,10 @@ pub struct ProviderDef {
 }
 
 /// All known providers.
-pub static ALL_PROVIDERS: &[ProviderDef] = &[
-    ProviderDef {
-        id: "openai-compatible",
-        name: "OpenAI Compatible",
-    },
-];
+pub static ALL_PROVIDERS: &[ProviderDef] = &[ProviderDef {
+    id: "openai-compatible",
+    name: "OpenAI Compatible",
+}];
 
 /// Find a provider by ID.
 pub fn find_provider(id: &str) -> Option<&'static ProviderDef> {

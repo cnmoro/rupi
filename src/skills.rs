@@ -14,7 +14,10 @@ pub struct Skill {
 pub fn parse_frontmatter(content: &str) -> (serde_yaml::Value, &str) {
     let content = content.trim_start();
     if !content.starts_with("---") {
-        return (serde_yaml::Value::Mapping(serde_yaml::Mapping::new()), content);
+        return (
+            serde_yaml::Value::Mapping(serde_yaml::Mapping::new()),
+            content,
+        );
     }
 
     let end = content[3..].find("---").map(|i| i + 3);
@@ -24,10 +27,16 @@ pub fn parse_frontmatter(content: &str) -> (serde_yaml::Value, &str) {
             let body = &content[3 + end_pos..];
             match serde_yaml::from_str::<serde_yaml::Value>(yaml_str) {
                 Ok(frontmatter) => (frontmatter, body.trim()),
-                Err(_) => (serde_yaml::Value::Mapping(serde_yaml::Mapping::new()), content),
+                Err(_) => (
+                    serde_yaml::Value::Mapping(serde_yaml::Mapping::new()),
+                    content,
+                ),
             }
         }
-        None => (serde_yaml::Value::Mapping(serde_yaml::Mapping::new()), content),
+        None => (
+            serde_yaml::Value::Mapping(serde_yaml::Mapping::new()),
+            content,
+        ),
     }
 }
 
@@ -95,7 +104,11 @@ fn load_skill_from_file(path: &PathBuf) -> Option<Skill> {
         .unwrap_or("")
         .to_string();
 
-    let skill_body = if frontmatter.as_mapping().map(|m| m.is_empty()).unwrap_or(true) {
+    let skill_body = if frontmatter
+        .as_mapping()
+        .map(|m| m.is_empty())
+        .unwrap_or(true)
+    {
         // No frontmatter — entire file is the body
         contents.trim().to_string()
     } else {
@@ -116,9 +129,7 @@ pub fn format_skills_for_prompt(skills: &[Skill]) -> String {
         return String::new();
     }
 
-    let mut result = String::from(
-        "\n\n<available_skills>\n",
-    );
+    let mut result = String::from("\n\n<available_skills>\n");
     for skill in skills {
         result.push_str(&format!(
             "  <skill>\n    <name>{}</name>\n    <description>{}</description>\n    <location>{}</location>\n  </skill>\n",
@@ -130,8 +141,6 @@ pub fn format_skills_for_prompt(skills: &[Skill]) -> String {
     result.push_str("</available_skills>");
     result
 }
-
-
 
 #[cfg(test)]
 mod tests {
@@ -179,7 +188,12 @@ mod tests {
         fs::create_dir_all(&skills_dir).unwrap();
 
         create_test_skill(&skills_dir, "test-skill", "A test skill", "Do something");
-        create_test_skill(&skills_dir.join("nested"), "nested-skill", "Nested skill", "Do nested");
+        create_test_skill(
+            &skills_dir.join("nested"),
+            "nested-skill",
+            "Nested skill",
+            "Do nested",
+        );
 
         let skills = load_skills(&dir.join("skills"));
         assert!(!skills.is_empty(), "Should find at least one skill");
@@ -229,7 +243,11 @@ mod tests {
     fn test_skill_no_frontmatter_uses_filename() {
         let dir = std::env::temp_dir().join(format!("rupi-skill-nofm-{}", std::process::id()));
         fs::create_dir_all(&dir).unwrap();
-        fs::write(dir.join("my-skill.md"), "# My Skill\n\nThis is the skill content.").unwrap();
+        fs::write(
+            dir.join("my-skill.md"),
+            "# My Skill\n\nThis is the skill content.",
+        )
+        .unwrap();
         let skills = load_skills(&dir);
         assert_eq!(skills.len(), 1);
         assert_eq!(skills[0].name, "my-skill");
@@ -243,8 +261,15 @@ mod tests {
         fs::create_dir_all(&dir).unwrap();
 
         // Create ONE.md, TWO.md, THREE.md at root
-        for (name, desc) in &[("one", "first skill"), ("two", "second skill"), ("three", "third skill")] {
-            let content = format!("---\nname: {}\ndescription: {}\n---\n\nbody of {}", name, desc, name);
+        for (name, desc) in &[
+            ("one", "first skill"),
+            ("two", "second skill"),
+            ("three", "third skill"),
+        ] {
+            let content = format!(
+                "---\nname: {}\ndescription: {}\n---\n\nbody of {}",
+                name, desc, name
+            );
             fs::write(dir.join(format!("{}.md", name.to_uppercase())), content).unwrap();
         }
 

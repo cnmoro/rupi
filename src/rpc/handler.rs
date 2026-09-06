@@ -4,7 +4,6 @@ use tokio::sync::mpsc;
 use super::types::*;
 use crate::agent::session::AgentSession;
 
-
 /// Handles RPC commands and produces responses/events.
 pub struct RpcHandler {
     session: Arc<tokio::sync::RwLock<AgentSession>>,
@@ -19,13 +18,10 @@ impl RpcHandler {
 
     /// Handle a single RPC command, writing responses and events to output_tx.
     /// Returns immediately. Async commands spawn background tasks.
-    pub async fn handle(
-        &self,
-        command: RpcCommand,
-        output_tx: mpsc::UnboundedSender<String>,
-    ) {
+    pub async fn handle(&self, command: RpcCommand, output_tx: mpsc::UnboundedSender<String>) {
         let session = self.session.clone();
         let tx = output_tx.clone();
+        let admitted = Arc::new(tokio::sync::Notify::new());
 
         match command {
             RpcCommand::Ping { id } => {
@@ -36,13 +32,20 @@ impl RpcHandler {
                 let state = session.read().await.get_state().await;
                 write_success(tx, id, "get_state", Some(state)).await;
             }
-            RpcCommand::SetModel { id, provider, model_id } => {
+            RpcCommand::SetModel {
+                id,
+                provider,
+                model_id,
+            } => {
                 if provider != "openai-compatible" {
                     write_error(
                         tx,
                         id,
                         "set_model",
-                        format!("Unknown provider: {}. Only 'openai-compatible' is supported.", provider),
+                        format!(
+                            "Unknown provider: {}. Only 'openai-compatible' is supported.",
+                            provider
+                        ),
                     )
                     .await;
                 } else {
@@ -75,7 +78,13 @@ impl RpcHandler {
                     "context_window": info.context_window,
                     "reasoning": info.reasoning,
                 })];
-                write_success(tx, id, "get_available_models", Some(serde_json::json!({ "models": models }))).await;
+                write_success(
+                    tx,
+                    id,
+                    "get_available_models",
+                    Some(serde_json::json!({ "models": models })),
+                )
+                .await;
             }
             RpcCommand::SetThinkingLevel { id, level } => {
                 session.read().await.set_thinking_level(level).await;
@@ -87,66 +96,114 @@ impl RpcHandler {
                 write_success(tx, id, "cycle_thinking_level", data).await;
             }
             RpcCommand::SetAutoCompaction { id, enabled } => {
-                session.read().await.set_auto_compaction_enabled(enabled).await;
+                session
+                    .read()
+                    .await
+                    .set_auto_compaction_enabled(enabled)
+                    .await;
                 write_success::<()>(tx, id, "set_auto_compaction", None).await;
             }
             RpcCommand::GetMessages { id } => {
                 let msgs = session.read().await.get_messages_as_rpc().await;
-                write_success(tx, id, "get_messages", Some(serde_json::json!({ "messages": msgs }))).await;
+                write_success(
+                    tx,
+                    id,
+                    "get_messages",
+                    Some(serde_json::json!({ "messages": msgs })),
+                )
+                .await;
             }
-            RpcCommand::Compact { id, .. } => {
-                match session.read().await.compact().await {
-                    Ok(result) => {
-                        let data = serde_json::json!({
-                            "summary": result.summary,
-                            "tokensBefore": result.tokens_before,
-                            "tokensAfter": 0,
-                        });
-                        write_success(tx, id, "compact", Some(data)).await;
-                    }
-                    Err(e) => {
-                        write_error(tx, id, "compact", e.to_string()).await;
-                    }
+            RpcCommand::Compact { id, .. } => match session.read().await.compact().await {
+                Ok(result) => {
+                    let data = serde_json::json!({
+                        "summary": result.summary,
+                        "tokensBefore": result.tokens_before,
+                        "tokensAfter": 0,
+                    });
+                    write_success(tx, id, "compact", Some(data)).await;
                 }
-            }
+                Err(e) => {
+                    write_error(tx, id, "compact", e.to_string()).await;
+                }
+            },
             RpcCommand::Abort { id } => {
                 session.read().await.abort().await;
                 write_success::<()>(tx, id, "abort", None).await;
             }
-            RpcCommand::NewSession { id, parent_session: _ } => {
+            RpcCommand::NewSession {
+                id,
+                parent_session: _,
+            } => {
                 // Reset current session
                 session.read().await.reset().await;
-                write_success(tx, id, "new_session", Some(serde_json::json!({"cancelled": false}))).await;
+                write_success(
+                    tx,
+                    id,
+                    "new_session",
+                    Some(serde_json::json!({"cancelled": false})),
+                )
+                .await;
             }
             RpcCommand::Prompt {
                 id,
                 message,
                 images: _,
-                streaming_behavior: _,
+                streaming_behavior,
             } => {
                 let session = session.clone();
                 let tx = output_tx.clone();
+                let ready = admitted.clone();
                 tokio::spawn(async move {
-                    handle_async_prompt(session, tx, id, &message, "prompt").await;
+                    handle_async_prompt(
+                        session,
+                        tx,
+                        id,
+                        &message,
+                        "prompt",
+                        streaming_behavior.as_deref(),
+                        ready,
+                    )
+                    .await;
                 });
+                admitted.notified().await;
             }
             RpcCommand::Steer { id, message, .. } => {
                 let session = session.clone();
                 let tx = output_tx.clone();
+                let ready = admitted.clone();
                 tokio::spawn(async move {
-                    handle_async_prompt(session, tx, id, &message, "steer").await;
+                    handle_async_prompt(session, tx, id, &message, "steer", Some("steer"), ready)
+                        .await;
                 });
+                admitted.notified().await;
             }
             RpcCommand::FollowUp { id, message, .. } => {
                 let session = session.clone();
                 let tx = output_tx.clone();
+                let ready = admitted.clone();
                 tokio::spawn(async move {
-                    handle_async_prompt(session, tx, id, &message, "follow_up").await;
+                    handle_async_prompt(
+                        session,
+                        tx,
+                        id,
+                        &message,
+                        "follow_up",
+                        Some("followUp"),
+                        ready,
+                    )
+                    .await;
                 });
+                admitted.notified().await;
             }
             RpcCommand::ListSessions { id } => {
                 let sessions = crate::sessions::list_sessions().unwrap_or_default();
-                write_success(tx, id, "list_sessions", Some(serde_json::json!({ "sessions": sessions }))).await;
+                write_success(
+                    tx,
+                    id,
+                    "list_sessions",
+                    Some(serde_json::json!({ "sessions": sessions })),
+                )
+                .await;
             }
             RpcCommand::SetLoop { id, message } => {
                 let msg = message.clone();
@@ -154,9 +211,11 @@ impl RpcHandler {
                 let session2 = session.clone();
                 let tx2 = output_tx.clone();
                 let id2 = id.clone();
+                let ready = admitted.clone();
                 tokio::spawn(async move {
-                    handle_async_prompt(session2, tx2, id2, &msg, "set_loop").await;
+                    handle_async_prompt(session2, tx2, id2, &msg, "set_loop", None, ready).await;
                 });
+                admitted.notified().await;
             }
             RpcCommand::StopLoop { id } => {
                 session.read().await.cancel_loop().await;
@@ -173,6 +232,8 @@ async fn handle_async_prompt(
     id: Option<String>,
     message: &str,
     command_name: &str,
+    streaming_behavior: Option<&str>,
+    admitted: Arc<tokio::sync::Notify>,
 ) {
     // Send immediate success response
     let resp = RpcResponse::success(id.clone(), command_name, None);
@@ -182,16 +243,24 @@ async fn handle_async_prompt(
 
     // Forward events from event_rx to output_tx
     let tx_clone = tx.clone();
+    let ready = admitted.clone();
     let _event_forwarder = tokio::spawn(async move {
         while let Some(event) = event_rx.recv().await {
+            if matches!(event, AgentEvent::AgentStart { .. }) {
+                ready.notify_one();
+            }
             let _ = tx_clone.send(event.to_json_line());
         }
     });
 
     // Run the prompt
     let session_read = session.read().await;
-    let _result = session_read.prompt(message, event_tx).await;
+    let _result = session_read
+        .prompt_with_behavior(message, event_tx, streaming_behavior)
+        .await;
     drop(session_read);
+    // Queued prompts return without starting another event stream.
+    admitted.notify_one();
 }
 
 async fn write_success<T: serde::Serialize>(
@@ -235,10 +304,7 @@ mod tests {
         RpcHandler::new(session)
     }
 
-    async fn handle_and_collect(
-        handler: &RpcHandler,
-        command: RpcCommand,
-    ) -> Vec<RpcResponse> {
+    async fn handle_and_collect(handler: &RpcHandler, command: RpcCommand) -> Vec<RpcResponse> {
         let (tx, mut rx) = mpsc::unbounded_channel::<String>();
         handler.handle(command, tx).await;
         let mut responses = Vec::new();
@@ -260,7 +326,9 @@ mod tests {
     #[tokio::test]
     async fn test_ping() {
         let handler = create_test_handler();
-        let cmd = RpcCommand::Ping { id: Some("req_1".into()) };
+        let cmd = RpcCommand::Ping {
+            id: Some("req_1".into()),
+        };
         let responses = handle_and_collect(&handler, cmd).await;
         assert_eq!(responses.len(), 1);
         assert!(responses[0].success);
@@ -270,7 +338,9 @@ mod tests {
     #[tokio::test]
     async fn test_get_state() {
         let handler = create_test_handler();
-        let cmd = RpcCommand::GetState { id: Some("req_1".into()) };
+        let cmd = RpcCommand::GetState {
+            id: Some("req_1".into()),
+        };
         let responses = handle_and_collect(&handler, cmd).await;
         assert_eq!(responses.len(), 1);
         assert!(responses[0].success);
@@ -296,7 +366,11 @@ mod tests {
         };
         let responses = handle_and_collect(&handler, cmd).await;
         assert!(!responses[0].success);
-        assert!(responses[0].error.as_deref().unwrap().contains("Unknown provider"));
+        assert!(responses[0]
+            .error
+            .as_deref()
+            .unwrap()
+            .contains("Unknown provider"));
     }
 
     #[tokio::test]
@@ -315,7 +389,9 @@ mod tests {
     #[tokio::test]
     async fn test_get_available_models() {
         let handler = create_test_handler();
-        let cmd = RpcCommand::GetAvailableModels { id: Some("req_1".into()) };
+        let cmd = RpcCommand::GetAvailableModels {
+            id: Some("req_1".into()),
+        };
         let responses = handle_and_collect(&handler, cmd).await;
         let data = responses[0].data.as_ref().unwrap();
         let models = data["models"].as_array().unwrap();
@@ -326,7 +402,9 @@ mod tests {
     #[tokio::test]
     async fn test_cycle_model() {
         let handler = create_test_handler();
-        let cmd = RpcCommand::CycleModel { id: Some("req_1".into()) };
+        let cmd = RpcCommand::CycleModel {
+            id: Some("req_1".into()),
+        };
         let responses = handle_and_collect(&handler, cmd).await;
         assert!(responses[0].success);
         // null data means only one model available, nothing to cycle to
@@ -351,7 +429,9 @@ mod tests {
     #[tokio::test]
     async fn test_cycle_thinking_level() {
         let handler = create_test_handler();
-        let cmd = RpcCommand::CycleThinkingLevel { id: Some("req_1".into()) };
+        let cmd = RpcCommand::CycleThinkingLevel {
+            id: Some("req_1".into()),
+        };
         let responses = handle_and_collect(&handler, cmd).await;
         let data = responses[0].data.as_ref().unwrap();
         assert_eq!(data["level"], "low");
@@ -360,7 +440,9 @@ mod tests {
     #[tokio::test]
     async fn test_abort() {
         let handler = create_test_handler();
-        let cmd = RpcCommand::Abort { id: Some("req_1".into()) };
+        let cmd = RpcCommand::Abort {
+            id: Some("req_1".into()),
+        };
         let responses = handle_and_collect(&handler, cmd).await;
         assert!(responses[0].success);
         assert_eq!(responses[0].command, "abort");
@@ -381,7 +463,9 @@ mod tests {
     #[tokio::test]
     async fn test_get_messages_empty() {
         let handler = create_test_handler();
-        let cmd = RpcCommand::GetMessages { id: Some("req_1".into()) };
+        let cmd = RpcCommand::GetMessages {
+            id: Some("req_1".into()),
+        };
         let responses = handle_and_collect(&handler, cmd).await;
         let data = responses[0].data.as_ref().unwrap();
         let messages = data["messages"].as_array().unwrap();
@@ -398,8 +482,18 @@ mod tests {
         let responses = handle_and_collect(&handler, cmd).await;
         // Empty session has no tokens to compact
         assert!(!responses[0].success);
-        assert!(responses[0].error.as_deref().unwrap().contains("not full enough")
-            || responses[0].error.as_deref().unwrap().contains("Nothing to compact"));
+        assert!(
+            responses[0]
+                .error
+                .as_deref()
+                .unwrap()
+                .contains("not full enough")
+                || responses[0]
+                    .error
+                    .as_deref()
+                    .unwrap()
+                    .contains("Nothing to compact")
+        );
     }
 
     #[tokio::test]

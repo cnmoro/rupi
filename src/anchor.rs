@@ -22,7 +22,8 @@ pub const ANCHOR_CLOSE: &str = "</active-task>";
 ///
 /// Without it the anchor reads as a fresh user turn arriving after a checkpoint
 /// that says the work is done, and the model restarts the task from the top.
-const ANCHOR_PREAMBLE: &str = "This is a verbatim restatement of the request that started this session. \
+const ANCHOR_PREAMBLE: &str =
+    "This is a verbatim restatement of the request that started this session. \
 It is NOT a new request and NOT a repeat instruction. Do not restart work that the conversation \
 above records as finished. Treat the workspace and the tool results as authoritative, and inspect \
 them instead of assuming earlier narration is still current. Continue from where the work stands.";

@@ -120,6 +120,8 @@ Same event stream as RPC but reads user input interactively. Useful for debuggin
 ## How it works
 
 - **Tools**: bash, read, write, edit, grep, find, ls, search_code, todo_write, goal — the agent decides when to use them. A bash command times out after 30s unless the model asks for longer, capped at 120s; `--bash-timeout-default` and `--bash-timeout-max` move both, and the tool schema tells the model what the current limits are. `search_code` uses a local Model2Vec semantic code search model (potion-code-16M) to find code by natural language description — no grep patterns needed. YOLO mode (default): no approval needed. Add `--disable-yolo` to require user confirmation per execution.
+- **Tool execution**: blocking tools run on at most four workers across sessions. Bash timeouts and cancellation terminate the command tree; pipe readers are closed and joined even when a background child outlives its shell. Bash captures at most 1 MiB each of stdout and stderr.
+- **Semantic search cache**: up to four canonical repository roots are cached in memory. Files whose size and modification time have not changed reuse their chunks and embeddings; additions, edits, and deletions refresh the index. Search timing includes the scan, refresh, and query. Ranking boosts are precomputed, and only the best results are sorted.
 - **Write guard**: `write` refuses if the file already exists, returning an error with the exact `edit` call-shape. This prevents accidental whole-file rewrites of existing code. Use `edit` for any change to an existing file.
 - **Multi-edit**: `edit` accepts an `edits` array for batch changes in a single call. Each edit's `old_text` is matched against the **original** file content (not after other edits). Edits must not overlap.
 - **Output parser**: when the model emits tool calls inside text (fenced ` ```tool ``` blocks, `<tool_call>` tags, or bare JSON), the parser extracts and executes them as if they were native tool calls.
@@ -129,7 +131,7 @@ Same event stream as RPC but reads user input interactively. Useful for debuggin
 
   A new prompt sent while the agent is idle replaces the anchor, because it starts a new task. A `/steer` or a follow-up sent while the agent works joins the anchor instead, because it refines the task in flight. The stored anchor keeps the head and the tail when it grows, so the request that started the work and the most recent instruction both survive.
 - **Todo list**: `todo_write` records a plan. Every call replaces the whole list, and at most one task can be `in_progress`. The newest copy sits at the tail of the context, where attention is strongest, and it rides along with the anchor reminder.
-- **Spill**: a tool result larger than 4000 characters is written in full to `<sessions-dir>/spill/<session-id>/` before the stored copy is truncated. The truncation notice carries the path, so the agent can `read` or `grep` the part that was cut. The context stays small and no output is destroyed. A storage failure is not fatal: the plain truncated result is kept.
+- **Spill**: a tool result larger than 4000 characters is written in full to `<sessions-dir>/spill/<session-id>/` before the stored copy is truncated. The truncation notice carries the path, so the agent can `read` or `grep` the part that was cut. The context stays small and the complete tool result remains available. Bash capture is bounded separately to the first 1 MiB of each output stream; excess bytes are drained and discarded, with a truncation notice. Redirect commands to a file when their complete raw output must be retained. A storage failure is not fatal: the plain truncated result is kept.
 - **Skills**: place `.md` files in `~/.config/rupi/skills/` — injected into the system prompt on startup
 - **Context files**: `CLAUDE.md` and `AGENTS.md` from cwd and ancestor directories are loaded automatically
 - **Prompt caching**: rupi treats the request prefix as something to protect, because re-prefilling a full context window on every turn is the single largest avoidable cost in a long run.
@@ -138,13 +140,14 @@ Same event stream as RPC but reads user input interactively. Useful for debuggin
   - The conversation is append-only. Nothing already sent is ever edited, so an automatic prefix cache (vLLM, SGLang, OpenAI, DeepSeek) keeps matching. A compaction is the only thing that breaks the prefix, and it replaces the head by design.
   - Two `cache_control` breakpoints are sent for servers that need explicit ones: a static breakpoint on the system message, and a moving breakpoint on the last message. The moving one is the important half — marking only the system message would leave the entire conversation, which is nearly all of the tokens, re-prefilled every turn. Because the history is append-only, this turn's breakpoint is the next turn's cache hit. Servers with automatic caching ignore the field.
   - The compaction call reuses the same prefix; see **Cache-aligned summarization** below.
-- **Compaction**: when the context passes `window - 16384` tokens, **auto-compact** calls the LLM to summarize the old messages. A **snip** pass truncates long tool-role messages older than the last 6 turns, which costs nothing and lets more messages fit in the retained tail. The snip is applied to the tail that compaction stores, never to the live conversation: a run that snipped and then declined to compact would rewrite message bodies the provider had already cached and gain nothing for it. Set the window with `--context-window` (default 128000). A compaction is recorded in the session file, and resuming honours it: everything the summary replaced is left out, so a compacted session does not reopen over budget and immediately compact again.
+- **Compaction**: checked before each model request, including successive tool turns. When the context passes `window - 16384` tokens, **auto-compact** calls the LLM to summarize the old messages. A **snip** pass truncates long tool-role messages older than the last 6 turns, which costs nothing and lets more messages fit in the retained tail. The snip is applied to the tail that compaction stores, never to the live conversation: a run that snipped and then declined to compact would rewrite message bodies the provider had already cached and gain nothing for it. Set the window with `--context-window` (default 128000). A compaction is recorded in the session file, and resuming honours it: everything the summary replaced is left out, so a compacted session does not reopen over budget and immediately compact again.
 - **Cache-aligned summarization**: the summarizer call replays the conversation's own system prompt, its tool schemas, and the region verbatim, then appends the compaction instruction as the final user message. That makes the call a genuine prefix of the last routed request, so the provider serves it from its KV cache instead of re-prefilling the whole span. The region replayed is the text from **before** the snip pass, because a snipped body no longer matches what the provider cached. The kept tail still gets the snipped copy. If an endpoint rejects the tool schemas on a non-streaming call, rupi retries without them and the summary still lands.
 - **Checkpoint framing**: the summary is stored as a message that states it is established background, wrapped in `<compacted-summary>` tags. The instruction tells the summarizer to merge a prior checkpoint rather than re-condense it, so repeated compactions consolidate instead of decaying.
 - **Tool pairing**: the compaction cut is snapped to a boundary where neither half splits an assistant tool call from its results. A split pair is a hard 400 from every OpenAI-compatible endpoint, on the summarizer request or on the next turn.
 - **No hard limits**: the agent runs indefinitely until the task is done. When context approaches the window limit, snip + auto-compact keeps the agent going. Optionally set `--timeout <secs>` to cap execution time.
 - **Steer / follow-up**: type while the agent generates — normal Enter queues as follow-up (processed after the current turn). Use `/steer <message>` to interrupt immediately. In RPC mode, set `"streamingBehavior": "steer"` or `"followUp"` on the prompt command.
 - **Memory**: add `--memory` to persist key facts across sessions. The agent reads/writes `~/.config/rupi/MEMORY.md` — reads on startup, overwrites with bullet points during execution.
+- **Resetting sessions**: RPC `new_session` cancels active generation and waits for its tools to finish before clearing history and opening a new transcript.
 - **Session persistence**: conversations saved as JSONL in `~/.config/rupi_sessions/` with UUID filenames. Spill artifacts live beside them under `spill/<session-id>/`, and are not pruned automatically. `--sessions-dir <path>` puts them somewhere else — one directory per tenant, or a path an embedding process controls. The transcript is recreated if something deletes it mid-run.
 - **Session resumption**: use `--session <id>` to resume a previous conversation from where you left off. The agent remembers all prior messages (up to the last compaction). An unknown id *starts* that session rather than falling back to a random one, so a caller that owns the id gets a predictable transcript path from the first turn. Works in interactive, raw, and RPC modes.
 - **Error reporting**: `message_end` includes `stop_reason` (`"stop"`, `"error"`, `"tool_calls"`, `"timeout"`) and error text in `content` when applicable.
@@ -260,3 +263,44 @@ public class RupiClient {
     }
 }
 ```
+
+## Development checks
+
+The lockfile is committed, and CI uses locked dependency resolution. Run:
+
+```sh
+cargo fmt --all -- --check
+cargo clippy --locked --all-targets -- -D warnings
+cargo test --locked --all-targets
+make dist
+```
+
+The default suite includes deterministic HTTP streaming, retry, cancellation,
+compaction, subprocess, and search-cache regressions. Live-provider/model tests
+are explicitly ignored by default. Run them separately in an environment with
+test credentials and permission to download the search model:
+
+```sh
+cargo test --locked --test e2e_test -- --ignored --test-threads=1
+```
+
+`make dist` builds the release binary before packaging it and takes the version
+from `Cargo.toml`. Published releases require both the build matrix and the test,
+formatting, and Clippy checks to succeed.
+
+Live tests accept `RUPI_BASE_URL`, `RUPI_API_KEY`, and `RUPI_MODEL` directly from
+the environment, before consulting config files. They keep session transcripts
+in a temporary directory. The API reachability test makes an actual streaming
+request and verifies Unicode output and token usage.
+
+For a live test of the executable itself, including file creation, read-back,
+process restart/session resumption, and reset:
+
+```sh
+cargo build --locked
+python tests/live_rpc_test.py target/debug/rupi
+```
+
+This check uses the same environment variables, creates an isolated temporary
+workspace, and fails on API errors, missing usage, incorrect file contents, or
+failed session recall. It does not print credentials.

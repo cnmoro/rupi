@@ -21,33 +21,51 @@ pub async fn run_raw(session: Arc<AgentSession>) {
             None => break,
         };
 
-        if line == "exit" || line == "/exit" || line == "/quit" || line == EOF_SIG { break; }
+        if line == "exit" || line == "/exit" || line == "/quit" || line == EOF_SIG {
+            break;
+        }
 
-        if line.starts_with("/steer ") {
-            let steer_text = line[7..].trim().to_string();
+        if let Some(text) = line.strip_prefix("/steer ") {
+            let steer_text = text.trim().to_string();
             if !steer_text.is_empty() {
                 session.steer(&steer_text).await;
                 session.abort().await;
-                let json = serialize_json_line(&serde_json::json!({"type": "steer_queued", "message": steer_text}));
+                let json = serialize_json_line(
+                    &serde_json::json!({"type": "steer_queued", "message": steer_text}),
+                );
                 let _ = write!(stdout(), "{}", json);
             } else {
-                let _ = write!(stdout(), "{}", serialize_json_line(&serde_json::json!({"type":"error","message":"Usage: /steer <message>"})));
+                let _ = write!(
+                    stdout(),
+                    "{}",
+                    serialize_json_line(
+                        &serde_json::json!({"type":"error","message":"Usage: /steer <message>"})
+                    )
+                );
             }
             let _ = stdout().flush();
             continue;
         }
 
-        if line.starts_with("/goal ") {
-            let goal_text = line[6..].trim().to_string();
+        if let Some(text) = line.strip_prefix("/goal ") {
+            let goal_text = text.trim().to_string();
             if !goal_text.is_empty() {
                 session.set_goal(Some(goal_text.clone())).await;
-                let json = serialize_json_line(&serde_json::json!({"type": "goal_set", "goal": goal_text}));
+                let json = serialize_json_line(
+                    &serde_json::json!({"type": "goal_set", "goal": goal_text}),
+                );
                 let _ = write!(stdout(), "{}", json);
                 let _ = stdout().flush();
                 process_prompt_raw(&session, &goal_text).await;
                 continue;
             }
-            let _ = write!(stdout(), "{}", serialize_json_line(&serde_json::json!({"type":"error","message":"Usage: /goal <description>"})));
+            let _ = write!(
+                stdout(),
+                "{}",
+                serialize_json_line(
+                    &serde_json::json!({"type":"error","message":"Usage: /goal <description>"})
+                )
+            );
             let _ = stdout().flush();
             continue;
         }
@@ -62,11 +80,15 @@ pub async fn run_raw(session: Arc<AgentSession>) {
         if line == "/compact" {
             match session.compact().await {
                 Ok(result) => {
-                    let json = serialize_json_line(&serde_json::json!({"type": "compaction_done", "tokens_before": result.tokens_before}));
+                    let json = serialize_json_line(
+                        &serde_json::json!({"type": "compaction_done", "tokens_before": result.tokens_before}),
+                    );
                     let _ = write!(stdout(), "{}", json);
                 }
                 Err(e) => {
-                    let json = serialize_json_line(&serde_json::json!({"type": "compaction_error", "error": e.to_string()}));
+                    let json = serialize_json_line(
+                        &serde_json::json!({"type": "compaction_error", "error": e.to_string()}),
+                    );
                     let _ = write!(stdout(), "{}", json);
                 }
             }
@@ -80,11 +102,15 @@ pub async fn run_raw(session: Arc<AgentSession>) {
                 let model_spec = parts[1].trim();
                 if !model_spec.is_empty() {
                     session.set_model(model_spec.to_string());
-                    let json = serialize_json_line(&serde_json::json!({"type": "model_changed", "model": model_spec}));
+                    let json = serialize_json_line(
+                        &serde_json::json!({"type": "model_changed", "model": model_spec}),
+                    );
                     let _ = write!(stdout(), "{}", json);
                 }
             } else {
-                let json = serialize_json_line(&serde_json::json!({"type": "model_info", "model": session.model()}));
+                let json = serialize_json_line(
+                    &serde_json::json!({"type": "model_info", "model": session.model()}),
+                );
                 let _ = write!(stdout(), "{}", json);
             }
             let _ = stdout().flush();
@@ -107,25 +133,36 @@ pub async fn run_raw(session: Arc<AgentSession>) {
             continue;
         }
 
-        if line.starts_with("/loop ") {
-            let loop_text = line[6..].trim().to_string();
+        if let Some(text) = line.strip_prefix("/loop ") {
+            let loop_text = text.trim().to_string();
             if !loop_text.is_empty() {
                 session.set_loop(Some(loop_text.clone())).await;
-                let json = serialize_json_line(&serde_json::json!({"type": "loop_set", "message": loop_text}));
+                let json = serialize_json_line(
+                    &serde_json::json!({"type": "loop_set", "message": loop_text}),
+                );
                 let _ = write!(stdout(), "{}", json);
                 let _ = stdout().flush();
                 process_prompt_raw(&session, &loop_text).await;
                 continue;
             }
-            let _ = write!(stdout(), "{}", serialize_json_line(&serde_json::json!({"type":"error","message":"Usage: /loop <prompt>"})));
+            let _ = write!(
+                stdout(),
+                "{}",
+                serialize_json_line(
+                    &serde_json::json!({"type":"error","message":"Usage: /loop <prompt>"})
+                )
+            );
             let _ = stdout().flush();
             continue;
         }
 
         if line == "/session" {
             let path = session.session_path().await;
-            let id = path.as_ref().and_then(|p| p.file_stem().and_then(|s| s.to_str()));
-            let json = serialize_json_line(&serde_json::json!({"type": "session_id", "session_id": id}));
+            let id = path
+                .as_ref()
+                .and_then(|p| p.file_stem().and_then(|s| s.to_str()));
+            let json =
+                serialize_json_line(&serde_json::json!({"type": "session_id", "session_id": id}));
             let _ = write!(stdout(), "{}", json);
             let _ = stdout().flush();
             continue;
@@ -135,10 +172,7 @@ pub async fn run_raw(session: Arc<AgentSession>) {
     }
 }
 
-async fn process_prompt_raw(
-    session: &Arc<AgentSession>,
-    initial_input: &str,
-) {
+async fn process_prompt_raw(session: &Arc<AgentSession>, initial_input: &str) {
     let (event_tx, mut event_rx) = tokio::sync::mpsc::unbounded_channel::<AgentEvent>();
     let sess = session.clone();
     let tx = event_tx.clone();
@@ -148,8 +182,13 @@ async fn process_prompt_raw(
         if let Err(e) = sess.prompt(&prompt_msg, tx.clone()).await {
             let _ = tx.send(AgentEvent::message_end(AgentMessage {
                 role: "assistant".to_string(),
-                content: vec![MessageContent { content_type: "text".to_string(), text: Some(format!("Error: {}", e)) }],
-                model: None, usage: None, stop_reason: Some("error".to_string()),
+                content: vec![MessageContent {
+                    content_type: "text".to_string(),
+                    text: Some(format!("Error: {}", e)),
+                }],
+                model: None,
+                usage: None,
+                stop_reason: Some("error".to_string()),
             }));
             let _ = tx.send(AgentEvent::turn_end());
             let _ = tx.send(AgentEvent::agent_end());
@@ -166,7 +205,11 @@ async fn process_prompt_raw(
         while let Ok(input) = stdin_rx.try_recv() {
             if input == CANCEL_LOOP_SIG || input == EOF_SIG {
                 session.cancel_loop().await;
-                let _ = write!(stdout(), "{}", serialize_json_line(&serde_json::json!({"type": "loop_cancelled"})));
+                let _ = write!(
+                    stdout(),
+                    "{}",
+                    serialize_json_line(&serde_json::json!({"type": "loop_cancelled"}))
+                );
                 let _ = stdout().flush();
                 if input == EOF_SIG {
                     streaming_stop.store(true, std::sync::atomic::Ordering::SeqCst);
@@ -177,10 +220,18 @@ async fn process_prompt_raw(
             if session.is_streaming().await {
                 if input.starts_with("/steer ") {
                     session.abort().await;
-                    let _ = write!(stdout(), "{}", serialize_json_line(&serde_json::json!({"type": "steer_queued"})));
+                    let _ = write!(
+                        stdout(),
+                        "{}",
+                        serialize_json_line(&serde_json::json!({"type": "steer_queued"}))
+                    );
                 } else {
                     session.follow_up(&input).await;
-                    let _ = write!(stdout(), "{}", serialize_json_line(&serde_json::json!({"type": "queued"})));
+                    let _ = write!(
+                        stdout(),
+                        "{}",
+                        serialize_json_line(&serde_json::json!({"type": "queued"}))
+                    );
                 }
                 let _ = stdout().flush();
             }

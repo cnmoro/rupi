@@ -181,11 +181,13 @@ pub fn repair_json(s: &str) -> String {
 
 /// Check if assistant text contains embedded tool calls that should be extracted.
 pub fn contains_embedded_tool_calls(text: &str) -> bool {
-    text.contains("```tool") || text.contains("<tool_call>") || (text.contains("\"name\"") && text.contains("\"input\""))
+    text.contains("```tool")
+        || text.contains("<tool_call>")
+        || (text.contains("\"name\"") && text.contains("\"input\""))
 }
 
 pub fn has_native_tool_calls(message: &crate::agent::session::Message) -> bool {
-    message.tool_calls.as_ref().map_or(false, |c| !c.is_empty())
+    message.tool_calls.as_ref().is_some_and(|c| !c.is_empty())
 }
 
 #[cfg(test)]

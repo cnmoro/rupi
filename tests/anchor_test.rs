@@ -53,6 +53,7 @@ struct MockProvider {
     script: Mutex<Vec<Turn>>,
     /// Every message list handed to `complete_aligned`, in call order.
     aligned_requests: Mutex<Vec<Vec<Message>>>,
+    aligned_sources: Mutex<Vec<Vec<Message>>>,
     /// Every message list handed to `stream_chat`, in call order.
     stream_requests: Mutex<Vec<Vec<Message>>>,
     summary_text: String,
@@ -63,6 +64,7 @@ impl MockProvider {
         MockProvider {
             script: Mutex::new(script.into_iter().rev().collect()),
             aligned_requests: Mutex::new(Vec::new()),
+            aligned_sources: Mutex::new(Vec::new()),
             stream_requests: Mutex::new(Vec::new()),
             summary_text: summary_text.to_string(),
         }
@@ -85,7 +87,12 @@ fn wire_shape(msg: &Message) -> (String, String, Option<String>, Vec<String>) {
         msg.tool_call_id.clone(),
         msg.tool_calls
             .as_ref()
-            .map(|calls| calls.iter().map(|c| format!("{}:{}", c.id, c.arguments)).collect())
+            .map(|calls| {
+                calls
+                    .iter()
+                    .map(|c| format!("{}:{}", c.id, c.arguments))
+                    .collect()
+            })
             .unwrap_or_default(),
     )
 }
@@ -186,7 +193,10 @@ impl ChatProvider for MockProvider {
     }
 
     async fn complete(&self, _model: &str, messages: &[Message]) -> Result<String, AgentError> {
-        self.aligned_requests.lock().unwrap().push(messages.to_vec());
+        self.aligned_requests
+            .lock()
+            .unwrap()
+            .push(messages.to_vec());
         Ok(self.summary_text.clone())
     }
 
@@ -195,7 +205,18 @@ impl ChatProvider for MockProvider {
         _model: &str,
         messages: &[Message],
     ) -> Result<String, AgentError> {
-        self.aligned_requests.lock().unwrap().push(messages.to_vec());
+        self.aligned_sources.lock().unwrap().push(
+            self.stream_requests
+                .lock()
+                .unwrap()
+                .last()
+                .cloned()
+                .unwrap_or_default(),
+        );
+        self.aligned_requests
+            .lock()
+            .unwrap()
+            .push(messages.to_vec());
         Ok(self.summary_text.clone())
     }
 
@@ -233,7 +254,10 @@ fn session_with_window(provider: Arc<MockProvider>, context_window: u64) -> Agen
 
 /// How many goal-round blocks the conversation carries.
 fn goal_rounds(messages: &[Message]) -> usize {
-    messages.iter().filter(|m| m.content.starts_with("<goal_round>")).count()
+    messages
+        .iter()
+        .filter(|m| m.content.starts_with("<goal_round>"))
+        .count()
 }
 
 /// Run one prompt to completion, discarding the event stream.
@@ -305,9 +329,11 @@ async fn the_original_request_survives_compaction_verbatim() {
 
     let messages = session.messages().await;
     assert!(
-        messages[0].content.starts_with("[Compacted conversation history]"),
+        messages[0]
+            .content
+            .starts_with("[Compacted conversation history]"),
         "expected a checkpoint at the head, got: {}",
-        &messages[0].content.chars().take(80).collect::<String>()
+        messages[0].content.chars().take(80).collect::<String>()
     );
 
     // The anchor sits directly below the checkpoint and carries the exact bytes.
@@ -317,7 +343,10 @@ async fn the_original_request_survives_compaction_verbatim() {
         Some(ORIGINAL_REQUEST),
         "the anchor must carry the request verbatim"
     );
-    assert_eq!(session.task_anchor().await.as_deref(), Some(ORIGINAL_REQUEST));
+    assert_eq!(
+        session.task_anchor().await.as_deref(),
+        Some(ORIGINAL_REQUEST)
+    );
 
     // And the request text is present in the conversation the model will see,
     // even though the summary dropped it.
@@ -371,10 +400,7 @@ async fn the_request_survives_repeated_compactions() {
 #[tokio::test]
 async fn a_checkpoint_never_becomes_the_anchor() {
     let provider = Arc::new(MockProvider::new(
-        vec![
-            Turn::ToolCall { output_bytes: 6000 },
-            Turn::Text("done"),
-        ],
+        vec![Turn::ToolCall { output_bytes: 6000 }, Turn::Text("done")],
         "## Primary Request and Intent\n- something else entirely\n",
     ));
     let session = session_with(provider);
@@ -382,10 +408,17 @@ async fn a_checkpoint_never_becomes_the_anchor() {
 
     // The checkpoint and the anchor both arrive on the `user` role, because
     // providers accept one system message. Only the real request may anchor.
-    assert_eq!(session.task_anchor().await.as_deref(), Some(ORIGINAL_REQUEST));
+    assert_eq!(
+        session.task_anchor().await.as_deref(),
+        Some(ORIGINAL_REQUEST)
+    );
 
-    session.set_task_anchor("[Compacted conversation history]\nsummary text").await;
-    session.set_task_anchor(&rupi::anchor::render("a re-emission", 2)).await;
+    session
+        .set_task_anchor("[Compacted conversation history]\nsummary text")
+        .await;
+    session
+        .set_task_anchor(&rupi::anchor::render("a re-emission", 2))
+        .await;
     session.set_task_anchor("   ").await;
     assert_eq!(
         session.task_anchor().await.as_deref(),
@@ -437,7 +470,10 @@ async fn recover_anchor_falls_back_to_the_first_real_user_message() {
         Message::new("user", "[Compacted conversation history]\nsummary"),
         Message::new("user", ORIGINAL_REQUEST),
     ];
-    assert_eq!(recover_anchor(&compacted).as_deref(), Some(ORIGINAL_REQUEST));
+    assert_eq!(
+        recover_anchor(&compacted).as_deref(),
+        Some(ORIGINAL_REQUEST)
+    );
 
     assert_eq!(recover_anchor(&[]), None);
 }
@@ -466,7 +502,9 @@ async fn the_summarizer_call_is_a_prefix_of_the_real_request() {
     // cached prefix instead of re-prefilling the whole span.
     assert_eq!(request[0].role, "system");
     assert!(
-        request[0].content.contains("expert coding agent operating inside rupi"),
+        request[0]
+            .content
+            .contains("expert coding agent operating inside rupi"),
         "the summarizer must reuse the conversation's own system prompt"
     );
 
@@ -492,8 +530,10 @@ async fn the_summarizer_call_is_a_prefix_of_the_real_request() {
     // than literal — a reordered field, a snipped tool result, a different system
     // prompt — and the provider re-prefills the whole span instead of serving it
     // from cache.
-    let streamed = provider.stream_requests();
-    let last_streamed = streamed.last().expect("at least one streamed request");
+    // Compaction now runs before the next stream, so compare to the stream
+    // captured at summarization time, not the later compacted request.
+    let sources = provider.aligned_sources.lock().unwrap();
+    let last_streamed = sources.first().expect("stream preceding the summary");
     let replayed = &request[..request.len() - 1];
     assert!(
         replayed.len() <= last_streamed.len(),
@@ -580,7 +620,10 @@ async fn compaction_leaves_a_valid_request_on_both_sides() {
         let label = format!("{} tool turns", tool_turns);
         assert_well_formed(&session.messages().await, &format!("tail after {}", label));
         for request in provider.aligned_requests() {
-            assert_well_formed(&request[..request.len() - 1], &format!("head after {}", label));
+            assert_well_formed(
+                &request[..request.len() - 1],
+                &format!("head after {}", label),
+            );
         }
     }
 }
@@ -592,10 +635,7 @@ async fn compaction_leaves_a_valid_request_on_both_sides() {
 #[tokio::test]
 async fn oversized_tool_output_stays_reachable() {
     let provider = Arc::new(MockProvider::new(
-        vec![
-            Turn::ToolCall { output_bytes: 9000 },
-            Turn::Text("done"),
-        ],
+        vec![Turn::ToolCall { output_bytes: 9000 }, Turn::Text("done")],
         "## Summary\n- work\n",
     ));
     let session = session_with(provider);
@@ -635,7 +675,9 @@ async fn every_goal_round_states_its_number() {
     ));
     let session = session_with_window(provider, 400_000);
     session.set_auto_compaction_enabled(false).await;
-    session.set_goal(Some("make the tests pass".to_string())).await;
+    session
+        .set_goal(Some("make the tests pass".to_string()))
+        .await;
 
     run_prompt(&session, ORIGINAL_REQUEST).await;
 
@@ -652,7 +694,10 @@ async fn every_goal_round_states_its_number() {
 async fn a_goal_completed_in_its_own_round_stops_the_driver() {
     let provider = Arc::new(MockProvider::new(
         vec![
-            Turn::GoalDecision { operation: "complete", round: 1 },
+            Turn::GoalDecision {
+                operation: "complete",
+                round: 1,
+            },
             Turn::Text("the objective is met"),
             Turn::Text("this turn must never run"),
         ],
@@ -660,18 +705,26 @@ async fn a_goal_completed_in_its_own_round_stops_the_driver() {
     ));
     let session = session_with_window(provider, 400_000);
     session.set_auto_compaction_enabled(false).await;
-    session.set_goal(Some("make the tests pass".to_string())).await;
+    session
+        .set_goal(Some("make the tests pass".to_string()))
+        .await;
 
     run_prompt(&session, ORIGINAL_REQUEST).await;
 
     let messages = session.messages().await;
-    assert_eq!(goal_rounds(&messages), 1, "an accepted completion ends the run");
+    assert_eq!(
+        goal_rounds(&messages),
+        1,
+        "an accepted completion ends the run"
+    );
     let tool_result = messages
         .iter()
         .find(|m| m.role == "tool")
         .expect("the goal tool must have run");
     assert!(
-        tool_result.content.contains("Goal marked complete in round 1"),
+        tool_result
+            .content
+            .contains("Goal marked complete in round 1"),
         "unexpected goal tool result: {}",
         tool_result.content
     );
@@ -679,13 +732,18 @@ async fn a_goal_completed_in_its_own_round_stops_the_driver() {
 
 #[tokio::test]
 async fn a_completion_from_the_wrong_round_is_rejected() {
-    let mut script = vec![Turn::GoalDecision { operation: "complete", round: 99 }];
+    let mut script = vec![Turn::GoalDecision {
+        operation: "complete",
+        round: 99,
+    }];
     script.extend((0..8).map(|_| Turn::Text("still working")));
     let provider = Arc::new(MockProvider::new(script, "NO"));
 
     let session = session_with_window(provider, 400_000);
     session.set_auto_compaction_enabled(false).await;
-    session.set_goal(Some("make the tests pass".to_string())).await;
+    session
+        .set_goal(Some("make the tests pass".to_string()))
+        .await;
 
     run_prompt(&session, ORIGINAL_REQUEST).await;
 
@@ -707,7 +765,10 @@ async fn a_completion_from_the_wrong_round_is_rejected() {
 async fn a_blocked_goal_stops_the_driver_and_records_the_reason() {
     let provider = Arc::new(MockProvider::new(
         vec![
-            Turn::GoalDecision { operation: "block", round: 1 },
+            Turn::GoalDecision {
+                operation: "block",
+                round: 1,
+            },
             Turn::Text("cannot proceed"),
             Turn::Text("this turn must never run"),
         ],
@@ -715,7 +776,9 @@ async fn a_blocked_goal_stops_the_driver_and_records_the_reason() {
     ));
     let session = session_with_window(provider, 400_000);
     session.set_auto_compaction_enabled(false).await;
-    session.set_goal(Some("make the tests pass".to_string())).await;
+    session
+        .set_goal(Some("make the tests pass".to_string()))
+        .await;
 
     run_prompt(&session, ORIGINAL_REQUEST).await;
 
@@ -730,7 +793,10 @@ async fn a_blocked_goal_stops_the_driver_and_records_the_reason() {
 async fn the_goal_tool_is_rejected_when_no_goal_is_set() {
     let provider = Arc::new(MockProvider::new(
         vec![
-            Turn::GoalDecision { operation: "complete", round: 1 },
+            Turn::GoalDecision {
+                operation: "complete",
+                round: 1,
+            },
             Turn::Text("done"),
         ],
         "NO",
@@ -755,7 +821,9 @@ async fn the_goal_tool_is_rejected_when_no_goal_is_set() {
 async fn a_long_tool_run_re_states_the_request_at_the_tail() {
     // Forty-one tool turns: past the re-emission threshold, with no compaction to
     // do the job instead.
-    let mut script: Vec<Turn> = (0..41).map(|_| Turn::ToolCall { output_bytes: 4 }).collect();
+    let mut script: Vec<Turn> = (0..41)
+        .map(|_| Turn::ToolCall { output_bytes: 4 })
+        .collect();
     script.push(Turn::Text("done"));
     let provider = Arc::new(MockProvider::new(script, "NO"));
 
@@ -769,7 +837,11 @@ async fn a_long_tool_run_re_states_the_request_at_the_tail() {
         .iter()
         .filter(|m| rupi::anchor::is_anchor(&m.content))
         .collect();
-    assert_eq!(anchors.len(), 1, "exactly one re-emission at 41 tool results");
+    assert_eq!(
+        anchors.len(),
+        1,
+        "exactly one re-emission at 41 tool results"
+    );
     assert_eq!(
         rupi::anchor::extract_request(&anchors[0].content).as_deref(),
         Some(ORIGINAL_REQUEST)
@@ -862,7 +934,11 @@ async fn a_second_active_todo_is_rejected() {
         .find(|m| m.role == "tool")
         .expect("the todo tool must have run")
         .content;
-    assert!(result.contains("AT MOST ONE"), "unexpected result: {}", result);
+    assert!(
+        result.contains("AT MOST ONE"),
+        "unexpected result: {}",
+        result
+    );
 }
 
 #[tokio::test]
@@ -919,7 +995,9 @@ async fn snipping_does_not_corrupt_the_replayed_region() {
     session.compact().await.expect("compaction must run");
 
     let requests = provider.aligned_requests();
-    let request = requests.last().expect("compaction must have called the summarizer");
+    let request = requests
+        .last()
+        .expect("compaction must have called the summarizer");
     let replayed = &request[1..request.len() - 1]; // drop the system prompt and the instruction
 
     // The region is the pristine text, not the snipped text. Replaying the snipped
@@ -964,7 +1042,10 @@ async fn a_steer_joins_the_anchor_instead_of_replacing_it() {
     session.steer("also keep the public API unchanged").await;
 
     let anchor = session.task_anchor().await.expect("an anchor");
-    assert!(anchor.contains(ORIGINAL_REQUEST), "the original request must survive a steer");
+    assert!(
+        anchor.contains(ORIGINAL_REQUEST),
+        "the original request must survive a steer"
+    );
     assert!(anchor.contains("also keep the public API unchanged"));
 
     // A follow-up is the user too, so it joins as well.
@@ -975,8 +1056,12 @@ async fn a_steer_joins_the_anchor_instead_of_replacing_it() {
     assert!(anchor.contains("and add a regression test"));
 
     // Host-written blocks still never touch it.
-    session.append_task_anchor("[Compacted conversation history]\nsummary").await;
-    session.append_task_anchor(&rupi::anchor::render("a re-emission", 1)).await;
+    session
+        .append_task_anchor("[Compacted conversation history]\nsummary")
+        .await;
+    session
+        .append_task_anchor(&rupi::anchor::render("a re-emission", 1))
+        .await;
     let after = session.task_anchor().await.expect("an anchor");
     assert!(!after.contains("[Compacted conversation history]"));
     assert!(!after.contains("a re-emission"));
@@ -989,7 +1074,10 @@ async fn a_steered_task_is_carried_through_a_compaction() {
         script.push(Turn::ToolCall { output_bytes: 600 });
         script.push(Turn::Text("step done"));
     }
-    let provider = Arc::new(MockProvider::new(script, "## Primary Request and Intent\n- (not restated)\n"));
+    let provider = Arc::new(MockProvider::new(
+        script,
+        "## Primary Request and Intent\n- (not restated)\n",
+    ));
 
     let session = session_with_window(provider, 2000);
     session.set_auto_compaction_enabled(false).await;
@@ -1010,7 +1098,9 @@ async fn a_steered_task_is_carried_through_a_compaction() {
         .find(|m| rupi::anchor::is_anchor(&m.content))
         .expect("an anchor must survive the compaction");
     assert!(anchor.content.contains(ORIGINAL_REQUEST));
-    assert!(anchor.content.contains("also keep the public API unchanged"));
+    assert!(anchor
+        .content
+        .contains("also keep the public API unchanged"));
     assert!(anchor.content.contains("and add a regression test"));
 }
 
@@ -1024,12 +1114,18 @@ async fn a_new_top_level_prompt_starts_a_new_task() {
     session.set_auto_compaction_enabled(false).await;
 
     run_prompt(&session, ORIGINAL_REQUEST).await;
-    assert_eq!(session.task_anchor().await.as_deref(), Some(ORIGINAL_REQUEST));
+    assert_eq!(
+        session.task_anchor().await.as_deref(),
+        Some(ORIGINAL_REQUEST)
+    );
 
     // A prompt sent while the agent is idle is a new task, not a refinement of the
     // last one, so it replaces rather than accumulates.
     run_prompt(&session, "now document the module").await;
-    assert_eq!(session.task_anchor().await.as_deref(), Some("now document the module"));
+    assert_eq!(
+        session.task_anchor().await.as_deref(),
+        Some("now document the module")
+    );
 }
 
 #[tokio::test]
@@ -1040,7 +1136,10 @@ async fn many_follow_ups_do_not_grow_the_anchor_without_bound() {
     session.set_task_anchor(ORIGINAL_REQUEST).await;
     for i in 0..400 {
         session
-            .follow_up(&format!("refinement number {} with some padding text to add bulk", i))
+            .follow_up(&format!(
+                "refinement number {} with some padding text to add bulk",
+                i
+            ))
             .await;
     }
 
@@ -1077,7 +1176,9 @@ async fn every_request_extends_the_previous_one() {
     // DeepSeek: nothing already sent may ever change. Editing one old message
     // invalidates the cache from that point to the end of the conversation, which is
     // a full re-prefill of everything after it.
-    let mut script: Vec<Turn> = (0..25).map(|_| Turn::ToolCall { output_bytes: 300 }).collect();
+    let mut script: Vec<Turn> = (0..25)
+        .map(|_| Turn::ToolCall { output_bytes: 300 })
+        .collect();
     script.push(Turn::Text("done"));
     let provider = Arc::new(MockProvider::new(script, "NO"));
 
@@ -1086,7 +1187,11 @@ async fn every_request_extends_the_previous_one() {
     run_prompt(&session, ORIGINAL_REQUEST).await;
 
     let requests = provider.stream_requests();
-    assert!(requests.len() >= 25, "expected a long tool run, got {}", requests.len());
+    assert!(
+        requests.len() >= 25,
+        "expected a long tool run, got {}",
+        requests.len()
+    );
     for (turn, pair) in requests.windows(2).enumerate() {
         assert_eq!(
             first_divergence(&pair[0], &pair[1]),
@@ -1099,7 +1204,9 @@ async fn every_request_extends_the_previous_one() {
 
 #[tokio::test]
 async fn the_system_prompt_is_byte_identical_on_every_turn() {
-    let mut script: Vec<Turn> = (0..6).map(|_| Turn::ToolCall { output_bytes: 300 }).collect();
+    let mut script: Vec<Turn> = (0..6)
+        .map(|_| Turn::ToolCall { output_bytes: 300 })
+        .collect();
     script.push(Turn::Text("done"));
     let provider = Arc::new(MockProvider::new(script, "NO"));
 
@@ -1113,7 +1220,11 @@ async fn the_system_prompt_is_byte_identical_on_every_turn() {
     assert_eq!(requests[0][0].role, "system");
     for (turn, request) in requests.iter().enumerate() {
         assert_eq!(request[0].role, "system");
-        assert_eq!(request[0].content, first, "the system prompt changed on turn {}", turn);
+        assert_eq!(
+            request[0].content, first,
+            "the system prompt changed on turn {}",
+            turn
+        );
     }
 }
 
@@ -1141,7 +1252,10 @@ async fn a_declined_compaction_leaves_the_history_untouched() {
     let mut probe = before.clone();
     assert!(rupi::compaction::snip_old_tool_results(&mut probe, 6) > 0);
 
-    assert!(session.compact().await.is_err(), "compaction must decline here");
+    assert!(
+        session.compact().await.is_err(),
+        "compaction must decline here"
+    );
 
     let after = session.messages().await;
     assert_eq!(after.len(), before.len());
@@ -1185,4 +1299,31 @@ async fn only_a_compaction_breaks_the_prefix() {
         breaks,
         compactions
     );
+}
+
+#[tokio::test]
+async fn long_tool_chain_compacts_before_the_final_response() {
+    let mut turns = Vec::new();
+    for _ in 0..8 {
+        turns.push(Turn::ToolCall { output_bytes: 3800 });
+    }
+    turns.push(Turn::Text("done"));
+    let provider = Arc::new(MockProvider::new(turns, "checkpoint"));
+    let session = session_with_window(provider.clone(), 20000);
+    let (tx, _rx) = mpsc::unbounded_channel();
+    session.prompt(ORIGINAL_REQUEST, tx).await.unwrap();
+    assert!(
+        !provider.aligned_requests().is_empty(),
+        "tool chain never compacted"
+    );
+    let requests = provider.stream_requests();
+    assert!(requests.iter().skip(1).any(|messages| messages
+        .iter()
+        .any(|m| m.content.contains("<compacted-summary>"))));
+    for request in requests {
+        assert!(rupi::compaction::tool_pairing_balanced_before(
+            &request,
+            request.len()
+        ));
+    }
 }

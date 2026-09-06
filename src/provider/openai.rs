@@ -186,7 +186,10 @@ impl OpenAIProvider {
         messages: &[Message],
         with_tools: bool,
     ) -> Result<String, AgentError> {
-        let url = format!("{}/chat/completions", self.config.base_url.trim_end_matches('/'));
+        let url = format!(
+            "{}/chat/completions",
+            self.config.base_url.trim_end_matches('/')
+        );
         let api_key = self.config.api_key.clone();
         let client = self.client.clone();
         let model = model.to_string();
@@ -245,7 +248,7 @@ impl OpenAIProvider {
             .enumerate()
             .map(|(index, m)| {
                 // OpenAI expects content: null for assistant messages with only tool calls
-                let has_tool_calls = m.tool_calls.as_ref().map_or(false, |c| !c.is_empty());
+                let has_tool_calls = m.tool_calls.as_ref().is_some_and(|c| !c.is_empty());
                 let content = if has_tool_calls && m.content.is_empty() {
                     None
                 } else {
@@ -321,7 +324,10 @@ impl ChatProvider for OpenAIProvider {
         messages: &[Message],
         mut signal: watch::Receiver<bool>,
     ) -> Result<mpsc::Receiver<StreamEvent>, AgentError> {
-        let url = format!("{}/chat/completions", self.config.base_url.trim_end_matches('/'));
+        let url = format!(
+            "{}/chat/completions",
+            self.config.base_url.trim_end_matches('/')
+        );
         let api_key = self.config.api_key.clone();
         let client = self.client.clone();
         let model = model.to_string();
@@ -334,53 +340,46 @@ impl ChatProvider for OpenAIProvider {
 
         let (tx, rx) = mpsc::channel(256);
 
-        // Spawn the streaming task. Panics are caught by tokio and stored
-        // in the JoinHandle. Since we don't await the handle, a panic would
-        // close the tx channel silently. Wrap the body in catch_unwind to
-        // send an error event on panic.
+        // Establish the request before returning the receiver so the caller can
+        // retry HTTP failures without replaying a partially emitted response.
+        let body = ChatRequest {
+            model: model.clone(),
+            messages: api_messages,
+            stream: true,
+            max_tokens: None,
+            tools: Some(serialized_tools),
+            tool_choice: Some(serde_json::json!("auto")),
+        };
+
+        if *signal.borrow() {
+            return Err(AgentError::Cancelled);
+        }
+        let response = tokio::select! {
+            biased;
+            _ = signal.changed() => return Err(AgentError::Cancelled),
+            response = client.post(&url)
+                .bearer_auth(&api_key)
+                .json(&body)
+                .send() => response?,
+        };
+        if !response.status().is_success() {
+            let status_code = response.status().as_u16();
+            let message = tokio::select! {
+                _ = signal.changed() => return Err(AgentError::Cancelled),
+                body = response.text() => body.unwrap_or_default(),
+            };
+            return Err(AgentError::Api {
+                message,
+                status_code,
+            });
+        }
+        let gen_id = response
+            .headers()
+            .get("X-Generation-Id")
+            .and_then(|v| v.to_str().ok())
+            .map(str::to_owned);
         let tx_catch = tx.clone();
         let handle: tokio::task::JoinHandle<()> = tokio::spawn(async move {
-            let body = ChatRequest {
-                model: model.clone(),
-                messages: api_messages,
-                stream: true,
-                max_tokens: None,
-                tools: Some(serialized_tools),
-                tool_choice: Some(serde_json::json!("auto")),
-            };
-
-            let response_result = client
-                .post(&url)
-                .header("Authorization", format!("Bearer {}", api_key))
-                .header("Content-Type", "application/json")
-                .json(&body)
-                .send()
-                .await;
-
-            let response = match response_result {
-                Ok(r) => r,
-                Err(e) => {
-                    let _ = tx.send(StreamEvent::Error(format!("HTTP request error: {}", e))).await;
-                    return;
-                }
-            };
-
-            // Capture X-Generation-Id from response headers before consuming body
-            let gen_id = response
-                .headers()
-                .get("X-Generation-Id")
-                .and_then(|v| v.to_str().ok())
-                .map(|s| s.to_string());
-
-            if !response.status().is_success() {
-                let status = response.status().as_u16();
-                let body_text = response.text().await.unwrap_or_default();
-                let _ = tx
-                    .send(StreamEvent::Error(format!("API error ({}): {}", status, body_text)))
-                    .await;
-                return;
-            }
-
             // Emit generation ID as early as possible
             if let Some(ref id) = gen_id {
                 let _ = tx.send(StreamEvent::GenerationId(id.clone())).await;
@@ -395,9 +394,9 @@ impl ChatProvider for OpenAIProvider {
             let mut finish_reason: Option<String> = None;
             let mut stream = response.bytes_stream();
             // SSE reassembly buffer: accumulates partial lines across chunk boundaries
-            let mut sse_buf = String::new();
+            let mut sse_buf = Vec::new();
 
-            loop {
+            'stream: loop {
                 tokio::select! {
                     biased;
                     _cancelled = signal.changed() => {
@@ -409,76 +408,69 @@ impl ChatProvider for OpenAIProvider {
                     chunk_result = stream.next() => {
                         match chunk_result {
                             Some(Ok(bytes)) => {
-                                sse_buf.push_str(&String::from_utf8_lossy(&bytes));
+                                sse_buf.extend_from_slice(&bytes);
                                 // Process complete lines from the buffer
-                                loop {
-                                    let line_end = match sse_buf.find('\n') {
-                                        Some(pos) => pos,
-                                        None => break, // wait for more data
-                                    };
-                                    let line = sse_buf[..line_end].trim().to_string();
+                                while let Some(line_end) = sse_buf.iter().position(|b| *b == b'\n') {
+                                    let line = String::from_utf8_lossy(&sse_buf[..line_end]).trim().to_string();
                                     sse_buf.drain(..=line_end);
                                     if line.is_empty() || line.starts_with(':') {
                                         continue;
                                     }
                                     if line == "data: [DONE]" || line == "data:[DONE]" {
-                                        break;
+                                        break 'stream;
                                     }
                                     // Handle both "data: " and "data:" prefixes
                                     let data = line.strip_prefix("data: ")
                                         .or_else(|| line.strip_prefix("data:"))
                                         .unwrap_or("");
                                     if !data.is_empty() {
-                                        match serde_json::from_str::<ChatChunk>(data) {
-                                            Ok(chunk) => {
-                                                if let Some(usage) = chunk.usage {
-                                                    input_tokens = usage.prompt_tokens;
-                                                    output_tokens = usage.completion_tokens;
-                                                    if let Some(c) = usage.cost {
-                                                        cost = Some(super::PromptCost {
-                                                            prompt_cost: c,
-                                                            completion_cost: 0.0,
-                                                            total_cost: c,
-                                                        });
-                                                    }
+                                        if let Ok(chunk) = serde_json::from_str::<ChatChunk>(data) {
+                                            if let Some(usage) = chunk.usage {
+                                                input_tokens = usage.prompt_tokens;
+                                                output_tokens = usage.completion_tokens;
+                                                if let Some(c) = usage.cost {
+                                                    cost = Some(super::PromptCost {
+                                                        prompt_cost: c,
+                                                        completion_cost: 0.0,
+                                                        total_cost: c,
+                                                    });
                                                 }
-                                                for choice in chunk.choices {
-                                                    if let Some(reason) = choice.finish_reason {
-                                                        finish_reason = Some(reason);
-                                                    }
-                                                    let delta = choice.delta;
-                                                    if let Some(content) = delta.content {
-                                                        full_content.push_str(&content);
-                                                        let _ = tx.send(StreamEvent::Delta(content)).await;
-                                                    }
-                                                    if let Some(rc) = delta.reasoning_content {
-                                                        reasoning_content.push_str(&rc);
-                                                        let _ = tx.send(StreamEvent::Reasoning(rc)).await;
-                                                    }
-                                                    if let Some(chunk_tool_calls) = delta.tool_calls {
-                                                        for tc in chunk_tool_calls {
-                                                            let index = tc.index;
-                                                            while tool_calls.len() <= index {
-                                                                tool_calls.push(AccumulatedToolCall::default());
+                                            }
+                                            for choice in chunk.choices {
+                                                if let Some(reason) = choice.finish_reason {
+                                                    finish_reason = Some(reason);
+                                                }
+                                                let delta = choice.delta;
+                                                if let Some(content) = delta.content {
+                                                    full_content.push_str(&content);
+                                                    let _ = tx.send(StreamEvent::Delta(content)).await;
+                                                }
+                                                if let Some(rc) = delta.reasoning_content {
+                                                    reasoning_content.push_str(&rc);
+                                                    let _ = tx.send(StreamEvent::Reasoning(rc)).await;
+                                                }
+                                                if let Some(chunk_tool_calls) = delta.tool_calls {
+                                                    for tc in chunk_tool_calls {
+                                                        let index = tc.index;
+                                                        while tool_calls.len() <= index {
+                                                            tool_calls.push(AccumulatedToolCall::default());
+                                                        }
+                                                        let acc = &mut tool_calls[index];
+                                                        acc.index = index;
+                                                        if let Some(id) = tc.id {
+                                                            acc.id = id;
+                                                        }
+                                                        if let Some(func) = tc.function {
+                                                            if let Some(name) = func.name {
+                                                                acc.name = name;
                                                             }
-                                                            let acc = &mut tool_calls[index];
-                                                            acc.index = index;
-                                                            if let Some(id) = tc.id {
-                                                                acc.id = id;
-                                                            }
-                                                            if let Some(func) = tc.function {
-                                                                if let Some(name) = func.name {
-                                                                    acc.name = name;
-                                                                }
-                                                                if let Some(args) = func.arguments {
-                                                                    acc.arguments.push_str(&args);
-                                                                }
+                                                            if let Some(args) = func.arguments {
+                                                                acc.arguments.push_str(&args);
                                                             }
                                                         }
                                                     }
                                                 }
                                             }
-                                            Err(_) => {}
                                         }
                                     }
                                 }
@@ -543,11 +535,14 @@ impl ChatProvider for OpenAIProvider {
             if let Err(e) = handle.await {
                 if e.is_panic() {
                     let panic = e.into_panic();
-                    let msg = panic.downcast_ref::<&str>()
+                    let msg = panic
+                        .downcast_ref::<&str>()
                         .map(|s| s.to_string())
-                        .or_else(|| panic.downcast_ref::<String>().map(|s| s.clone()))
+                        .or_else(|| panic.downcast_ref::<String>().cloned())
                         .unwrap_or_else(|| "unknown panic in HTTP task".to_string());
-                    let _ = tx_err.send(StreamEvent::Error(format!("Internal error: {}", msg))).await;
+                    let _ = tx_err
+                        .send(StreamEvent::Error(format!("Internal error: {}", msg)))
+                        .await;
                 }
             }
         });
@@ -555,11 +550,7 @@ impl ChatProvider for OpenAIProvider {
         Ok(rx)
     }
 
-    async fn complete(
-        &self,
-        model: &str,
-        messages: &[Message],
-    ) -> Result<String, AgentError> {
+    async fn complete(&self, model: &str, messages: &[Message]) -> Result<String, AgentError> {
         self.complete_inner(model, messages, false).await
     }
 
@@ -626,7 +617,10 @@ mod tests {
 
     #[test]
     fn the_moving_breakpoint_follows_the_tail() {
-        let mut messages = vec![Message::new("system", "SYSTEM"), Message::new("user", "one")];
+        let mut messages = vec![
+            Message::new("system", "SYSTEM"),
+            Message::new("user", "one"),
+        ];
         assert_eq!(body_of(&messages)[1]["cache_control"]["type"], "ephemeral");
 
         messages.push(Message::new("assistant", "two"));
@@ -646,8 +640,6 @@ mod tests {
     fn an_empty_request_does_not_panic() {
         assert!(body_of(&[]).as_array().unwrap().is_empty());
     }
-
-    use super::*;
 
     #[tokio::test]
     async fn test_openai_provider_model_info() {
@@ -669,8 +661,15 @@ mod tests {
 
     #[tokio::test]
     async fn test_openai_provider_empty_messages() {
+        let mut server = mockito::Server::new_async().await;
+        let mock = server
+            .mock("POST", "/chat/completions")
+            .with_status(200)
+            .with_body("data: [DONE]\n\n")
+            .create_async()
+            .await;
         let config = OpenAIConfig {
-            base_url: "http://127.0.0.1:1".into(),
+            base_url: server.url(),
             api_key: "test-key".into(),
             model: "gpt-4".into(),
             context_window: 8192,
@@ -680,6 +679,10 @@ mod tests {
         let provider = OpenAIProvider::new(config);
         let (_tx, rx_signal) = watch::channel(false);
         let result = provider.stream_chat("gpt-4", &[], rx_signal).await;
-        assert!(result.is_ok(), "stream_chat should not fail for empty messages");
+        assert!(
+            result.is_ok(),
+            "stream_chat should not fail for empty messages"
+        );
+        mock.assert_async().await;
     }
 }

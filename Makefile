@@ -2,7 +2,7 @@
 
 # Project metadata
 NAME := rupi
-VERSION := 0.1.0
+VERSION := $(shell sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -n 1)
 BINARY := target/release/rupi
 
 # Directories
@@ -11,18 +11,18 @@ DIST_DIR := dist
 
 # Ensure build directory exists
 $(BINARY):
-	cargo build --release
+	cargo build --locked --release
 
 # Build the project
 build:
-	cargo build --release
+	cargo build --locked --release
 
 # Run tests
 test:
-	cargo test
+	cargo test --locked --all-targets
 
 # Install to system directories
-install:
+install: build
 	install -m 0755 $(BINARY) /usr/local/bin/$(NAME)
 
 # Uninstall from system directories
@@ -30,7 +30,8 @@ uninstall:
 	rm -f /usr/local/bin/$(NAME)
 
 # Create a distribution package
-dist: clean
+dist: build
+	rm -rf $(DIST_DIR)
 	mkdir -p $(DIST_DIR)
 	cp $(BINARY) $(DIST_DIR)/$(NAME)
 	tar -czvf $(DIST_DIR)/$(NAME)-v$(VERSION)-x86_64-unknown-linux-gnu.tar.gz -C $(DIST_DIR) $(NAME)
