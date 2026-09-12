@@ -275,6 +275,15 @@ async fn process_prompt(session: &Arc<AgentSession>, initial_input: &str) {
                             args_str
                         };
                         let _ = writeln!(stdout(), "\n[Tool: {} {}]", tool_name, cmd);
+                        // A fused command is shell execution and it sorts last in the
+                        // serialized arguments, so the line above cuts it off for any
+                        // realistic edit. Show it on its own line, before it runs.
+                        if let Some(fused) = crate::tools::fused_command(&tool_name, &arguments) {
+                            // In full. This is the only place the fused command is
+                            // shown before it runs, and a silent cut here lets a
+                            // long command look complete while its tail is hidden.
+                            let _ = writeln!(stdout(), "[Tool: bash (fused) {}]", fused);
+                        }
                         let _ = stdout().flush();
                     }
                     Some(AgentEvent::ToolExecutionEnd { tool_name, result, .. }) => {

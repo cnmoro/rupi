@@ -176,10 +176,10 @@ impl OpenAIProvider {
 
     /// One non-streaming completion.
     ///
-    /// `with_tools` decides whether the serialized tool schemas ride along. They
-    /// change nothing about the answer — `tool_choice` is `"none"` — but they keep
-    /// the request prefix byte-identical to the streaming calls, which is what lets
-    /// the provider serve the whole conversation from its KV cache.
+    /// `with_tools` decides whether the serialized tool schemas ride along, under
+    /// the same `tool_choice` the streaming call uses, so the request prefix stays
+    /// byte-identical to it. That is what lets the provider serve the whole
+    /// conversation from its KV cache instead of re-reading it.
     async fn complete_inner(
         &self,
         model: &str,
@@ -203,7 +203,14 @@ impl OpenAIProvider {
         });
         if with_tools && !self.cached_tools.is_empty() {
             body["tools"] = serde_json::Value::Array(self.cached_tools.clone());
-            body["tool_choice"] = serde_json::json!("none");
+            // `auto`, matching the streaming call exactly. `none` reads as the safer
+            // choice — it forces text — but several of the backends this alignment
+            // targets render `tool_choice` into the chat template, so a different
+            // value changes the tokenized prompt and silently discards the very
+            // cache this call exists to hit. The instruction already tells the model
+            // not to call a tool, and if one comes back anyway `complete_aligned`
+            // retries without tools.
+            body["tool_choice"] = serde_json::json!("auto");
         }
 
         let response = client

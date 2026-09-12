@@ -318,7 +318,23 @@ async fn run_interactive_mode(
         use std::io::Write;
         let approval: ApprovalFn = Arc::new(|tool_name: &str, args: &str| {
             let mut line = String::new();
-            let prompt = format!("\n[APPROVAL] Allow tool '{}({})'? [y/N] ", tool_name, args);
+            // Show the arguments in full, never eliding the middle.
+            //
+            // An earlier version trimmed to head plus tail to keep the prompt
+            // readable. That is exactly the wrong shape for a gate: a padded
+            // command hides its payload in the omitted middle while the visible
+            // head and tail read as harmless, and the full string is what runs. A
+            // long prompt is ugly; a short one that lies is a vulnerability.
+            let shown = args.to_string();
+            let warning = if args.chars().count() > 2000 {
+                "\n  [long input — decline if you cannot review all of it]"
+            } else {
+                ""
+            };
+            let prompt = format!(
+                "\n[APPROVAL] Allow tool '{}'?\n  {}{}\n[y/N] ",
+                tool_name, shown, warning
+            );
             let _ = std::io::Write::write(&mut std::io::stdout(), prompt.as_bytes());
             let _ = std::io::stdout().flush();
             line.clear();

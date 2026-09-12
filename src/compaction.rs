@@ -96,9 +96,6 @@ fn ceil_boundary(text: &str, index: usize) -> usize {
 /// Default number of tokens to reserve for the prompt + LLM response.
 const RESERVE_TOKENS: u64 = 16384;
 
-/// Default number of recent tokens to keep after compaction cuts.
-const KEEP_RECENT_TOKENS: u64 = 20000;
-
 /// Result of a compaction operation.
 #[derive(Debug, Clone)]
 pub struct CompactionResult {
@@ -154,6 +151,11 @@ pub fn should_compact(context_tokens: u64, context_window: u64) -> bool {
 /// It is not when the last message opens tool calls whose results fall on the
 /// other side of the cut. The summarizer replays this half verbatim, so an
 /// unanswered call here is rejected by the provider.
+/// Note: this checks only the message immediately before the cut. It is not
+/// self-sufficient — a cut in the middle of one assistant's multi-result run would
+/// pass it, because the message before the cut is then a `tool` with no calls of its
+/// own. `tool_pairing_balanced_after` rejects exactly that case, and the two are
+/// always used together in `snap_cut_to_boundary`. Keep them together.
 pub fn tool_pairing_balanced_before(messages: &[Message], cut: usize) -> bool {
     let cut = cut.min(messages.len());
     if cut == 0 {
@@ -305,6 +307,17 @@ pub fn build_summarization_request(
     system_prompt: Option<&str>,
     region: &[Message],
 ) -> Vec<Message> {
+    // The region must already be a whole request. Every caller derives it from
+    // `find_cut_point`, which guarantees that; this catches a future caller that
+    // does not, in debug builds, instead of sending the provider an invalid request.
+    debug_assert!(
+        region.first().map(|m| m.role.as_str()) != Some("tool"),
+        "a summarization region must not start with an orphan tool result"
+    );
+    debug_assert!(
+        tool_pairing_balanced_before(region, region.len()),
+        "a summarization region must not end with an unanswered tool call"
+    );
     let mut request = Vec::with_capacity(region.len() + 2);
     if let Some(system) = system_prompt {
         request.push(Message::new("system", system));
@@ -334,6 +347,350 @@ pub fn build_checkpoint_body(summary: &str) -> String {
     )
 }
 
+// ---------------------------------------------------------------------------
+// Checkpoint validation
+// ---------------------------------------------------------------------------
+//
+// Compaction replaces a large span of the conversation with whatever the
+// summarizer returned. Nothing checked that the return value was a summary at
+// all, so a refusal, a content-filter stub, or a response cut off at the token
+// limit would be stored as the checkpoint and the whole region deleted behind
+// it. The loss is silent: the agent continues from a checkpoint that says
+// nothing, with no signal that its context was thrown away.
+//
+// The idea is borrowed from the deepseek harness and from SoL-Pi's reducer,
+// which refuses a receipt whose claims it cannot verify against the archived
+// source. A markdown checkpoint carries no structured evidence to verify quote
+// by quote, so the check here is structural: a checkpoint has to look like one.
+
+/// Why a summarizer response was refused as a checkpoint.
+#[derive(Debug, Clone, PartialEq)]
+pub enum CheckpointProblem {
+    /// Nothing but whitespace came back.
+    Empty,
+    /// Far too short to be a summary of a full context window.
+    TooShort(usize),
+    /// The instruction demands these sections and they are absent.
+    MissingSections(Vec<&'static str>),
+    /// A section is present but says nothing.
+    EmptySection(&'static str),
+    /// The model echoed the instruction back instead of following it.
+    InstructionEcho,
+}
+
+impl std::fmt::Display for CheckpointProblem {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            CheckpointProblem::Empty => write!(f, "an empty response"),
+            CheckpointProblem::TooShort(chars) => {
+                write!(f, "only {} characters, too short to be a checkpoint", chars)
+            }
+            CheckpointProblem::MissingSections(missing) => {
+                write!(f, "a response missing the sections {}", missing.join(", "))
+            }
+            CheckpointProblem::EmptySection(section) => {
+                write!(f, "a response whose {} section is empty", section)
+            }
+            CheckpointProblem::InstructionEcho => {
+                write!(f, "the instruction echoed back instead of a summary")
+            }
+        }
+    }
+}
+
+/// Sections the compaction instruction requires, by their heading text.
+///
+/// Matched after normalization, not literally. A model that writes
+/// `**Primary Request and Intent**`, `## 1. Primary Request and Intent`, or
+/// `##PRIMARY REQUEST AND INTENT` has followed the instruction; rejecting it
+/// would throw away a good summary and fall back to a far worse checkpoint.
+const REQUIRED_SECTIONS: [&str; 3] = ["primary request and intent", "current work", "next step"];
+
+/// Sections that must carry substance, not just a heading.
+///
+/// `Next Step` is deliberately excluded: the instruction itself allows `(none)`
+/// there, so an empty one is a valid checkpoint.
+const SECTIONS_NEEDING_BODY: [&str; 2] = ["primary request and intent", "current work"];
+
+/// Shortest response that can plausibly be a checkpoint.
+const MIN_CHECKPOINT_CHARS: usize = 200;
+
+/// Shortest body a required section must carry.
+const MIN_SECTION_BODY_CHARS: usize = 12;
+
+/// A sentence unique to the compaction instruction.
+///
+/// Parroting the prompt back is the most common weak-model failure, and the
+/// instruction itself contains every required heading — so an echo used to sail
+/// through the gate written to catch exactly that.
+const INSTRUCTION_FINGERPRINT: &str = "acting as a compaction engine";
+
+/// Reduce a line to its heading text, or `None` when it is not a heading.
+///
+/// Strips the markdown and numbering models decorate headings with, so matching
+/// is on what the heading says rather than how it was typeset.
+fn heading_text(line: &str) -> Option<String> {
+    let trimmed = line.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let is_hash = trimmed.starts_with('#');
+    let is_bold = trimmed.starts_with("**");
+    if !is_hash && !is_bold {
+        return None;
+    }
+    let stripped: String = trimmed
+        .trim_matches(|c: char| c == '#' || c == '*' || c == ':' || c == '.' || c.is_whitespace())
+        .to_string();
+    // Drop a leading section number such as `1.` or `2)`.
+    let without_number = stripped
+        .trim_start_matches(|c: char| c.is_ascii_digit() || c == '.' || c == ')' || c == ' ');
+    let text = without_number.trim().to_lowercase();
+    if text.is_empty() {
+        None
+    } else {
+        Some(text)
+    }
+}
+
+/// Locate a required section and return the text under it.
+fn section_body(lines: &[&str], section: &str) -> Option<String> {
+    // Exact match after normalization. A prefix match let `## Current Workflow`,
+    // about something else entirely, satisfy the `Current Work` requirement.
+    let start = lines
+        .iter()
+        .position(|line| heading_text(line).as_deref() == Some(section))?;
+    // Stop at the next heading, ignoring anything inside a fenced code block. A
+    // `#` comment in a snippet is not a heading, and treating it as one truncated
+    // the section and rejected a summary that had followed the instruction to
+    // preserve syntax fragments.
+    let mut body: Vec<&str> = Vec::new();
+    let mut in_fence = false;
+    for line in &lines[start + 1..] {
+        let trimmed = line.trim_start();
+        if trimmed.starts_with("```") || trimmed.starts_with("~~~") {
+            in_fence = !in_fence;
+            body.push(line);
+            continue;
+        }
+        if !in_fence && heading_text(line).is_some() {
+            break;
+        }
+        body.push(line);
+    }
+    Some(body.join("\n"))
+}
+
+/// Whether a section body says anything.
+///
+/// Bullet markers and dashes are decoration, so a body made only of them is
+/// empty however long it is.
+fn body_is_substantive(body: &str) -> bool {
+    let meat: String = body
+        .chars()
+        .filter(|c| !c.is_whitespace() && *c != '-' && *c != '*' && *c != '_' && *c != '#')
+        .collect();
+    meat.chars().count() >= MIN_SECTION_BODY_CHARS
+}
+
+/// Check that a summarizer response is actually a checkpoint.
+pub fn validate_summary(summary: &str) -> Result<(), CheckpointProblem> {
+    let trimmed = summary.trim();
+    if trimmed.is_empty() {
+        return Err(CheckpointProblem::Empty);
+    }
+    if trimmed.len() < MIN_CHECKPOINT_CHARS {
+        return Err(CheckpointProblem::TooShort(trimmed.len()));
+    }
+    if trimmed.contains(INSTRUCTION_FINGERPRINT) {
+        return Err(CheckpointProblem::InstructionEcho);
+    }
+
+    let lines: Vec<&str> = trimmed.lines().collect();
+    let mut missing: Vec<&'static str> = Vec::new();
+    for section in REQUIRED_SECTIONS {
+        if section_body(&lines, section).is_none() {
+            missing.push(section);
+        }
+    }
+    if !missing.is_empty() {
+        return Err(CheckpointProblem::MissingSections(missing));
+    }
+    for section in SECTIONS_NEEDING_BODY {
+        let body = section_body(&lines, section).unwrap_or_default();
+        if !body_is_substantive(&body) {
+            return Err(CheckpointProblem::EmptySection(section));
+        }
+    }
+    Ok(())
+}
+
+/// Longest a single recorded path or command may be in a mechanical checkpoint.
+const MECHANICAL_ITEM_CHARS: usize = 120;
+/// Most paths a mechanical checkpoint lists.
+const MECHANICAL_MAX_FILES: usize = 40;
+/// Most commands a mechanical checkpoint lists.
+const MECHANICAL_MAX_COMMANDS: usize = 30;
+/// Longest narration excerpt kept per message.
+const MECHANICAL_NARRATION_CHARS: usize = 400;
+
+/// Patterns whose following value is replaced before a command is recorded.
+///
+/// Redaction is best-effort and cannot be complete. It exists because compaction
+/// is the one operation that would otherwise have dropped these strings from the
+/// live context, and a mechanical checkpoint would instead promote them into
+/// every later request.
+const SECRET_MARKERS: [&str; 10] = [
+    "authorization:",
+    "bearer ",
+    "api_key",
+    "apikey",
+    "secret",
+    "password",
+    "passwd",
+    "token",
+    "--header",
+    "-u ",
+];
+
+/// Shorten one model-authored string to a bounded, redacted single line.
+///
+/// The length cap is the load-bearing part. `file_path` and `command` come
+/// straight from tool arguments, so a region of long one-liners used to produce a
+/// checkpoint far larger than the span it replaced — which left the context over
+/// budget with a checkpoint at index zero that `find_cut_point` could never cut
+/// again, wedging the session permanently.
+fn mechanical_item(value: &str) -> String {
+    let line = value.lines().next().unwrap_or("").trim();
+    let lowered = line.to_lowercase();
+    if SECRET_MARKERS.iter().any(|marker| lowered.contains(marker)) {
+        let head: String = line.chars().take(24).collect();
+        return format!("{}... [redacted: may contain a credential]", head);
+    }
+    if line.chars().count() <= MECHANICAL_ITEM_CHARS {
+        return line.to_string();
+    }
+    let head: String = line.chars().take(MECHANICAL_ITEM_CHARS).collect();
+    format!("{}... [{} chars]", head, line.chars().count())
+}
+
+/// Build a checkpoint from the region with no model call.
+///
+/// Used when the summarizer will not produce a usable one. The two obvious
+/// responses to that are both bad: storing the bad summary destroys the region
+/// silently, and refusing to compact leaves the next request over the provider's
+/// limit. This is the third option — a summary that states only what can be read
+/// straight off the messages, so it invents nothing and always succeeds.
+///
+/// Every part of it is bounded. It runs precisely when the context is already
+/// over budget, so it is the one summary that must never be large.
+pub fn mechanical_checkpoint(region: &[Message]) -> String {
+    let mut files: Vec<String> = Vec::new();
+    let mut commands: Vec<String> = Vec::new();
+    let mut files_seen = 0usize;
+    let mut commands_seen = 0usize;
+    for msg in region {
+        let Some(calls) = msg.tool_calls.as_ref() else {
+            continue;
+        };
+        for call in calls {
+            // `or_else` only fires when the key is absent, so a `file_path` of the
+            // wrong type still falls through to `path`.
+            if let Some(path) = call
+                .arguments
+                .get("file_path")
+                .and_then(|p| p.as_str())
+                .or_else(|| call.arguments.get("path").and_then(|p| p.as_str()))
+            {
+                let item = mechanical_item(path);
+                if !item.is_empty() && !files.contains(&item) {
+                    files_seen += 1;
+                    if files.len() < MECHANICAL_MAX_FILES {
+                        files.push(item);
+                    }
+                }
+            }
+            if let Some(command) = call.arguments.get("command").and_then(|c| c.as_str()) {
+                let item = mechanical_item(command);
+                if !item.is_empty() && !commands.contains(&item) {
+                    commands_seen += 1;
+                    if commands.len() < MECHANICAL_MAX_COMMANDS {
+                        commands.push(item);
+                    }
+                }
+            }
+        }
+    }
+
+    let mut out = String::new();
+    out.push_str("## Primary Request and Intent\n");
+    out.push_str(
+        "- The summarizer did not return a usable checkpoint, so this one was built mechanically \
+from the messages. It records only what the conversation shows. Read the files below before you \
+rely on any of it.\n\n",
+    );
+
+    out.push_str("## Files and Code\n");
+    if files.is_empty() {
+        out.push_str("- (none recorded)\n");
+    } else {
+        for path in &files {
+            out.push_str(&format!("- {}\n", path));
+        }
+        // Say when the list is partial. Without this, whoever resumes has no signal
+        // that the region touched more files than are recorded here.
+        if files_seen > files.len() {
+            out.push_str(&format!(
+                "- ... and {} more not listed\n",
+                files_seen - files.len()
+            ));
+        }
+    }
+
+    out.push_str("\n## Commands Run\n");
+    if commands.is_empty() {
+        out.push_str("- (none recorded)\n");
+    } else {
+        for command in &commands {
+            out.push_str(&format!("- {}\n", command));
+        }
+        if commands_seen > commands.len() {
+            out.push_str(&format!(
+                "- ... and {} more not listed\n",
+                commands_seen - commands.len()
+            ));
+        }
+    }
+
+    out.push_str("\n## Current Work\n");
+    let tail: Vec<&Message> = region
+        .iter()
+        .rev()
+        .filter(|m| (m.role == "assistant" || m.role == "user") && !m.content.trim().is_empty())
+        .take(3)
+        .collect();
+    if tail.is_empty() {
+        out.push_str("- no narration was recorded in the replaced messages\n");
+    } else {
+        for msg in tail.iter().rev() {
+            let text: String = msg
+                .content
+                .chars()
+                .take(MECHANICAL_NARRATION_CHARS)
+                .collect::<String>()
+                .replace('\n', " ");
+            out.push_str(&format!("- {}: {}\n", msg.role, text));
+        }
+    }
+
+    out.push_str(&format!(
+        "\n## Next Step\n- Re-read the files above and continue the task stated in the \
+active-task block. {} messages were replaced by this checkpoint.\n",
+        region.len()
+    ));
+    out
+}
+
 /// Generate a summary of `region` by replaying it to the model.
 ///
 /// `system_prompt` must be the conversation's own system prompt. Passing `None`
@@ -347,42 +704,6 @@ pub async fn generate_summary(
     let request = build_summarization_request(system_prompt, region);
     let response = provider.complete_aligned(model, &request).await?;
     Ok(response)
-}
-
-/// Run compaction: find cut point, generate summary, return result.
-pub async fn run_compaction(
-    provider: &Arc<dyn ChatProvider>,
-    model: &str,
-    system_prompt: Option<&str>,
-    messages: &[Message],
-    auto_compaction_enabled: bool,
-    context_window: u64,
-) -> Result<Option<CompactionResult>, AgentError> {
-    if !auto_compaction_enabled {
-        return Ok(None);
-    }
-
-    let total_tokens = estimate_total_tokens(messages);
-    if !should_compact(total_tokens, context_window) {
-        return Ok(None);
-    }
-
-    let cut_index = match find_cut_point(messages, KEEP_RECENT_TOKENS) {
-        Some(i) => i,
-        None => return Ok(None),
-    };
-
-    if cut_index == 0 {
-        return Ok(None);
-    }
-
-    let region = &messages[..cut_index];
-    let summary = generate_summary(provider, model, system_prompt, region).await?;
-
-    Ok(Some(CompactionResult {
-        summary,
-        tokens_before: total_tokens,
-    }))
 }
 
 #[cfg(test)]
@@ -611,6 +932,349 @@ mod tests {
         assert!(body.contains("did things"));
     }
 
+    // ---- checkpoint validation ----
+
+    fn good_summary() -> String {
+        format!(
+            "## Primary Request and Intent\n- refactor the parser\n\n\
+             ## Key Technical Concepts\n- rust, nom\n\n\
+             ## Files and Code\n- src/parse.rs: the tokenizer\n\n\
+             ## Errors and Fixes\n- (none)\n\n\
+             ## Pending Jobs\n- write the tests\n\n\
+             ## Current Work\n- rewriting the lexer\n\n\
+             ## Next Step\n- run the suite\n\n\
+             ## Critical Context\n- keep the public API stable{}\n",
+            " ".repeat(50)
+        )
+    }
+
+    #[test]
+    fn a_real_checkpoint_validates() {
+        assert_eq!(validate_summary(&good_summary()), Ok(()));
+    }
+
+    #[test]
+    fn an_empty_response_is_refused() {
+        assert_eq!(validate_summary(""), Err(CheckpointProblem::Empty));
+        assert_eq!(validate_summary("   \n\t "), Err(CheckpointProblem::Empty));
+    }
+
+    #[test]
+    fn a_refusal_is_refused() {
+        // The exact shape a filtered or declining response takes. Storing this
+        // would delete the whole region and leave the agent with nothing.
+        for refusal in [
+            "I'm sorry, I can't help with that.",
+            "I cannot summarize this conversation.",
+            "```\n```",
+        ] {
+            assert!(
+                validate_summary(refusal).is_err(),
+                "accepted a refusal: {}",
+                refusal
+            );
+        }
+    }
+
+    #[test]
+    fn a_truncated_response_is_refused() {
+        // A stream cut off at the token limit keeps the early sections and loses
+        // the rest.
+        let truncated = format!(
+            "## Primary Request and Intent\n- refactor the parser{}\n\n## Key Technical Concepts\n- rust",
+            " ".repeat(300)
+        );
+        match validate_summary(&truncated) {
+            Err(CheckpointProblem::MissingSections(missing)) => {
+                assert!(missing.contains(&"current work"), "{:?}", missing);
+                assert!(missing.contains(&"next step"), "{:?}", missing);
+            }
+            other => panic!("expected missing sections, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn a_similar_heading_does_not_satisfy_a_required_one() {
+        // `## Current Workflow` is about something else. A prefix match accepted it
+        // as the `Current Work` section, so the real one could be absent entirely.
+        let text = format!(
+            "## Primary Request and Intent\n- refactor the parser thoroughly\n\n\
+             ## Current Workflow\n- the CI pipeline runs on every push{}\n\n\
+             ## Next Step\n- run the suite\n",
+            " ".repeat(120)
+        );
+        match validate_summary(&text) {
+            Err(CheckpointProblem::MissingSections(missing)) => {
+                assert!(missing.contains(&"current work"), "{:?}", missing);
+            }
+            other => panic!("expected the section to be missing, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn heading_styles_models_actually_emit_are_accepted() {
+        for style in [
+            "## Primary Request and Intent",
+            "**Primary Request and Intent**",
+            "##Primary Request and Intent",
+            "## primary request and intent",
+            "### 1. Primary Request and Intent",
+        ] {
+            let text = format!(
+                "{}\n- refactor the parser thoroughly and keep the API stable\n\n\
+                 ## Current Work\n- rewriting the lexer right now{}\n\n\
+                 ## Next Step\n- run the suite\n",
+                style,
+                " ".repeat(100)
+            );
+            assert_eq!(
+                validate_summary(&text),
+                Ok(()),
+                "rejected heading style {:?}",
+                style
+            );
+        }
+    }
+
+    #[test]
+    fn a_code_fence_inside_a_section_does_not_end_it() {
+        // The instruction asks the model to preserve syntax fragments. A `#`
+        // comment inside a fence was read as the next heading, truncating the
+        // section and rejecting a summary that had done as it was told.
+        let text = format!(
+            "## Primary Request and Intent\n- refactor the parser thoroughly\n\n\
+             ## Current Work\n```python\n# initialize the parser\ndef foo(): pass\n```\n\
+             - rewrote the lexer and it now passes{}\n\n\
+             ## Next Step\n- run the suite\n",
+            " ".repeat(100)
+        );
+        assert_eq!(validate_summary(&text), Ok(()));
+    }
+
+    #[test]
+    fn the_instruction_echoed_back_is_refused() {
+        // The instruction contains every required heading, so parroting it used to
+        // pass the gate written to catch exactly that.
+        assert_eq!(
+            validate_summary(COMPACTION_INSTRUCTION),
+            Err(CheckpointProblem::InstructionEcho)
+        );
+    }
+
+    #[test]
+    fn headings_with_no_body_are_refused() {
+        let bare = format!(
+            "## Primary Request and Intent\n\n## Current Work\n\n## Next Step\n{}",
+            "-".repeat(220)
+        );
+        assert!(matches!(
+            validate_summary(&bare),
+            Err(CheckpointProblem::EmptySection(_))
+        ));
+    }
+
+    #[test]
+    fn the_fallback_says_when_its_lists_are_partial() {
+        let region: Vec<Message> = (0..60)
+            .map(|i| {
+                Message::tool_call(
+                    "",
+                    vec![ToolCall {
+                        id: format!("c{}", i),
+                        name: "edit".into(),
+                        arguments: serde_json::json!({"file_path": format!("src/f{}.rs", i)}),
+                        raw_arguments: None,
+                    }],
+                )
+            })
+            .collect();
+        let checkpoint = mechanical_checkpoint(&region);
+        assert!(
+            checkpoint.contains("and 20 more not listed"),
+            "{}",
+            checkpoint
+        );
+    }
+
+    #[test]
+    fn the_fallback_bounds_a_region_of_enormous_commands() {
+        // The defect this closes: item COUNT was capped but item LENGTH was not, so
+        // a region of long one-liners produced a checkpoint larger than the span it
+        // replaced. The context then stayed over budget with an uncuttable
+        // checkpoint at index zero, and the session could never compact again.
+        let region: Vec<Message> = (0..30)
+            .map(|i| {
+                Message::tool_call(
+                    "",
+                    vec![ToolCall {
+                        id: format!("c{}", i),
+                        name: "bash".into(),
+                        arguments: serde_json::json!({
+                            "command": format!("python3 -c \"d={}\"", "0".repeat(100_000))
+                        }),
+                        raw_arguments: None,
+                    }],
+                )
+            })
+            .collect();
+        let checkpoint = mechanical_checkpoint(&region);
+        assert!(
+            checkpoint.len() < 16_000,
+            "fallback was {} bytes",
+            checkpoint.len()
+        );
+        assert_eq!(validate_summary(&checkpoint), Ok(()));
+    }
+
+    #[test]
+    fn the_fallback_redacts_a_credential_bearing_command() {
+        let region = vec![Message::tool_call(
+            "",
+            vec![ToolCall {
+                id: "c1".into(),
+                name: "bash".into(),
+                arguments: serde_json::json!({
+                    "command": "curl -H 'Authorization: Bearer sk-live-DEADBEEF' https://api.example"
+                }),
+                raw_arguments: None,
+            }],
+        )];
+        let checkpoint = mechanical_checkpoint(&region);
+        assert!(!checkpoint.contains("sk-live-DEADBEEF"), "{}", checkpoint);
+        assert!(checkpoint.contains("redacted"), "{}", checkpoint);
+    }
+
+    #[test]
+    fn a_short_response_is_refused_before_the_section_check() {
+        let short = "## Primary Request and Intent\n## Current Work\n## Next Step";
+        assert!(matches!(
+            validate_summary(short),
+            Err(CheckpointProblem::TooShort(_))
+        ));
+    }
+
+    #[test]
+    fn the_problem_reads_as_a_sentence() {
+        assert!(format!("{}", CheckpointProblem::Empty).contains("empty"));
+        assert!(format!("{}", CheckpointProblem::TooShort(12)).contains("12"));
+        assert!(
+            format!("{}", CheckpointProblem::MissingSections(vec!["next step"]))
+                .contains("next step")
+        );
+        assert!(format!("{}", CheckpointProblem::InstructionEcho).contains("echoed back"));
+        assert!(format!("{}", CheckpointProblem::EmptySection("current work")).contains("empty"));
+    }
+
+    // ---- mechanical fallback ----
+
+    #[test]
+    fn the_mechanical_checkpoint_validates_as_one() {
+        let region = vec![
+            Message::new("user", "fix the parser"),
+            Message::tool_call(
+                "reading",
+                vec![ToolCall {
+                    id: "c1".into(),
+                    name: "read".into(),
+                    arguments: serde_json::json!({"file_path": "src/parse.rs"}),
+                    raw_arguments: None,
+                }],
+            ),
+            Message::tool_result("c1", "file body"),
+            Message::new("assistant", "I rewrote the lexer"),
+        ];
+        let checkpoint = mechanical_checkpoint(&region);
+        // The fallback must itself pass the gate, or compaction has no way out.
+        assert_eq!(validate_summary(&checkpoint), Ok(()));
+    }
+
+    #[test]
+    fn the_mechanical_checkpoint_reports_only_what_it_can_read() {
+        let region = vec![
+            Message::new("user", "fix the parser"),
+            Message::tool_call(
+                "working",
+                vec![
+                    ToolCall {
+                        id: "c1".into(),
+                        name: "edit".into(),
+                        arguments: serde_json::json!({"file_path": "src/parse.rs"}),
+                        raw_arguments: None,
+                    },
+                    ToolCall {
+                        id: "c2".into(),
+                        name: "bash".into(),
+                        arguments: serde_json::json!({"command": "cargo test\n--lib"}),
+                        raw_arguments: None,
+                    },
+                ],
+            ),
+            Message::tool_result("c1", "ok"),
+            Message::new("assistant", "the lexer is rewritten"),
+        ];
+        let checkpoint = mechanical_checkpoint(&region);
+        assert!(checkpoint.contains("src/parse.rs"));
+        assert!(checkpoint.contains("cargo test"), "{}", checkpoint);
+        assert!(checkpoint.contains("the lexer is rewritten"));
+        assert!(checkpoint.contains("4 messages were replaced"));
+        // It must say plainly that it is not a model summary.
+        assert!(checkpoint.contains("mechanically"));
+    }
+
+    #[test]
+    fn the_mechanical_checkpoint_survives_an_empty_region() {
+        let checkpoint = mechanical_checkpoint(&[]);
+        assert_eq!(validate_summary(&checkpoint), Ok(()));
+        assert!(checkpoint.contains("(none recorded)"));
+    }
+
+    #[test]
+    fn the_mechanical_checkpoint_bounds_what_it_lists() {
+        let mut region = Vec::new();
+        for i in 0..200 {
+            region.push(Message::tool_call(
+                "",
+                vec![ToolCall {
+                    id: format!("c{}", i),
+                    name: "edit".into(),
+                    arguments: serde_json::json!({"file_path": format!("src/file{}.rs", i)}),
+                    raw_arguments: None,
+                }],
+            ));
+        }
+        let checkpoint = mechanical_checkpoint(&region);
+        assert_eq!(
+            checkpoint.matches("- src/file").count(),
+            40,
+            "file list is not capped"
+        );
+        // A fallback that grew with the region would defeat the compaction.
+        assert!(
+            checkpoint.len() < 8000,
+            "fallback was {} chars",
+            checkpoint.len()
+        );
+    }
+
+    #[test]
+    fn the_mechanical_checkpoint_deduplicates() {
+        let region: Vec<Message> = (0..10)
+            .map(|i| {
+                Message::tool_call(
+                    "",
+                    vec![ToolCall {
+                        id: format!("c{}", i),
+                        name: "bash".into(),
+                        arguments: serde_json::json!({"command": "cargo test"}),
+                        raw_arguments: None,
+                    }],
+                )
+            })
+            .collect();
+        let checkpoint = mechanical_checkpoint(&region);
+        assert_eq!(checkpoint.matches("- cargo test").count(), 1);
+    }
+
     // ---- snip ----
 
     #[test]
@@ -701,56 +1365,5 @@ mod tests {
         assert!(removed > 0);
         assert!(msgs[2].content.contains("[snip:"));
         assert!(msgs[2].content.contains("の"));
-    }
-
-    #[test]
-    fn test_run_compaction_disabled() {
-        let rt = tokio::runtime::Runtime::new().unwrap();
-        let config = crate::provider::openai::OpenAIConfig {
-            base_url: "https://api.example.com".into(),
-            api_key: "test".into(),
-            model: "gpt-4".into(),
-            context_window: 128000,
-            timeout_secs: 0,
-            reasoning: false,
-        };
-        let provider: Arc<dyn ChatProvider> =
-            Arc::new(crate::provider::openai::OpenAIProvider::new(config));
-        let msgs = vec![
-            Message::new("user", "hi"),
-            Message::new("assistant", "hello"),
-        ];
-
-        let result = rt.block_on(run_compaction(
-            &provider, "gpt-4", None, &msgs, false, 128000,
-        ));
-        assert!(result.is_ok());
-        assert!(result.unwrap().is_none());
-    }
-
-    #[test]
-    fn test_run_compaction_below_threshold() {
-        let rt = tokio::runtime::Runtime::new().unwrap();
-        let config = crate::provider::openai::OpenAIConfig {
-            base_url: "https://api.example.com".into(),
-            api_key: "test".into(),
-            model: "gpt-4".into(),
-            context_window: 128000,
-            timeout_secs: 0,
-            reasoning: false,
-        };
-        let provider: Arc<dyn ChatProvider> =
-            Arc::new(crate::provider::openai::OpenAIProvider::new(config));
-        let msgs = vec![
-            Message::new("user", "hi"),
-            Message::new("assistant", "hello"),
-        ];
-
-        let result = rt.block_on(run_compaction(
-            &provider, "gpt-4", None, &msgs, true, 128000,
-        ));
-        assert!(result.is_ok());
-        // Below threshold, should return None
-        assert!(result.unwrap().is_none());
     }
 }

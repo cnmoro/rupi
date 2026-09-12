@@ -96,26 +96,104 @@ fn capped_tool_result(result: &str) -> String {
     }
     let keep_beginning = MAX_TOOL_RESULT_CHARS * 7 / 10;
     let keep_end = MAX_TOOL_RESULT_CHARS - keep_beginning;
-    // Snap both cuts to character boundaries. Slicing raw byte offsets panics on
-    // any tool output that contains a multi-byte character, and tool output is
-    // arbitrary bytes from the user's machine.
-    let mut head = keep_beginning.min(result.len());
-    while head > 0 && !result.is_char_boundary(head) {
-        head -= 1;
-    }
-    let mut tail = result.len().saturating_sub(keep_end);
-    while tail < result.len() && !result.is_char_boundary(tail) {
-        tail += 1;
-    }
-    if tail <= head {
+
+    // Cut on line boundaries. Tool output is lines — a stack trace, a compiler
+    // error, a directory listing — and a cut in the middle of one leaves a
+    // fragment that reads as a different, shorter message than it is.
+    //
+    // Line snapping is only worth it when it keeps most of the budget. One short
+    // framing line followed by one enormous line — `curl | jq -c`, a webpack log,
+    // a `docker inspect` — would otherwise pin the head at that framing line and
+    // throw the rest of the budget away, which is far worse than a clean cut
+    // mid-line. Below `MIN_LINE_CUT_RATIO` of the budget, take the characters.
+    let head = best_excerpt(result, keep_beginning, true);
+    let tail = best_excerpt(result, keep_end, false);
+
+    let omitted = result.len().saturating_sub(head.len() + tail.len());
+    let rendered = format!("{}... [truncated: {} bytes]\n...{}", head, omitted, tail);
+    // Truncation must never inflate. Just over the cap, head plus tail can cover
+    // the whole input and the marker is pure overhead.
+    if rendered.len() >= result.len() {
         return result.to_string();
     }
-    format!(
-        "{}... [truncated: {} chars]\n...{}",
-        &result[..head],
-        tail - head,
-        &result[tail..]
-    )
+    rendered
+}
+
+/// Smallest share of a budget a line-aligned excerpt must fill to be worth taking.
+const MIN_LINE_CUT_RATIO: usize = 2;
+
+/// The better of a line-aligned and a character-aligned excerpt for one budget.
+fn best_excerpt(text: &str, budget: usize, from_start: bool) -> &str {
+    let lines = if from_start {
+        head_lines(text, budget)
+    } else {
+        tail_lines(text, budget)
+    };
+    if lines.len() * MIN_LINE_CUT_RATIO >= budget {
+        return lines;
+    }
+    if from_start {
+        head_chars(text, budget)
+    } else {
+        tail_chars(text, budget)
+    }
+}
+
+/// Whole lines from the start of `text`, within `budget` bytes.
+fn head_lines(text: &str, budget: usize) -> &str {
+    let mut end = 0;
+    for line in text.split_inclusive('\n') {
+        if end + line.len() > budget {
+            break;
+        }
+        end += line.len();
+    }
+    &text[..end]
+}
+
+/// Whole lines from the end of `text`, within `budget` bytes.
+///
+/// Walks backwards over newline positions instead of materializing every line.
+/// Collecting first cost a vector proportional to the whole input to select the
+/// last few lines of it, and tool output reaches hundreds of megabytes.
+fn tail_lines(text: &str, budget: usize) -> &str {
+    let bytes = text.as_bytes();
+    let mut start = text.len();
+    loop {
+        // The newline that ends the line before `start`.
+        let search_end = start.saturating_sub(1);
+        let previous = bytes[..search_end].iter().rposition(|b| *b == b'\n');
+        let candidate = match previous {
+            Some(index) => index + 1,
+            None => 0,
+        };
+        if text.len() - candidate > budget {
+            break;
+        }
+        start = candidate;
+        if start == 0 {
+            break;
+        }
+    }
+    &text[start..]
+}
+
+/// Largest prefix of `text` within `budget` bytes, cut on a character boundary.
+fn head_chars(text: &str, budget: usize) -> &str {
+    let mut end = budget.min(text.len());
+    while end > 0 && !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    &text[..end]
+}
+
+/// Largest suffix of `text` within `budget` bytes, cut on a character boundary.
+fn tail_chars(text: &str, budget: usize) -> &str {
+    let mut start = text.len().saturating_sub(budget);
+    while start < text.len() && !text.is_char_boundary(start) {
+        start += 1;
+    }
+    &text[start..]
 }
 
 /// The date to put in the system prompt.
@@ -156,6 +234,7 @@ Available tools:
 - read: Read file contents with optional line offset/limit.
 - write: Create a NEW file. REFUSES if the file already exists — use edit to modify existing files instead. Creates parent directories if needed.
 - edit: Replace exact text in a file. Supports batch edits via the edits array. Each old_text is matched against the ORIGINAL file content (not after other edits). Edits must not overlap. Prefer this over write for any change to an existing file.
+- edit and write both accept an optional then_run: {{\"command\": \"...\"}}. It runs that command in the SAME call, right after the change lands. Use it whenever you already know what you would run next to check the change — the tests, a build, a linter, a restart. It is skipped if the change fails, and a non-zero exit is reported without undoing the change.
 - grep: Search file contents for patterns (uses ripgrep, respects .gitignore, falls back to grep).
 - find: Find files by glob pattern (uses fd, respects .gitignore, falls back to find).
 - ls: List directory contents.
@@ -170,6 +249,7 @@ Guidelines:
 - When a command fails, read the error output and try a different approach rather than giving up
 - If you don't have enough information to complete a task, use bash, read, grep, or find to get the necessary context
 - For work of more than a few steps, plan it with todo_write first and keep the list current as you go
+- Fuse the check into the change: pass then_run on edit or write instead of spending a separate turn on the command that verifies it
 - A message inside <active-task> tags re-states the request that started this session. It is context, not a new instruction — do not restart finished work when you see it
 - A message inside <compacted-summary> tags is a checkpoint of earlier context. Treat it as established background and continue from the messages after it",
         time_str
@@ -276,7 +356,15 @@ pub fn load_context_files(cwd: &str) -> Vec<ContextFile> {
 /// best source because it is exact. Failing that, the first real user message is
 /// the request, skipping checkpoints and anchors, which are host-written.
 pub fn recover_anchor(messages: &[Message]) -> Option<String> {
+    // Only `user` messages are considered. rupi writes its anchors on that role,
+    // and the restriction is what keeps untrusted content out: a tool result is
+    // role `tool`, so a full anchor block sitting inside a file the agent read, or
+    // a page it fetched, can no longer be adopted as the session's own request and
+    // re-emitted under framing that tells the model to trust it.
     for msg in messages.iter().rev() {
+        if msg.role != "user" {
+            continue;
+        }
         if crate::anchor::is_anchor(&msg.content) {
             if let Some(request) = crate::anchor::extract_request(&msg.content) {
                 return Some(request);
@@ -289,6 +377,10 @@ pub fn recover_anchor(messages: &[Message]) -> Option<String> {
             m.role == "user"
                 && !crate::anchor::is_anchor(&m.content)
                 && !m.content.starts_with(sessions::COMPACTION_PREFIX)
+                // Goal rounds are host-written and arrive on the user role too.
+                // Without this they could be recovered as "the request that
+                // started this session" once a compaction dropped the real one.
+                && !m.content.trim_start().starts_with("<goal_round>")
                 && !m.content.trim().is_empty()
         })
         .map(|m| m.content.clone())
@@ -530,8 +622,28 @@ impl AgentSession {
         }
         let mut stored = capped_tool_result(result);
         let session_id = self.session_id().await;
-        if let Some(spill) = crate::spill::save_text(&session_id, tool_name, result) {
-            stored.push_str(&crate::spill::retrieval_hint(&spill));
+
+        // Archive off the runtime. Hashing and writing a large result is hundreds
+        // of milliseconds of synchronous work, and doing it inline holds a worker
+        // thread for the whole time — on a one or two core host that stalls the
+        // interactive loop.
+        let owned_tool = tool_name.to_string();
+        let owned_result = result.to_string();
+        let spill = tokio::task::spawn_blocking(move || {
+            crate::spill::save_text(&session_id, &owned_tool, &owned_result)
+        })
+        .await
+        .unwrap_or(None);
+
+        match spill {
+            Some(spill) => stored.push_str(&crate::spill::retrieval_hint(&spill)),
+            // Say so in the result itself. The truncated bytes really are gone at
+            // this point, and letting the agent believe it can read them back is
+            // worse than telling it they are lost.
+            None => stored.push_str(
+                "\n[The full result could not be archived, so the truncated part is not \
+recoverable. Re-run the command if you need it.]",
+            ),
         }
         stored
     }
@@ -838,6 +950,9 @@ impl AgentSession {
 
                 if let Err(e) = self.run_tool_loop(wrapped_tx.clone()).await {
                     eprintln!("rupi: tool loop error in goal round {}: {}", round, e);
+                    self.tool_context
+                        .goal
+                        .conclude(&format!("the tool loop failed in round {}", round));
                     break;
                 }
 
@@ -853,9 +968,18 @@ impl AgentSession {
                 // every round.
                 if self.verify_goal(&g).await {
                     eprintln!("rupi: goal verified out of band in round {}", round);
+                    self.tool_context
+                        .goal
+                        .conclude(&format!("verified out of band in round {}", round));
                     break;
                 }
             }
+
+            // Rounds can also simply run out. Leaving the goal active then made the
+            // next unrelated prompt re-enter goal mode and start again.
+            self.tool_context
+                .goal
+                .conclude("the driver ran out of rounds without a decision");
 
             drop(wrapped_tx);
             let _ = fwd.await;
@@ -868,10 +992,13 @@ impl AgentSession {
             } else {
                 let _ = event_tx.send(AgentEvent::agent_end());
             }
-        } else if self.loop_prompt.read().await.is_some() {
+        } else if let Some(loop_msg) = self.loop_prompt.read().await.clone() {
             // Loop mode: re-send the loop prompt after each agent_end until cancelled.
             // Suppress agent_end events during the loop like goal mode.
-            let loop_msg = self.loop_prompt.read().await.clone().unwrap();
+            //
+            // Read once. Checking `is_some()` and then unwrapping a second read
+            // panics if `stop_loop` clears the field in between, which it can: the
+            // RPC handler takes only a read lock for both.
             let (wrapped_tx, mut wrapped_rx) = mpsc::unbounded_channel::<AgentEvent>();
             let (held_tx, mut held_rx) = tokio::sync::mpsc::unbounded_channel::<AgentEvent>();
 
@@ -1248,7 +1375,19 @@ impl AgentSession {
             // Quality check: assess the response before proceeding
             if !tool_calls.is_empty() || !full_content.is_empty() {
                 let known = quality::known_tool_names();
-                let recent = self.recent_tool_calls.read().await.clone();
+                // Newest first. The buffer is appended to, so it is stored
+                // oldest-first, while `consecutive_repeat_count` walks backwards
+                // from the current turn. Passing it unreversed both missed real
+                // repeat runs and raised false alarms on benign alternating
+                // patterns — and those alarms bypass the correction cap.
+                let recent: Vec<Vec<ToolCall>> = self
+                    .recent_tool_calls
+                    .read()
+                    .await
+                    .iter()
+                    .rev()
+                    .cloned()
+                    .collect();
                 let verdict = quality::assess_response(&full_content, &tool_calls, &recent, known);
                 if !verdict.ok {
                     let issue = verdict.reason.as_ref().unwrap();
@@ -1512,7 +1651,7 @@ impl AgentSession {
         if compaction::region_contains_checkpoint(region) {
             eprintln!("rupi: compacting over a prior checkpoint — merging it into one summary");
         }
-        let summary = match compaction::generate_summary(
+        let raw_summary = match compaction::generate_summary(
             &self.provider,
             &compact_model,
             Some(&system_prompt),
@@ -1524,6 +1663,36 @@ impl AgentSession {
             Err(e) => {
                 *self.is_compacting.lock().await = false;
                 return Err(e);
+            }
+        };
+
+        // Never store a response that is not a checkpoint. Whatever comes back
+        // replaces the whole region, so a refusal, a filtered stub, or a stream cut
+        // off at the token limit would delete the context silently and leave the
+        // agent continuing from nothing.
+        let summary = match compaction::validate_summary(&raw_summary) {
+            Ok(()) => raw_summary,
+            Err(problem) => {
+                eprintln!("rupi: the summarizer returned {} — retrying once", problem);
+                let retried = compaction::generate_summary(
+                    &self.provider,
+                    &compact_model,
+                    Some(&system_prompt),
+                    region,
+                )
+                .await
+                .ok()
+                .filter(|s| compaction::validate_summary(s).is_ok());
+                match retried {
+                    Some(good) => good,
+                    None => {
+                        // Refusing to compact would leave the next request over the
+                        // provider's limit. A mechanical checkpoint states only what
+                        // the messages show, so it invents nothing and always works.
+                        eprintln!("rupi: falling back to a mechanical checkpoint");
+                        compaction::mechanical_checkpoint(region)
+                    }
+                }
             }
         };
 
@@ -1566,17 +1735,21 @@ impl AgentSession {
         }
         *self.tool_results_since_user.write().await = 0;
 
-        {
-            let mut compacting = self.is_compacting.lock().await;
-            *compacting = false;
-        }
-
         self.persist_compaction(&summary, total_tokens).await;
         // Persist the anchor AFTER the compaction record. Replay clears everything
         // above that record, so an anchor written before it would be dropped on
         // resume and the fix would hold only until the process restarted.
         if let Some(ref anchor) = anchor_msg {
             self.persist_message(anchor).await;
+        }
+
+        // Released only now. `reset()` polls this flag and then swaps
+        // `session_path`, so clearing it before the writes above let a concurrent
+        // new-session command redirect this session's compaction record and anchor
+        // into the fresh session's file.
+        {
+            let mut compacting = self.is_compacting.lock().await;
+            *compacting = false;
         }
 
         Ok(CompactionResult {
@@ -1736,15 +1909,17 @@ impl AgentSession {
         let request = self.task_anchor.read().await.clone()?;
         let mut emissions = self.anchor_emissions.write().await;
         *emissions += 1;
-        let mut block = crate::anchor::render(&request, *emissions);
         // The anchor states the goal. The todo list states where the work stands.
-        // They answer different questions, so a reminder carries both.
-        if let Some(todos) = self.tool_context.todos.render_current() {
-            block.push_str("\n\n<todo-list>\n");
-            block.push_str(&todos);
-            block.push_str("\n</todo-list>");
-        }
-        Some(block)
+        // They answer different questions, so a reminder carries both — but the plan
+        // goes INSIDE the block. Appending it after the closing tag left a message
+        // that no longer parsed as an anchor, so a re-emitted reminder could not be
+        // recovered on resume.
+        let plan = self.tool_context.todos.render_current();
+        Some(crate::anchor::render_with_plan(
+            &request,
+            *emissions,
+            plan.as_deref(),
+        ))
     }
 
     /// Tool results allowed between anchor re-emissions.
@@ -1802,6 +1977,7 @@ impl AgentSession {
                 crate::goal::GoalStatus::Active => "active",
                 crate::goal::GoalStatus::Complete => "complete",
                 crate::goal::GoalStatus::Blocked => "blocked",
+                crate::goal::GoalStatus::Ended => "ended",
             }
         ))
     }
@@ -1845,9 +2021,13 @@ impl AgentSession {
             .take(6)
             .map(|m| {
                 let content = if m.content.len() > 1000 {
+                    // Snap to a character boundary. A raw byte slice panics on any
+                    // message whose byte 1000 lands inside a multi-byte character,
+                    // and tool results routinely carry non-ASCII: a source file, a
+                    // git log with an accented name, box-drawing progress output.
                     format!(
-                        "{}... [truncated: {} chars]",
-                        &m.content[..1000],
+                        "{}... [truncated: {} bytes]",
+                        head_chars(&m.content, 1000),
                         m.content.len()
                     )
                 } else {
@@ -1947,6 +2127,186 @@ Has the assistant's output satisfied this exact condition? Reply with only YES o
                 stop_reason: None,
             })
             .collect()
+    }
+}
+
+#[cfg(test)]
+mod truncation_tests {
+    use super::*;
+
+    #[test]
+    fn short_output_is_untouched() {
+        let text = "line one\nline two\n";
+        assert_eq!(capped_tool_result(text), text);
+    }
+
+    #[test]
+    fn long_output_is_cut_on_line_boundaries() {
+        // Distinct, numbered lines so a fragment is obvious.
+        let body: String = (0..2000)
+            .map(|i| format!("line {:05} of output\n", i))
+            .collect();
+        assert!(body.len() > MAX_TOOL_RESULT_CHARS);
+        let capped = capped_tool_result(&body);
+
+        assert!(capped.contains("[truncated:"), "{}", capped);
+        assert!(capped.len() < body.len());
+
+        // Every retained line is whole. A cut mid-line leaves a fragment that reads
+        // as a different, shorter message than it is.
+        let head = capped.split("... [truncated:").next().unwrap();
+        for line in head.lines() {
+            assert!(
+                line.is_empty() || line.ends_with(" of output"),
+                "head carries a partial line: {:?}",
+                line
+            );
+        }
+        let tail = capped.rsplit("bytes]\n...").next().unwrap();
+        for line in tail.lines() {
+            assert!(
+                line.is_empty() || line.starts_with("line "),
+                "tail carries a partial line: {:?}",
+                line
+            );
+        }
+    }
+
+    #[test]
+    fn the_beginning_and_the_end_both_survive() {
+        let body: String = (0..2000)
+            .map(|i| format!("line {:05} of output\n", i))
+            .collect();
+        let capped = capped_tool_result(&body);
+        assert!(
+            capped.contains("line 00000 of output"),
+            "the first line must survive"
+        );
+        assert!(
+            capped.contains("line 01999 of output"),
+            "the last line must survive"
+        );
+    }
+
+    #[test]
+    fn output_without_line_breaks_still_truncates() {
+        // Minified JSON: no line boundary exists inside the budget, so the cut
+        // falls back to character boundaries rather than returning nothing.
+        let body = format!("{{\"k\":\"{}\"}}", "v".repeat(MAX_TOOL_RESULT_CHARS * 2));
+        let capped = capped_tool_result(&body);
+        assert!(capped.contains("[truncated:"), "{}", capped);
+        assert!(capped.len() < body.len());
+        assert!(capped.starts_with("{\"k\""), "{}", &capped[..20]);
+    }
+
+    #[test]
+    fn multibyte_output_never_panics() {
+        // Three bytes per character, so naive byte offsets land mid-character.
+        for body in [
+            "の".repeat(MAX_TOOL_RESULT_CHARS),
+            format!("{}\n", "の".repeat(MAX_TOOL_RESULT_CHARS)),
+            (0..1000).map(|_| "のの\n").collect::<String>(),
+        ] {
+            let capped = capped_tool_result(&body);
+            assert!(capped.contains("の"));
+            assert!(capped.len() <= body.len());
+        }
+    }
+
+    #[test]
+    fn a_short_first_line_does_not_collapse_the_head_budget() {
+        // The shape that broke line-aligned cutting: one framing line, then one
+        // enormous line. Snapping to lines pins the head at the framing line and
+        // throws the rest of the budget away, which is far worse than a clean cut
+        // mid-line. This is `curl | jq -c`, a docker inspect, a webpack log.
+        let body = format!("Running command...\n{}", "j".repeat(160_000));
+        let capped = capped_tool_result(&body);
+
+        assert!(
+            capped.len() > MAX_TOOL_RESULT_CHARS / 2,
+            "kept only {} bytes of a {} byte budget",
+            capped.len(),
+            MAX_TOOL_RESULT_CHARS
+        );
+        assert!(
+            capped.contains("Running command..."),
+            "the framing line must survive"
+        );
+        assert!(
+            capped.contains("jjjj"),
+            "the payload must not be thrown away"
+        );
+    }
+
+    #[test]
+    fn a_single_huge_line_still_uses_the_budget() {
+        for body in [
+            format!("\n{}", "x".repeat(50_000)),
+            "y".repeat(50_000),
+            format!("{}\n", "z".repeat(50_000)),
+        ] {
+            let capped = capped_tool_result(&body);
+            assert!(
+                capped.len() > MAX_TOOL_RESULT_CHARS / 2,
+                "kept only {} bytes for a {} byte input",
+                capped.len(),
+                body.len()
+            );
+        }
+    }
+
+    #[test]
+    fn truncation_never_inflates() {
+        // Just over the cap, head plus tail can cover the whole input and the
+        // marker is pure overhead. Growing a result while truncating it is a loss
+        // on every axis the cap exists to protect.
+        for size in [
+            MAX_TOOL_RESULT_CHARS + 1,
+            MAX_TOOL_RESULT_CHARS + 27,
+            MAX_TOOL_RESULT_CHARS + 30,
+            MAX_TOOL_RESULT_CHARS + 100,
+        ] {
+            for body in [
+                "x".repeat(size),
+                (0..size / 2).map(|_| "a\n").collect::<String>(),
+            ] {
+                let capped = capped_tool_result(&body);
+                assert!(
+                    capped.len() <= body.len(),
+                    "a {} byte input grew to {} bytes",
+                    body.len(),
+                    capped.len()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn the_truncation_marker_names_its_unit() {
+        let body: String = (0..2000)
+            .map(|i| format!("line {:05} of output\n", i))
+            .collect();
+        let capped = capped_tool_result(&body);
+        // The count is a byte count. Labelling it "chars" overstates it by up to
+        // three times on non-ASCII, next to a spill hint that correctly says bytes.
+        assert!(capped.contains("bytes]"), "{}", &capped[..80]);
+        assert!(!capped.contains("chars]"));
+    }
+
+    #[test]
+    fn the_cap_is_respected_within_a_line_of_slack() {
+        let body: String = (0..2000)
+            .map(|i| format!("line {:05} of output\n", i))
+            .collect();
+        let capped = capped_tool_result(&body);
+        // Head and tail budgets plus the marker. Line snapping only ever removes
+        // content, so the result cannot exceed the budget plus the marker text.
+        assert!(
+            capped.len() < MAX_TOOL_RESULT_CHARS + 100,
+            "capped to {} chars, budget is {}",
+            capped.len(),
+            MAX_TOOL_RESULT_CHARS
+        );
     }
 }
 

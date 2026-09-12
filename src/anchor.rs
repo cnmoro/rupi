@@ -84,19 +84,52 @@ fn ceil_boundary(text: &str, index: usize) -> usize {
 /// `round` is the ordinal of this emission, used only to tell the model that a
 /// repeated block is the same task and not a second copy of the work.
 pub fn render(request: &str, emission: u32) -> String {
+    render_with_plan(request, emission, None)
+}
+
+/// Render the anchor block, optionally carrying the current plan.
+///
+/// The plan goes inside the block. Appending it after the closing tag produced a
+/// message that no longer parsed as an anchor, so a reminder carrying a plan could
+/// not be recovered on resume.
+pub fn render_with_plan(request: &str, emission: u32, plan: Option<&str>) -> String {
+    let plan_section = match plan {
+        Some(plan) if !plan.trim().is_empty() => {
+            format!("\n\n--- current plan ---\n{}", plan.trim())
+        }
+        _ => String::new(),
+    };
     format!(
-        "{}\nemission: {}\n{}\n\n--- original request ---\n{}\n{}",
+        "{}\nemission: {}\n{}\n\n{}{}{}\n{}",
         ANCHOR_OPEN,
         emission,
         ANCHOR_PREAMBLE,
+        REQUEST_SEPARATOR,
         clamp(request.trim()),
+        plan_section,
         ANCHOR_CLOSE
     )
 }
 
-/// Whether a message body is a rendered anchor block.
+/// Separator between the anchor's framing and the request it carries.
+pub const REQUEST_SEPARATOR: &str = "--- original request ---\n";
+
+/// Whether a message body is a complete, well-formed anchor block.
+///
+/// All three markers are required, not just the opening tag. A bare prefix check
+/// answered yes to any message that merely began with the tag — so an ordinary
+/// question about `<active-task>` silently disabled the anchor for the whole
+/// session, and, worse, a full block appearing inside untrusted content the agent
+/// read could be adopted as the anchor and then re-emitted under framing that tells
+/// the model to treat it as authoritative.
+///
+/// Structure is not authentication. `recover_anchor` additionally restricts which
+/// messages it will even consider.
 pub fn is_anchor(content: &str) -> bool {
-    content.trim_start().starts_with(ANCHOR_OPEN)
+    let trimmed = content.trim_start();
+    trimmed.starts_with(ANCHOR_OPEN)
+        && trimmed.contains(REQUEST_SEPARATOR)
+        && trimmed.trim_end().ends_with(ANCHOR_CLOSE)
 }
 
 /// Recover the original request text from a rendered anchor block.
@@ -107,9 +140,13 @@ pub fn extract_request(content: &str) -> Option<String> {
     if !is_anchor(content) {
         return None;
     }
-    const SEPARATOR: &str = "--- original request ---\n";
-    let start = content.find(SEPARATOR)? + SEPARATOR.len();
-    let end = content.rfind(ANCHOR_CLOSE).unwrap_or(content.len());
+    let start = content.find(REQUEST_SEPARATOR)? + REQUEST_SEPARATOR.len();
+    // The plan section, when present, sits between the request and the close tag.
+    let end = content[start..]
+        .find("\n\n--- current plan ---")
+        .map(|offset| start + offset)
+        .or_else(|| content.rfind(ANCHOR_CLOSE))
+        .unwrap_or(content.len());
     if end <= start {
         return None;
     }
@@ -140,6 +177,19 @@ mod tests {
         assert!(is_anchor(&render("x", 1)));
         assert!(!is_anchor("please fix the build"));
         assert!(!is_anchor("[Compacted conversation history]\n## Summary"));
+    }
+
+    #[test]
+    fn is_anchor_requires_the_whole_structure() {
+        // An ordinary question that happens to start with the tag. Treating this as
+        // an anchor silently disabled the feature for the rest of the session.
+        assert!(!is_anchor("<active-task> what does this tag do in rupi?"));
+        // Opening tag and separator, but never closed.
+        assert!(!is_anchor(
+            "<active-task>\n--- original request ---\ndo a thing"
+        ));
+        // Closed, but no separator to read a request out of.
+        assert!(!is_anchor("<active-task>\nsomething\n</active-task>"));
     }
 
     #[test]
@@ -192,6 +242,21 @@ mod tests {
         assert!(clamped.starts_with("ORIGINAL REQUEST"));
         assert!(clamped.ends_with("LATEST INSTRUCTION"));
         assert!(clamped.contains("anchor truncated"));
+    }
+
+    #[test]
+    fn a_block_carrying_a_plan_is_still_a_well_formed_anchor() {
+        let block = render_with_plan("do the thing", 2, Some("[~] step one"));
+        assert!(is_anchor(&block), "{}", block);
+        assert!(block.contains("[~] step one"));
+        assert_eq!(extract_request(&block).as_deref(), Some("do the thing"));
+        assert!(block.trim_end().ends_with(ANCHOR_CLOSE));
+    }
+
+    #[test]
+    fn an_empty_plan_changes_nothing() {
+        assert_eq!(render_with_plan("x", 1, Some("   ")), render("x", 1));
+        assert_eq!(render_with_plan("x", 1, None), render("x", 1));
     }
 
     #[test]

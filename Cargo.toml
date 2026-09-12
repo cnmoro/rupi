@@ -1,6 +1,6 @@
 [package]
 name = "rupi"
-version = "0.8.2"
+version = "0.9.0"
 edition = "2021"
 description = "Minimalistic RPC coding agent with OpenAI-compatible API support"
 
@@ -22,6 +22,7 @@ regex = "1"
 anyhow = "1"
 rustyline = "14"
 libc = "0.2"
+sha2 = "0.10"
 half = "2"
 ndarray = "0.15"
 safetensors = "0.5"

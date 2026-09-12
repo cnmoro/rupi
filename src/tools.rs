@@ -133,15 +133,42 @@ fn read_tool() -> ToolDef {
     }
 }
 
+/// Schema for the optional follow-up command carried by `edit` and `write`.
+///
+/// A file mutation is nearly always followed by a command that checks it: run the
+/// tests, build, restart the server. Splitting that pair across two turns costs a
+/// full round trip — a whole response, a tool result, and a new request carrying
+/// the entire conversation again — for a decision the model has already made.
+/// Carrying the command with the mutation removes that turn.
+fn then_run_schema(mutation: &str) -> Value {
+    serde_json::json!({
+        "type": "object",
+        "description": format!(
+            "Optional command to run immediately after the {} succeeds, in the same call. Use it for the check you would run next: tests, a build, a linter, a restart. The command is SKIPPED if the {} fails. A non-zero exit is reported but the {} is KEPT.",
+            mutation, mutation, mutation
+        ),
+        "properties": {
+            "command": { "type": "string", "description": "The bash command to run" },
+            "timeout": {
+                "type": "number",
+                "description": format!("Timeout in seconds (max {})", bash_timeout_max()),
+                "default": bash_timeout_default()
+            }
+        },
+        "required": ["command"]
+    })
+}
+
 fn write_tool() -> ToolDef {
     ToolDef {
         name: "write",
-        description: "Create a NEW file with the given content. REFUSES if the file already exists — use edit to modify existing files. Creates parent directories automatically.",
+        description: "Create a NEW file with the given content. REFUSES if the file already exists — use edit to modify existing files. Creates parent directories automatically. Pass then_run to check the result in the same call instead of spending another turn on it.",
         parameters: serde_json::json!({
             "type": "object",
             "properties": {
                 "file_path": { "type": "string", "description": "The absolute file path for the new file" },
-                "content": { "type": "string", "description": "The full content to write" }
+                "content": { "type": "string", "description": "The full content to write" },
+                "then_run": then_run_schema("write")
             },
             "required": ["file_path", "content"]
         }),
@@ -151,7 +178,7 @@ fn write_tool() -> ToolDef {
 fn edit_tool() -> ToolDef {
     ToolDef {
         name: "edit",
-        description: "Replace exact text in a file. Uses exact string matching (not regex). Each old_text must be found exactly once in the file. Supports batch edits via the edits array. Prefer this over write for any change to an existing file.",
+        description: "Replace exact text in a file. Uses exact string matching (not regex). Each old_text must be found exactly once in the file. Supports batch edits via the edits array. Prefer this over write for any change to an existing file. Pass then_run to check the result in the same call instead of spending another turn on it.",
         parameters: serde_json::json!({
             "type": "object",
             "properties": {
@@ -169,7 +196,8 @@ fn edit_tool() -> ToolDef {
                         },
                         "required": ["old_text", "new_text"]
                     }
-                }
+                },
+                "then_run": then_run_schema("edit")
             }
         }),
     }
@@ -254,13 +282,198 @@ pub fn serialize_tools(tools: &[ToolDef]) -> Vec<Value> {
         .collect()
 }
 
+// ---- action fusion ----
+
+/// The fused command ran and exited zero.
+pub const THEN_RUN_SUCCEEDED: &str = "[then_run:succeeded]";
+/// The fused command ran and did not exit zero. The file mutation is still applied.
+pub const THEN_RUN_FAILED: &str = "[then_run:failed]";
+/// The fused command was not run, because the mutation it depends on did not happen.
+pub const THEN_RUN_SKIPPED: &str = "[then_run:skipped]";
+/// Opens the fused command's own output.
+pub const THEN_RUN_OUTPUT_OPEN: &str = "--- then_run output ---";
+/// Closes the fused command's own output.
+pub const THEN_RUN_OUTPUT_CLOSE: &str = "--- end then_run output ---";
+
+/// The exact messages `execute_write` and `execute_edit` use to report a clean,
+/// complete mutation. Nothing else counts.
+const MUTATION_SUCCESS_PREFIXES: [&str; 2] = ["Successfully wrote ", "Successfully applied "];
+
+/// Whether a mutation message reports a change that reached the disk intact.
+///
+/// This matches success positively and treats everything else as failure, rather
+/// than the other way round. The tempting inverse — anything that does not start
+/// with `Error` succeeded — is wrong: `execute_edit` reports an unmatched
+/// `old_text` as `Edit failed:`, and a truncated `write` reports `WARNING:` over a
+/// half-written file. Both would have been read as success, and the follow-up
+/// command would have run against a file that is unchanged or knowingly broken.
+///
+/// Failing closed also means a future message this function does not recognize
+/// skips the command rather than running it on a false premise.
+/// `mutation_classification_is_exhaustive` pins every path of both functions.
+fn mutation_succeeded(message: &str) -> bool {
+    MUTATION_SUCCESS_PREFIXES
+        .iter()
+        .any(|prefix| message.starts_with(prefix))
+}
+
+/// The shell command a mutation tool call would fuse, if it carries one.
+///
+/// Exposed so the session can put a fused command through the shell approval gate
+/// rather than the file-mutation one. The two are not the same privilege.
+pub fn fused_command<'a>(tool_name: &str, args: &'a Value) -> Option<&'a str> {
+    if tool_name != "edit" && tool_name != "write" {
+        return None;
+    }
+    args.get("then_run")?.get("command")?.as_str()
+}
+
+/// A follow-up command carried by a mutation tool call.
+#[derive(Debug)]
+struct ThenRun {
+    command: String,
+    timeout: Option<u64>,
+}
+
+/// Read the optional `then_run` object from a mutation tool call.
+///
+/// A malformed `then_run` returns `Err` rather than being ignored. Silently
+/// dropping it would report a bare mutation as complete while the model believes
+/// its check ran.
+fn parse_then_run(args: &Value) -> Result<Option<ThenRun>, String> {
+    let Some(value) = args.get("then_run") else {
+        return Ok(None);
+    };
+    if value.is_null() {
+        return Ok(None);
+    }
+    let Some(object) = value.as_object() else {
+        return Err(format!(
+            "{} `then_run` must be an object such as {{\"command\": \"cargo test\"}}.",
+            THEN_RUN_SKIPPED
+        ));
+    };
+    let Some(command) = object.get("command").and_then(|c| c.as_str()) else {
+        return Err(format!(
+            "{} `then_run` needs a `command` string.",
+            THEN_RUN_SKIPPED
+        ));
+    };
+    if command.trim().is_empty() {
+        return Err(format!("{} `then_run.command` is empty.", THEN_RUN_SKIPPED));
+    }
+    // A timeout must be a positive whole number of seconds. A float or a negative
+    // value used to cast to 0, and a 0 means "kill before the command runs" — so
+    // `{"timeout": -1}` killed the command and reported the test suite as failed.
+    // The plain `bash` tool takes the looser route and falls back to its default
+    // for the same values; here the model is told, because a fused command it
+    // believes ran is worse than one it is told was skipped.
+    let timeout = match object.get("timeout") {
+        None | Some(Value::Null) => None,
+        Some(value) => match value.as_u64() {
+            Some(seconds) if seconds >= 1 => Some(seconds),
+            _ => {
+                return Err(format!(
+                    "{} `then_run.timeout` must be a whole number of seconds, 1 or more. Got {}.",
+                    THEN_RUN_SKIPPED, value
+                ))
+            }
+        },
+    };
+    Ok(Some(ThenRun {
+        command: command.to_string(),
+        timeout,
+    }))
+}
+
+/// Apply a file mutation and, when the model asked for one, run its follow-up
+/// command, returning both as a single observation.
+///
+/// There is no per-file lock here and no re-hash of the target, unlike SoL-Pi.
+/// `run_tool_loop` drives tool calls one at a time with no yield between the
+/// mutation and the command, so nothing in a rupi session can interleave, and
+/// reading the file twice on every fused call to narrow a microsecond window
+/// against an external writer is not worth the I/O.
+///
+/// That reasoning is about rupi's own loop, not about this function. `execute_tool`
+/// is public, so an embedder driving two sessions over the same working directory
+/// concurrently gets no such guarantee and must serialize its own mutations.
+fn mutation_then_run(
+    tool_call: &ToolCall,
+    mutation: String,
+    mutation_kind: &str,
+    ctx: &ToolContext,
+) -> String {
+    let then_run = match parse_then_run(&tool_call.arguments) {
+        Ok(Some(then_run)) => then_run,
+        Ok(None) => return mutation_without_command(tool_call, mutation),
+        Err(problem) => return format!("{}\n\n{}", mutation, problem),
+    };
+
+    if !mutation_succeeded(&mutation) {
+        return format!(
+            "{}\n\n{} The {} did not complete cleanly, so `{}` was not run.",
+            mutation, THEN_RUN_SKIPPED, mutation_kind, then_run.command
+        );
+    }
+
+    let mut bash_args = serde_json::json!({ "command": then_run.command });
+    if let Some(timeout) = then_run.timeout {
+        bash_args["timeout"] = serde_json::json!(timeout);
+    }
+    let outcome = run_bash_blocking(&bash_args, ctx.cancelled.clone());
+
+    // A failed command never undoes the mutation. Saying so explicitly stops the
+    // model from re-applying an edit that is already on disk.
+    let marker = if outcome.succeeded {
+        format!("{} `{}`", THEN_RUN_SUCCEEDED, then_run.command)
+    } else {
+        format!(
+            "{} `{}` failed. The {} is still applied.",
+            THEN_RUN_FAILED, then_run.command, mutation_kind
+        )
+    };
+    // Fence the output. The markers are bare bracketed words, and a command such as
+    // `grep then_run src/tools.rs` prints them as ordinary data — so without a
+    // delimiter there is nothing separating what the harness reports from what the
+    // command happened to echo.
+    format!(
+        "{}\n\n{}\n{}\n{}\n{}",
+        mutation, marker, THEN_RUN_OUTPUT_OPEN, outcome.text, THEN_RUN_OUTPUT_CLOSE
+    )
+}
+
+/// Report a `then_run` that was present in the raw call but could not be read.
+///
+/// A provider that truncates a streamed tool call leaves `arguments` as null and
+/// the partial text in `raw_arguments`. `write` recovers its path and content from
+/// that text, so the mutation still happens — but `then_run` is not recovered, and
+/// returning the bare mutation message would tell the model its check ran when no
+/// command was ever parsed, let alone executed.
+fn mutation_without_command(tool_call: &ToolCall, mutation: String) -> String {
+    if !tool_call.arguments.is_null() {
+        return mutation;
+    }
+    let Some(raw) = tool_call.raw_arguments.as_ref() else {
+        return mutation;
+    };
+    if !raw.contains("then_run") {
+        return mutation;
+    }
+    format!(
+        "{}\n\n{} The call was truncated before `then_run` could be read, so no command ran. \
+Re-issue it if you still need the check.",
+        mutation, THEN_RUN_SKIPPED
+    )
+}
+
 /// Execute a tool call and return the result.
 pub fn execute_tool(tool_call: &ToolCall, ctx: &ToolContext) -> String {
     match tool_call.name.as_str() {
         "bash" => execute_bash_with_cancel(&tool_call.arguments, ctx.cancelled.clone()),
         "read" => execute_read(&tool_call.arguments),
-        "write" => execute_write(tool_call),
-        "edit" => execute_edit(&tool_call.arguments),
+        "write" => mutation_then_run(tool_call, execute_write(tool_call), "write", ctx),
+        "edit" => mutation_then_run(tool_call, execute_edit(&tool_call.arguments), "edit", ctx),
         "grep" => execute_grep(&tool_call.arguments),
         "find" => execute_find(&tool_call.arguments),
         "ls" => execute_ls(&tool_call.arguments),
@@ -274,7 +487,7 @@ pub fn execute_tool(tool_call: &ToolCall, ctx: &ToolContext) -> String {
 /// Keep blocking tools and approval callbacks off Tokio's IO workers. The global
 /// permit bounds concurrent filesystem/indexing work across embedded sessions.
 pub async fn execute_tool_async(
-    call: ToolCall,
+    mut call: ToolCall,
     context: ToolContext,
     approval: Option<crate::agent::session::ApprovalFn>,
 ) -> String {
@@ -295,16 +508,45 @@ pub async fn execute_tool_async(
         if context.cancelled.load(Ordering::SeqCst) {
             return "[cancelled]".into();
         }
+        let mut declined_command: Option<String> = None;
         if let Some(approval) = approval {
             let args = serde_json::to_string(&call.arguments).unwrap_or_default();
             if !approval(&call.name, &args) {
                 return format!("[User denied execution of tool '{}']", call.name);
             }
+            // A fused `then_run` is shell execution, so it is approved as shell
+            // execution. Approving it under the `edit` label would let a model reach
+            // the shell through the one tool a user has learned is safe to wave
+            // through, which is the whole thing approval mode exists to prevent.
+            //
+            // Named plainly `bash`, so a callback keying an allowlist on the tool
+            // name sees it for what it is.
+            if let Some(command) = fused_command(&call.name, &call.arguments) {
+                if !approval("bash", command) {
+                    // Declining the command is not declining the change. Drop only
+                    // what was refused.
+                    declined_command = Some(command.to_string());
+                    if let Some(object) = call.arguments.as_object_mut() {
+                        object.remove("then_run");
+                    }
+                }
+            }
         }
         if context.cancelled.load(Ordering::SeqCst) {
             return "[cancelled]".into();
         }
-        execute_tool(&call, &context)
+        let mut result = execute_tool(&call, &context);
+        // Say that the command was blocked. Stripping it silently left a result
+        // byte-identical to one where no command was ever asked for, so the model
+        // could report a check as done that a human had explicitly refused.
+        if let Some(command) = declined_command {
+            result.push_str(&format!(
+                "\n\n{} The user declined to run `{}`. The change was applied; \
+nothing was verified.",
+                THEN_RUN_SKIPPED, command
+            ));
+        }
+        result
     })
     .await
     .unwrap_or_else(|e| format!("Tool execution failed: {e}"))
@@ -344,6 +586,23 @@ fn execute_bash(args: &Value) -> String {
 }
 
 fn execute_bash_with_cancel(args: &Value, cancelled: Arc<AtomicBool>) -> String {
+    run_bash_blocking(args, cancelled).text
+}
+
+/// What one bash run produced, plus whether it actually succeeded.
+///
+/// `execute_bash_with_cancel` flattens this to the text the model sees. Action
+/// Fusion needs the distinction too: it must label a fused command `succeeded` or
+/// `failed`, and reading that back out of the assembled text would mean parsing
+/// prose the output filter is free to rewrite.
+pub struct BashOutcome {
+    pub text: String,
+    /// True only when the command ran to completion and exited zero. A spawn
+    /// failure, a timeout, a cancellation, and a non-zero exit are all false.
+    pub succeeded: bool,
+}
+
+fn run_bash_blocking(args: &Value, cancelled: Arc<AtomicBool>) -> BashOutcome {
     // Called on a blocking worker; a local IO runtime lets us cancel pipe reads
     // portably without leaving threads parked behind background children.
     std::thread::scope(|scope| {
@@ -354,11 +613,17 @@ fn execute_bash_with_cancel(args: &Value, cancelled: Arc<AtomicBool>) -> String 
                     .build()
                 {
                     Ok(runtime) => runtime.block_on(run_bash(args, cancelled)),
-                    Err(e) => format!("Failed to create bash IO runtime: {e}"),
+                    Err(e) => BashOutcome {
+                        text: format!("Failed to create bash IO runtime: {e}"),
+                        succeeded: false,
+                    },
                 }
             })
             .join()
-            .unwrap_or_else(|_| "Error: bash execution panicked".into())
+            .unwrap_or_else(|_| BashOutcome {
+                text: "Error: bash execution panicked".into(),
+                succeeded: false,
+            })
     })
 }
 
@@ -397,16 +662,26 @@ async fn kill_process_tree(child: &mut tokio::process::Child) {
     let _ = child.wait().await;
 }
 
-async fn run_bash(args: &Value, cancelled: Arc<AtomicBool>) -> String {
+async fn run_bash(args: &Value, cancelled: Arc<AtomicBool>) -> BashOutcome {
     let Some(command) = get_arg(args, "command") else {
-        return "Error: missing 'command' argument".into();
+        return BashOutcome {
+            text: "Error: missing 'command' argument".into(),
+            succeeded: false,
+        };
     };
     if cancelled.load(Ordering::SeqCst) {
-        return "[cancelled]".into();
+        return BashOutcome {
+            text: "[cancelled]".into(),
+            succeeded: false,
+        };
     }
+    // A timeout below one second means "kill before the command can run", which no
+    // caller intends. `0` is a plausible way for a model to say "no timeout", so it
+    // falls back to the default rather than killing the command instantly.
     let timeout_secs = args
         .get("timeout")
         .and_then(Value::as_u64)
+        .filter(|seconds| *seconds >= 1)
         .unwrap_or_else(bash_timeout_default)
         .min(bash_timeout_max());
     let mut process = tokio::process::Command::new("bash");
@@ -424,7 +699,12 @@ async fn run_bash(args: &Value, cancelled: Arc<AtomicBool>) -> String {
     }
     let mut child = match process.spawn() {
         Ok(child) => child,
-        Err(e) => return format!("Failed to spawn bash: {e}"),
+        Err(e) => {
+            return BashOutcome {
+                text: format!("Failed to spawn bash: {e}"),
+                succeeded: false,
+            }
+        }
     };
     let out = Arc::new(Mutex::new(Vec::new()));
     let err = Arc::new(Mutex::new(Vec::new()));
@@ -467,7 +747,10 @@ async fn run_bash(args: &Value, cancelled: Arc<AtomicBool>) -> String {
     if out.len() == MAX_CAPTURE_BYTES || err.len() == MAX_CAPTURE_BYTES {
         result.push_str("\n[output capture capped at 1 MiB per stream]");
     }
-    result
+    BashOutcome {
+        succeeded: notice.is_empty() && status == Some(0),
+        text: result,
+    }
 }
 
 fn assemble_bash_result(command: &str, out: &[u8], err: &[u8], exit_code: Option<i32>) -> String {
@@ -481,11 +764,13 @@ fn assemble_bash_result(command: &str, out: &[u8], err: &[u8], exit_code: Option
         }
         result.push_str(&String::from_utf8_lossy(err));
     }
-    let failed = !matches!(exit_code, Some(0));
-    if failed {
-        if let Some(code) = exit_code {
-            result.push_str(&format!("\n[exit code: {}]", code));
-        }
+    match exit_code {
+        Some(0) => {}
+        Some(code) => result.push_str(&format!("\n[exit code: {}]", code)),
+        // No exit code means the process died to a signal — a segfault, an OOM
+        // kill, a `kill -9`. Printing nothing here made a crash that had already
+        // written output indistinguishable from a clean success.
+        None => result.push_str("\n[no exit code: the command was killed or did not finish]"),
     }
     if result.trim().is_empty() {
         return format!(
@@ -686,20 +971,49 @@ fn execute_edit(args: &Value) -> String {
     }
 
     // Collect edits from either the singular old_text/new_text or the edits array
+    // `edits` present but not an array used to fall through to the deprecated
+    // single-edit path, applying `old_text`/`new_text` and reporting success while
+    // ignoring what the model actually asked for.
+    if let Some(value) = args.get("edits") {
+        if !value.is_null() && !value.is_array() {
+            return "Error: `edits` must be an array of {old_text, new_text} objects. \
+No edits were applied."
+                .to_string();
+        }
+    }
     let edits: Vec<(String, String)> = if let Some(edits_val) =
         args.get("edits").and_then(|v| v.as_array())
     {
         if edits_val.is_empty() {
             return "Error: edits array is empty".to_string();
         }
-        edits_val
-            .iter()
-            .filter_map(|e| {
-                let old = e.get("old_text")?.as_str()?.to_string();
-                let new = e.get("new_text")?.as_str()?.to_string();
-                Some((old, new))
-            })
-            .collect()
+        // A malformed entry is rejected, not dropped. Dropping one and applying the
+        // rest reported "Successfully applied edit" for a half-applied request —
+        // and with a fused then_run, the check then passed against a file carrying
+        // only part of the intended change.
+        let mut parsed = Vec::with_capacity(edits_val.len());
+        for (index, entry) in edits_val.iter().enumerate() {
+            let old = match entry.get("old_text").and_then(|v| v.as_str()) {
+                Some(text) => text.to_string(),
+                None => {
+                    return format!(
+                        "Error: edit {} has no `old_text` string. No edits were applied.",
+                        index
+                    )
+                }
+            };
+            let new = match entry.get("new_text").and_then(|v| v.as_str()) {
+                Some(text) => text.to_string(),
+                None => {
+                    return format!(
+                        "Error: edit {} has no `new_text` string. No edits were applied.",
+                        index
+                    )
+                }
+            };
+            parsed.push((old, new));
+        }
+        parsed
     } else {
         let old_text = match get_arg(args, "old_text") {
             Some(t) => t,
@@ -1161,6 +1475,579 @@ the current <goal_round> block."
 }
 
 #[cfg(test)]
+mod action_fusion_tests {
+    use super::*;
+
+    fn scratch(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("rupi-fusion-{}-{}", name, std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn call(name: &str, args: Value) -> ToolCall {
+        ToolCall {
+            id: "t1".into(),
+            name: name.into(),
+            arguments: args,
+            raw_arguments: None,
+        }
+    }
+
+    fn run(name: &str, args: Value) -> String {
+        execute_tool(&call(name, args), &ToolContext::new())
+    }
+
+    // ---- the invariant the fusion rests on ----
+
+    #[test]
+    fn mutation_classification_is_exhaustive() {
+        let dir = scratch("classify");
+        let existing = dir.join("existing.txt");
+        std::fs::write(&existing, "hello world").unwrap();
+        let fresh = dir.join("fresh.txt");
+
+        // Every failure path of write and edit, in one place. If a future change
+        // returns a failure that does not start with `Error`, the fusion would run
+        // a validation command against a file that never changed.
+        let failures = vec![
+            execute_write(&call("write", serde_json::json!({"content": "x"}))),
+            execute_write(&call(
+                "write",
+                serde_json::json!({"file_path": fresh.display().to_string()}),
+            )),
+            execute_write(&call(
+                "write",
+                serde_json::json!({
+                    "file_path": existing.display().to_string(), "content": "x"
+                }),
+            )),
+            execute_edit(&serde_json::json!({"old_text": "a", "new_text": "b"})),
+            execute_edit(&serde_json::json!({
+                "file_path": dir.join("missing.txt").display().to_string(),
+                "old_text": "a", "new_text": "b"
+            })),
+            execute_edit(&serde_json::json!({
+                "file_path": existing.display().to_string(), "edits": []
+            })),
+            execute_edit(&serde_json::json!({
+                "file_path": existing.display().to_string(), "new_text": "b"
+            })),
+            execute_edit(&serde_json::json!({
+                "file_path": existing.display().to_string(),
+                "old_text": "not present anywhere", "new_text": "b"
+            })),
+            // The paths the first version of this test missed, while its comment
+            // claimed to cover every one.
+            execute_edit(&serde_json::json!({
+                "file_path": existing.display().to_string(), "old_text": "hello"
+            })),
+            execute_edit(&serde_json::json!({
+                "file_path": existing.display().to_string(),
+                "edits": [{"old_text": "hello"}]
+            })),
+            execute_edit(&serde_json::json!({
+                "file_path": existing.display().to_string(),
+                "edits": [{"new_text": "x"}]
+            })),
+            execute_edit(&serde_json::json!({
+                "file_path": existing.display().to_string(),
+                "edits": [
+                    {"old_text": "hello world", "new_text": "a"},
+                    {"old_text": "world", "new_text": "b"}
+                ]
+            })),
+            execute_edit(&serde_json::json!({
+                "file_path": dir.display().to_string(), "old_text": "a", "new_text": "b"
+            })),
+            execute_write(&call(
+                "write",
+                serde_json::json!({
+                    "file_path": dir.join("sub").join("x").join("..").display().to_string(),
+                    "content": "x"
+                }),
+            )),
+        ];
+        for failure in &failures {
+            assert!(
+                !mutation_succeeded(failure),
+                "classified as success: {}",
+                failure
+            );
+        }
+
+        // The two paths that do not start with `Error` and would have been read as
+        // success by a naive inverse check.
+        let edit_failed = execute_edit(&serde_json::json!({
+            "file_path": existing.display().to_string(),
+            "old_text": "not present anywhere", "new_text": "b"
+        }));
+        assert!(edit_failed.starts_with("Edit failed:"), "{}", edit_failed);
+        assert!(!mutation_succeeded(&edit_failed));
+
+        assert!(!mutation_succeeded(
+            "WARNING: Response was truncated. Wrote 3 lines (incomplete) to /tmp/x"
+        ));
+
+        // Fail closed: an unrecognized message must not run the command.
+        assert!(!mutation_succeeded("something new a future change returns"));
+        assert!(!mutation_succeeded(""));
+
+        // And the success paths must classify the other way.
+        let successes = vec![
+            execute_write(&call(
+                "write",
+                serde_json::json!({
+                    "file_path": fresh.display().to_string(), "content": "one\ntwo"
+                }),
+            )),
+            execute_edit(&serde_json::json!({
+                "file_path": existing.display().to_string(), "old_text": "hello", "new_text": "goodbye"
+            })),
+            execute_edit(&serde_json::json!({
+                "file_path": existing.display().to_string(),
+                "edits": [{"old_text": "goodbye", "new_text": "hi"}, {"old_text": "world", "new_text": "there"}]
+            })),
+        ];
+        for success in &successes {
+            assert!(
+                mutation_succeeded(success),
+                "classified as failure: {}",
+                success
+            );
+        }
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ---- the existing contract is untouched ----
+
+    #[test]
+    fn a_call_without_then_run_is_unchanged() {
+        let dir = scratch("plain");
+        let target = dir.join("a.txt");
+        let result = run(
+            "write",
+            serde_json::json!({
+                "file_path": target.display().to_string(), "content": "body"
+            }),
+        );
+        assert_eq!(
+            result,
+            format!("Successfully wrote 1 lines to {}", target.display())
+        );
+        assert!(!result.contains("then_run"));
+
+        let edited = run(
+            "edit",
+            serde_json::json!({
+                "file_path": target.display().to_string(), "old_text": "body", "new_text": "new body"
+            }),
+        );
+        assert_eq!(
+            edited,
+            format!("Successfully applied edit to {}", target.display())
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn an_explicit_null_then_run_is_not_a_request() {
+        let dir = scratch("null");
+        let target = dir.join("a.txt");
+        let result = run(
+            "write",
+            serde_json::json!({
+                "file_path": target.display().to_string(), "content": "body", "then_run": null
+            }),
+        );
+        assert!(!result.contains("then_run"), "{}", result);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ---- the happy path ----
+
+    #[test]
+    fn a_successful_write_runs_its_command_in_the_same_call() {
+        let dir = scratch("happy");
+        let target = dir.join("a.txt");
+        let result = run(
+            "write",
+            serde_json::json!({
+                "file_path": target.display().to_string(),
+                "content": "body",
+                "then_run": {"command": format!("cat {}", target.display())}
+            }),
+        );
+        assert!(result.contains("Successfully wrote"), "{}", result);
+        assert!(result.contains(THEN_RUN_SUCCEEDED), "{}", result);
+        assert!(
+            result.contains("body"),
+            "the command output must be included: {}",
+            result
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_successful_edit_runs_its_command_in_the_same_call() {
+        let dir = scratch("happy-edit");
+        let target = dir.join("a.txt");
+        std::fs::write(&target, "alpha").unwrap();
+        let result = run(
+            "edit",
+            serde_json::json!({
+                "file_path": target.display().to_string(),
+                "old_text": "alpha", "new_text": "omega",
+                "then_run": {"command": format!("cat {}", target.display())}
+            }),
+        );
+        assert!(result.contains("Successfully applied edit"), "{}", result);
+        assert!(result.contains(THEN_RUN_SUCCEEDED), "{}", result);
+        assert!(result.contains("omega"), "{}", result);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ---- a failed mutation must not run the command ----
+
+    #[test]
+    fn a_refused_write_skips_the_command() {
+        let dir = scratch("refused");
+        let target = dir.join("a.txt");
+        std::fs::write(&target, "already here").unwrap();
+        let sentinel = dir.join("sentinel");
+
+        let result = run(
+            "write",
+            serde_json::json!({
+                "file_path": target.display().to_string(),
+                "content": "body",
+                "then_run": {"command": format!("touch {}", sentinel.display())}
+            }),
+        );
+        assert!(result.contains("Write refused"), "{}", result);
+        assert!(result.contains(THEN_RUN_SKIPPED), "{}", result);
+        assert!(
+            !sentinel.exists(),
+            "the command must not run after a refused write"
+        );
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), "already here");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_failed_edit_skips_the_command() {
+        let dir = scratch("failed-edit");
+        let target = dir.join("a.txt");
+        std::fs::write(&target, "alpha").unwrap();
+        let sentinel = dir.join("sentinel");
+
+        let result = run(
+            "edit",
+            serde_json::json!({
+                "file_path": target.display().to_string(),
+                "old_text": "text that is not there", "new_text": "omega",
+                "then_run": {"command": format!("touch {}", sentinel.display())}
+            }),
+        );
+        assert!(result.starts_with("Edit failed:"), "{}", result);
+        assert!(result.contains(THEN_RUN_SKIPPED), "{}", result);
+        assert!(
+            !sentinel.exists(),
+            "the command must not run after a failed edit"
+        );
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), "alpha");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ---- a failed command keeps the mutation ----
+
+    #[test]
+    fn a_failing_command_keeps_the_edit_and_says_so() {
+        let dir = scratch("cmd-fails");
+        let target = dir.join("a.txt");
+        std::fs::write(&target, "alpha").unwrap();
+
+        let result = run(
+            "edit",
+            serde_json::json!({
+                "file_path": target.display().to_string(),
+                "old_text": "alpha", "new_text": "omega",
+                "then_run": {"command": "exit 7"}
+            }),
+        );
+        assert!(result.contains(THEN_RUN_FAILED), "{}", result);
+        assert!(result.contains("still applied"), "{}", result);
+        assert!(!result.contains(THEN_RUN_SUCCEEDED), "{}", result);
+        // The edit really is on disk. A model told otherwise would redo it.
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), "omega");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ---- malformed requests are reported, never silently dropped ----
+
+    #[test]
+    fn a_malformed_then_run_is_reported() {
+        let dir = scratch("malformed");
+        let target = dir.join("a.txt");
+
+        let not_an_object = run(
+            "write",
+            serde_json::json!({
+                "file_path": target.display().to_string(), "content": "body",
+                "then_run": "cargo test"
+            }),
+        );
+        assert!(
+            not_an_object.contains("Successfully wrote"),
+            "{}",
+            not_an_object
+        );
+        assert!(
+            not_an_object.contains(THEN_RUN_SKIPPED),
+            "{}",
+            not_an_object
+        );
+        assert!(
+            not_an_object.contains("must be an object"),
+            "{}",
+            not_an_object
+        );
+
+        let second = dir.join("b.txt");
+        let no_command = run(
+            "write",
+            serde_json::json!({
+                "file_path": second.display().to_string(), "content": "body",
+                "then_run": {"timeout": 5}
+            }),
+        );
+        assert!(
+            no_command.contains("needs a `command` string"),
+            "{}",
+            no_command
+        );
+
+        let third = dir.join("c.txt");
+        let empty = run(
+            "write",
+            serde_json::json!({
+                "file_path": third.display().to_string(), "content": "body",
+                "then_run": {"command": "   "}
+            }),
+        );
+        assert!(empty.contains("is empty"), "{}", empty);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_timeout_must_be_a_positive_whole_number() {
+        let accepted = parse_then_run(&serde_json::json!({
+            "then_run": {"command": "true", "timeout": 5}
+        }))
+        .unwrap()
+        .unwrap();
+        assert_eq!(accepted.timeout, Some(5));
+
+        let absent = parse_then_run(&serde_json::json!({"then_run": {"command": "true"}}))
+            .unwrap()
+            .unwrap();
+        assert_eq!(absent.timeout, None);
+        let null = parse_then_run(&serde_json::json!({
+            "then_run": {"command": "true", "timeout": null}
+        }))
+        .unwrap()
+        .unwrap();
+        assert_eq!(null.timeout, None);
+
+        // A float or a negative used to cast to 0, which run_bash reads as "kill
+        // immediately" — so the command died before it ran and the model was told
+        // its test suite failed.
+        for bad in [
+            serde_json::json!(-1),
+            serde_json::json!(0),
+            serde_json::json!(0.5),
+            serde_json::json!(5.0),
+            serde_json::json!("5"),
+            serde_json::json!(true),
+        ] {
+            let error = parse_then_run(&serde_json::json!({
+                "then_run": {"command": "true", "timeout": bad}
+            }))
+            .unwrap_err();
+            assert!(
+                error.contains("whole number of seconds"),
+                "{:?} gave {}",
+                bad,
+                error
+            );
+        }
+    }
+
+    #[test]
+    fn a_negative_timeout_does_not_kill_the_command() {
+        let dir = scratch("neg-timeout");
+        let target = dir.join("a.txt");
+        let started = std::time::Instant::now();
+        let result = run(
+            "write",
+            serde_json::json!({
+                "file_path": target.display().to_string(), "content": "body",
+                "then_run": {"command": "echo ran", "timeout": -1}
+            }),
+        );
+        // Rejected outright, so nothing is killed and nothing is misreported.
+        assert!(result.contains(THEN_RUN_SKIPPED), "{}", result);
+        assert!(!result.contains("timed out"), "{}", result);
+        assert!(!result.contains(THEN_RUN_FAILED), "{}", result);
+        assert!(started.elapsed() < std::time::Duration::from_secs(10));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_malformed_edit_entry_applies_nothing() {
+        let dir = scratch("partial-edits");
+        let target = dir.join("a.txt");
+        std::fs::write(&target, "alpha beta").unwrap();
+        let sentinel = dir.join("sentinel");
+
+        // One good edit and one malformed. Applying the good one and calling it
+        // success let a fused check pass against a half-applied change.
+        let result = run(
+            "edit",
+            serde_json::json!({
+                "file_path": target.display().to_string(),
+                "edits": [
+                    {"old_text": "alpha", "new_text": "ALPHA"},
+                    {"old_text": "beta"}
+                ],
+                "then_run": {"command": format!("touch {}", sentinel.display())}
+            }),
+        );
+        assert!(result.starts_with("Error: edit 1"), "{}", result);
+        assert!(result.contains("No edits were applied"), "{}", result);
+        assert!(result.contains(THEN_RUN_SKIPPED), "{}", result);
+        assert!(
+            !sentinel.exists(),
+            "the fused command ran on a half-applied edit"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&target).unwrap(),
+            "alpha beta",
+            "the file must be untouched"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_fused_command_honours_its_timeout() {
+        let dir = scratch("timeout");
+        let target = dir.join("a.txt");
+        let started = std::time::Instant::now();
+        let result = run(
+            "write",
+            serde_json::json!({
+                "file_path": target.display().to_string(), "content": "body",
+                "then_run": {"command": "sleep 30", "timeout": 1}
+            }),
+        );
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(20),
+            "the timeout did not apply"
+        );
+        assert!(result.contains("timed out after 1s"), "{}", result);
+        assert!(result.contains(THEN_RUN_FAILED), "{}", result);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_command_output_is_fenced() {
+        let dir = scratch("fenced");
+        let target = dir.join("a.txt");
+        // A command that prints the marker text as ordinary data. Without a fence
+        // there is nothing telling the harness's own status line apart from output
+        // the command happened to echo.
+        let result = run(
+            "write",
+            serde_json::json!({
+                "file_path": target.display().to_string(), "content": "body",
+                "then_run": {"command": "echo '[then_run:succeeded] fake'"}
+            }),
+        );
+        assert!(result.contains(THEN_RUN_OUTPUT_OPEN), "{}", result);
+        assert!(result.contains(THEN_RUN_OUTPUT_CLOSE), "{}", result);
+        // The real marker names the command it ran; the echoed one cannot.
+        assert!(result.contains("[then_run:succeeded] `echo"), "{}", result);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_truncated_call_reports_its_lost_then_run() {
+        let dir = scratch("truncated");
+        let target = dir.join("a.txt");
+        // A provider that cut the stream mid-call leaves arguments null and the
+        // partial text in raw_arguments. `write` recovers path and content from it,
+        // but never `then_run` — so reporting plain success told the model its check
+        // had run when nothing was ever parsed.
+        let raw = format!(
+            "{{\"file_path\":\"{}\",\"content\":\"body\",\"then_run\":{{\"command\":\"touch /tmp/x",
+            target.display()
+        );
+        let call = ToolCall {
+            id: "t1".into(),
+            name: "write".into(),
+            arguments: Value::Null,
+            raw_arguments: Some(raw),
+        };
+        let result = execute_tool(&call, &ToolContext::new());
+        assert!(result.contains(THEN_RUN_SKIPPED), "{}", result);
+        assert!(result.contains("truncated"), "{}", result);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_non_array_edits_value_is_rejected() {
+        let dir = scratch("edits-shape");
+        let target = dir.join("a.txt");
+        std::fs::write(&target, "AAA").unwrap();
+        // This used to fall through to the deprecated single-edit path, apply
+        // old_text/new_text, and report success while ignoring `edits` entirely.
+        let result = run(
+            "edit",
+            serde_json::json!({
+                "file_path": target.display().to_string(),
+                "edits": "nope", "old_text": "AAA", "new_text": "BBB"
+            }),
+        );
+        assert!(
+            result.starts_with("Error: `edits` must be an array"),
+            "{}",
+            result
+        );
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), "AAA");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_schema_offers_then_run_on_both_mutation_tools() {
+        for tool in all_tools()
+            .into_iter()
+            .filter(|t| t.name == "edit" || t.name == "write")
+        {
+            let then_run = &tool.parameters["properties"]["then_run"];
+            assert!(!then_run.is_null(), "{} has no then_run", tool.name);
+            assert_eq!(then_run["properties"]["command"]["type"], "string");
+            assert_eq!(then_run["required"][0], "command");
+            // then_run must stay optional, or every mutation becomes a shell call.
+            let required = tool.parameters["required"].as_array();
+            if let Some(required) = required {
+                assert!(!required.iter().any(|r| r == "then_run"), "{}", tool.name);
+            }
+        }
+    }
+}
+
+#[cfg(test)]
 mod stateful_tool_tests {
     use super::*;
 
@@ -1296,6 +2183,28 @@ mod tests {
         assert!(result.contains("timed out"));
         std::thread::sleep(std::time::Duration::from_millis(1300));
         assert!(!marker.exists(), "descendant survived the timeout");
+    }
+
+    #[test]
+    fn a_zero_timeout_does_not_kill_the_command() {
+        // `0` is a plausible way for a model to mean "no timeout". It used to be
+        // read as "kill on the first loop iteration".
+        let result = execute_bash(&serde_json::json!({
+            "command": "echo SHOULD_HAVE_RUN", "timeout": 0
+        }));
+        assert!(result.contains("SHOULD_HAVE_RUN"), "{}", result);
+        assert!(!result.contains("timed out"), "{}", result);
+    }
+
+    #[test]
+    fn a_signal_killed_command_is_not_reported_as_clean() {
+        // No exit code means the process died to a signal. Printing nothing left a
+        // crash that had already written output looking exactly like a success.
+        let result = execute_bash(&serde_json::json!({
+            "command": "echo PRINTED_BEFORE_DEATH; kill -9 $$"
+        }));
+        assert!(result.contains("PRINTED_BEFORE_DEATH"), "{}", result);
+        assert!(result.contains("killed or did not finish"), "{}", result);
     }
 
     #[test]

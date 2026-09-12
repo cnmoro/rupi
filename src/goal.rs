@@ -24,6 +24,8 @@ pub enum GoalStatus {
     Complete,
     /// The model reported that it cannot proceed.
     Blocked,
+    /// The driver stopped without the model deciding either way.
+    Ended,
 }
 
 /// Durable state of one goal.
@@ -103,6 +105,27 @@ impl GoalRegistry {
         )
     }
 
+    /// End a goal the driver gave up on, without claiming the model decided it.
+    ///
+    /// The driver leaves its round loop three ways: the model decides, the
+    /// out-of-band check passes, or the rounds run out. Only the first moved the
+    /// goal out of `Active`, so the other two left it live — and because
+    /// `active_objective` is consulted on every later prompt, the next unrelated
+    /// message re-entered goal mode and burned another five rounds, forever, with
+    /// no command able to clear it.
+    pub fn conclude(&self, reason: &str) {
+        let Ok(mut guard) = self.state.write() else {
+            return;
+        };
+        let Some(state) = guard.as_mut() else { return };
+        if state.status != GoalStatus::Active {
+            return;
+        }
+        state.status = GoalStatus::Ended;
+        state.block_reason = Some(reason.to_string());
+        state.decided_round = state.admitted_round;
+    }
+
     /// Report the current goal to the model.
     pub fn read_goal(&self) -> GoalToolResult {
         match self.current() {
@@ -118,6 +141,7 @@ impl GoalRegistry {
                     GoalStatus::Active => "active",
                     GoalStatus::Complete => "complete",
                     GoalStatus::Blocked => "blocked",
+                    GoalStatus::Ended => "ended",
                 }
             )),
         }
@@ -169,6 +193,7 @@ Keep working and decide inside the current round.",
                 match state.status {
                     GoalStatus::Complete => "complete",
                     GoalStatus::Blocked => "blocked",
+                    GoalStatus::Ended => "ended",
                     GoalStatus::Active => "active",
                 }
             ));
@@ -189,7 +214,9 @@ Keep working and decide inside the current round.",
                     round
                 )
             }
-            GoalStatus::Active => unreachable!("decide is never called with Active"),
+            GoalStatus::Active | GoalStatus::Ended => {
+                unreachable!("decide is only called with Complete or Blocked")
+            }
         })
     }
 }
