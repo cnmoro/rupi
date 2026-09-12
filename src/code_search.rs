@@ -450,26 +450,23 @@ fn unix_identity(metadata: &std::fs::Metadata) -> (Option<(i64, i64)>, Option<u6
     )
 }
 
-/// Windows has no status change time. The file index identifies a replacement,
-/// which is what most tools do, but a same-size edit made in place with the
-/// modification time restored afterwards is not detected there. The content digest
-/// still prevents needless re-embedding; it cannot prompt a read that never happens.
-#[cfg(windows)]
+/// Off unix there is no status change time, so only the creation time is used.
+///
+/// That identifies a file replaced by a new one, which is what most editors and
+/// archive tools do. It does not identify a same-size edit made in place with the
+/// modification time restored afterwards, so that case stays undetected on Windows.
+/// The content digest cannot help: it prevents needless re-embedding once a read
+/// happens, and here no read is prompted.
+#[cfg(not(unix))]
 fn unix_identity(metadata: &std::fs::Metadata) -> (Option<(i64, i64)>, Option<u64>) {
-    use std::os::windows::fs::MetadataExt;
-    (
-        metadata
-            .creation_time()
-            .try_into()
-            .ok()
-            .map(|t: i64| (t, 0)),
-        metadata.file_index(),
-    )
-}
-
-#[cfg(not(any(unix, windows)))]
-fn unix_identity(_metadata: &std::fs::Metadata) -> (Option<(i64, i64)>, Option<u64>) {
-    (None, None)
+    // `created` rather than a platform-specific accessor: it is stable everywhere
+    // and needs no per-target API I cannot compile here to verify.
+    let created = metadata
+        .created()
+        .ok()
+        .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|since| (since.as_secs() as i64, since.subsec_nanos() as i64));
+    (created, None)
 }
 
 struct CachedFile {
