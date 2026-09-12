@@ -1,8 +1,10 @@
 # rupi
 
-A Rust coding agent that borrows concepts from [pi](https://pi.dev/), [little-coder](https://github.com/itayinbarr/little-coder), [RTK](https://github.com/rtk-ai/rtk), and [semble](https://github.com/MinishLab/semble). Just `./rupi`. A single ~28MB binary. No npm install, no pip install, no node_modules, no Python runtime, no JVM. Download it and run it.
+A Rust coding agent that borrows concepts from [pi](https://pi.dev/), [little-coder](https://github.com/itayinbarr/little-coder), [RTK](https://github.com/rtk-ai/rtk), and [semble](https://github.com/MinishLab/semble). A single ~28MB binary. No npm install, no pip install, no node_modules, no Python runtime, no JVM. Download it and run it.
 
-Works as an interactive coding agent for humans, or as a headless RPC backend for automation scripts.
+**This project targets headless use.** rupi is built to be driven by another program over a JSONL protocol on stdin and stdout, not typed at by a person in a terminal. Every design decision answers to that: one `agent_end` per prompt so a caller always knows when a turn is over, a session id the caller chooses and can resume, events for every step of a turn, and refusals that are reported as errors instead of silently changing what the agent does.
+
+An interactive terminal mode exists, and it works, but it is there to debug the engine by hand. It is not the audience. See **Modes** below, and **Calling via code** for a Python, Node.js or Java client.
 
 Output compression: bash command output is automatically filtered to reduce token consumption. Git status/diff/log/add/commit/push, cargo test/build/check, ls, find — each has a specialized filter that strips noise and keeps only what the agent needs. Generic fallback handles ANSI stripping, deduplication, and line capping. Typical savings: 60-90% on common dev commands.
 
@@ -51,41 +53,11 @@ The list is fetched from `https://models.dev/api.json` (same source opencode use
 
 ## Modes
 
-### Interactive — `./rupi` (default)
+RPC is the mode the project is built around. Raw mode is the same event stream with keyboard input. Interactive mode is a convenience for driving the engine by hand. For working code that speaks the protocol, see **Calling via code** below.
 
-REPL prompt for humans. While the agent is generating, you can still type:
+### RPC — `./rupi --rpc` (the mode this project is for)
 
-- **Press Enter** → queues as **follow-up**: the message is saved and processed after the current response finishes.
-- **`/steer <message>`** → **interrupts immediately**: the agent receives your message right away and pivots.
-
-Commands: `/goal <desc>`, `/model <name>`, `/compact`, `/steer <message>`, `/loop <prompt>`, `/stop`, `/session`. With `--disable-yolo`, typing while the agent works is unavailable: the approval prompt needs the terminal, and two readers on one terminal means the prompt never receives your answer. Exit with `Ctrl+D`, `/exit`, `/quit`, or `exit`. Use `/session` to show the current session ID.
-
-### Loop mode — `/loop <prompt>`
-
-Sends the prompt, waits for the agent to finish, then sends it again — repeats forever until cancelled. Useful for:
-- Continuous code review
-- Ongoing monitoring tasks
-- Creative generation sprints
-
-Cancel with **double-Esc** (press Esc twice in rapid succession), or type `/stop`.
-
-### Goal mode — `/goal <description>`
-
-Sets a durable objective and drives the agent in rounds until the objective is met. Each round injects a `<goal_round>` block that carries the objective, the round number, the round budget, and an instruction to treat the workspace and the tool results as authoritative rather than earlier narration.
-
-The agent ends the run itself with the `goal` tool:
-
-- `{"operation": "complete", "round": N}` — the whole objective is achieved.
-- `{"operation": "block", "round": N, "reason": "..."}` — the agent cannot proceed.
-- `{"operation": "read"}` — report the objective, the open round, and the status.
-
-A decision is accepted only from inside the round the driver opened. `N` must match that round, so the agent cannot declare the goal done from a stray turn. A model that never calls the tool falls back to an out-of-band check, and the run stops after 5 rounds either way. However the driver stops, the goal is finished — an undecided goal does not keep driving later, unrelated prompts.
-
-Show the current goal and its status with `/goal`.
-
-### RPC — `./rupi --rpc`
-
-JSONL protocol over stdin/stdout. Designed for programmatic use — send JSON commands on stdin, receive events on stdout.
+JSONL protocol over stdin and stdout. Send one JSON command per line on stdin, read one JSON event per line on stdout. This is how rupi is meant to run: a parent program owns the session, decides what to prompt, and reacts to the events.
 
 ```json
 {"type":"prompt","id":"1","message":"hello"}
@@ -95,6 +67,8 @@ JSONL protocol over stdin/stdout. Designed for programmatic use — send JSON co
 ```
 
 Events: `generation_id`, `agent_start`, `turn_start`, `message_start`, `message_update`, `message_end`, `turn_end`, `agent_end`, `tool_execution_start`, `tool_execution_end`.
+
+Commands: `ping`, `prompt`, `steer`, `follow_up`, `abort`, `new_session`, `get_state`, `set_model`, `cycle_model`, `get_available_models`, `set_thinking_level`, `cycle_thinking_level`, `compact`, `set_auto_compaction`, `get_messages`, `list_sessions`, `set_loop`, `stop_loop`. Every command takes an optional `id`, and the `response` line for that command carries it back with `success`. A command that is refused answers with `success: false` and a reason.
 
 **Steer / follow-up in RPC**: add `"streamingBehavior"` to the prompt command:
 
@@ -120,6 +94,40 @@ While a loop runs, a plain `prompt` is refused with an error that says to send `
 ### Raw — `./rupi --raw`
 
 Same event stream as RPC but reads user input interactively. Useful for debugging or piping. Supports the same interactive steer/follow-up behavior: **Enter queues as follow-up**, **`/steer <message>` interrupts**.
+
+### Interactive — `./rupi` (the default when no mode flag is given, for debugging)
+
+A REPL for a person at a keyboard. It runs the same engine as RPC mode, so it is a good way to watch the agent work by hand. It is not what the project optimizes for. While the agent is generating, you can still type:
+
+- **Press Enter** → queues as **follow-up**: the message is saved and processed after the current response finishes.
+- **`/steer <message>`** → **interrupts immediately**: the agent receives your message right away and pivots.
+
+Commands: `/goal <desc>`, `/model <name>`, `/compact`, `/steer <message>`, `/loop <prompt>`, `/stop`, `/session`. With `--disable-yolo`, typing while the agent works is unavailable: the approval prompt needs the terminal, and two readers on one terminal means the prompt never receives your answer. Exit with `Ctrl+D`, `/exit`, `/quit`, or `exit`. Use `/session` to show the current session ID.
+
+### Loop mode — `set_loop` over RPC, `/loop <prompt>` interactively
+
+Sends the prompt, waits for the agent to finish, then sends it again — repeats forever until cancelled. Useful for:
+- Continuous code review
+- Ongoing monitoring tasks
+- Creative generation sprints
+
+Over RPC, start it with `set_loop` and end it with `stop_loop`. Interactively, cancel with **double-Esc** (press Esc twice in rapid succession), or type `/stop`.
+
+### Goal mode — `/goal <description>` (interactive and raw modes only)
+
+Sets a durable objective and drives the agent in rounds until the objective is met. Each round injects a `<goal_round>` block that carries the objective, the round number, the round budget, and an instruction to treat the workspace and the tool results as authoritative rather than earlier narration.
+
+The agent ends the run itself with the `goal` tool:
+
+- `{"operation": "complete", "round": N}` — the whole objective is achieved.
+- `{"operation": "block", "round": N, "reason": "..."}` — the agent cannot proceed.
+- `{"operation": "read"}` — report the objective, the open round, and the status.
+
+A decision is accepted only from inside the round the driver opened. `N` must match that round, so the agent cannot declare the goal done from a stray turn. A model that never calls the tool falls back to an out-of-band check, and the run stops after 5 rounds either way. However the driver stops, the goal is finished — an undecided goal does not keep driving later, unrelated prompts.
+
+`/goal` with no argument shows the objective and its status.
+
+RPC has no goal command. A headless caller drives rounds itself — it owns the prompt loop already — or uses `set_loop`, which repeats one prompt until it is stopped. The goal tool the model calls to end a run is only wired to the two keyboard modes.
 
 ## How it works
 
@@ -169,6 +177,8 @@ Same event stream as RPC but reads user input interactively. Useful for debuggin
 - **Cost**: usage and cost data from the API included in the `message_end` event
 
 ## Calling via code (Python / Node.js / Java)
+
+This is the intended way to use rupi. Each client below starts the binary in RPC mode, writes one command per line, and reads events until `agent_end`.
 
 ### Python
 
