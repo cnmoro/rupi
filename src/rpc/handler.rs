@@ -152,12 +152,37 @@ impl RpcHandler {
                 )
                 .await;
             }
+            // A prompt sent while a loop is running used to be queued into the
+            // loop's own turn. It never produced its own `agent_end`, so a caller
+            // waiting for one — the pattern the README documents — waited forever.
             RpcCommand::Prompt {
                 id,
                 message,
                 images: _,
                 streaming_behavior,
             } => {
+                // Refuse a PLAIN prompt while a loop is running. It would
+                // otherwise be queued into the loop's own turn, produce no
+                // `agent_end` of its own, and leave a caller waiting on one — the
+                // pattern the README documents — waiting until someone thought to
+                // send stop_loop.
+                //
+                // A prompt that names a streaming behaviour is a steer or a
+                // follow-up, and interjecting in a running turn is exactly what
+                // those are for. Refusing them blocked the one steering path the
+                // README documents, while the undocumented `steer` command went
+                // through untouched.
+                let plain_prompt = streaming_behavior.is_none();
+                if plain_prompt && session.read().await.is_loop_active().await {
+                    write_error(
+                        tx,
+                        id,
+                        "prompt",
+                        "a loop is running; send stop_loop before prompting".to_string(),
+                    )
+                    .await;
+                    return;
+                }
                 let session = session.clone();
                 let tx = output_tx.clone();
                 let ready = admitted.clone();

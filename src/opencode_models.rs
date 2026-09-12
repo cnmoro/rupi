@@ -78,8 +78,27 @@ fn try_fetch_from_api(provider_id: &str) -> Result<Vec<ModelsDevModel>, String> 
         return Err(format!("HTTP {}", resp.status()));
     }
 
+    // Bounded. `json()` buffers the whole body with no limit, so a compromised or
+    // spoofed host could stream gigabytes and force rupi to allocate all of it
+    // before the timeout ever fires.
+    const MAX_MODEL_LIST_BYTES: u64 = 8 * 1024 * 1024;
+    let body = {
+        use std::io::Read;
+        let mut limited = resp.take(MAX_MODEL_LIST_BYTES + 1);
+        let mut buffer = Vec::new();
+        limited
+            .read_to_end(&mut buffer)
+            .map_err(|e| format!("HTTP body: {}", e))?;
+        if buffer.len() as u64 > MAX_MODEL_LIST_BYTES {
+            return Err(format!(
+                "model list exceeded {} bytes",
+                MAX_MODEL_LIST_BYTES
+            ));
+        }
+        buffer
+    };
     let providers: HashMap<String, ModelsDevProvider> =
-        resp.json().map_err(|e| format!("JSON parse: {}", e))?;
+        serde_json::from_slice(&body).map_err(|e| format!("JSON parse: {}", e))?;
 
     match providers.get(provider_id) {
         Some(p) => {

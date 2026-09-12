@@ -2001,3 +2001,110 @@ async fn a_second_compaction_after_a_resume_keeps_untouched_history() {
         .count();
     assert_eq!(checkpoints, 1, "replay left {} checkpoints", checkpoints);
 }
+
+/// A fenced tool call in plain text, writing a file so the test can see it run.
+const FENCED_CALL_A: &str =
+    "```tool\n{\"name\":\"bash\",\"input\":{\"command\":\"touch /tmp/rupi-fallback-a\"}}\n```";
+const FENCED_CALL_B: &str =
+    "```tool\n{\"name\":\"bash\",\"input\":{\"command\":\"touch /tmp/rupi-fallback-b\"}}\n```";
+
+#[tokio::test]
+async fn a_provider_without_native_tool_calls_still_gets_the_text_fallback() {
+    let marker = std::path::Path::new("/tmp/rupi-fallback-a");
+    let _ = std::fs::remove_file(marker);
+    let provider = Arc::new(MockProvider::new(
+        vec![Turn::Text(FENCED_CALL_A), Turn::Text("done")],
+        "SUMMARY",
+    ));
+    let session = session_with_window(provider, 200_000);
+    run_prompt(&session, "list the directory").await;
+    assert!(
+        marker.exists(),
+        "the fallback stopped working for a provider that needs it"
+    );
+    let _ = std::fs::remove_file(marker);
+}
+
+#[tokio::test]
+async fn a_quoted_block_is_not_run_once_the_provider_has_called_natively() {
+    // A provider that surfaces tool calls natively does not need the text fallback,
+    // and a block in its text is a quotation. Running it would turn content the
+    // model merely read into a command the agent executes.
+    let marker = std::path::Path::new("/tmp/rupi-fallback-b");
+    let _ = std::fs::remove_file(marker);
+    let provider = Arc::new(MockProvider::new(
+        vec![
+            Turn::ToolCall { output_bytes: 8 },
+            Turn::Text(FENCED_CALL_B),
+            Turn::Text("done"),
+        ],
+        "SUMMARY",
+    ));
+    let session = session_with_window(provider, 200_000);
+    run_prompt(&session, "read the docs and tell me what they say").await;
+    assert!(
+        !marker.exists(),
+        "a quoted block ran after the provider had already called natively"
+    );
+    let _ = std::fs::remove_file(marker);
+}
+
+#[tokio::test]
+async fn a_queued_message_is_written_to_the_transcript_once() {
+    // Draining wrote the message, and so did the caller, so every steer and every
+    // follow-up came back doubled when the session was resumed.
+    let provider = Arc::new(MockProvider::new(
+        vec![Turn::ToolCall { output_bytes: 10 }, Turn::Text("done")],
+        "SUMMARY",
+    ));
+    let session = session_with_window(provider, 200_000);
+    session.follow_up("also check the tests").await;
+    run_prompt(&session, "do the work").await;
+
+    let path = session.session_path().await.expect("a session file");
+    let replayed = rupi::sessions::load_session(&path).expect("the transcript must load");
+    let written = replayed
+        .iter()
+        .filter(|m| m.content == "also check the tests")
+        .count();
+    assert_eq!(
+        written, 1,
+        "the queued message was written {} times",
+        written
+    );
+
+    let in_memory = session
+        .messages()
+        .await
+        .iter()
+        .filter(|m| m.content == "also check the tests")
+        .count();
+    assert_eq!(in_memory, 1, "the queued message is in history twice");
+}
+
+#[tokio::test]
+async fn switching_models_allows_the_text_fallback_again() {
+    // The new model may not surface tool calls natively, so what the old one could
+    // do says nothing about it.
+    let marker = std::path::Path::new("/tmp/rupi-fallback-c");
+    let _ = std::fs::remove_file(marker);
+    const FENCED_CALL_C: &str =
+        "```tool\n{\"name\":\"bash\",\"input\":{\"command\":\"touch /tmp/rupi-fallback-c\"}}\n```";
+    let provider = Arc::new(MockProvider::new(
+        vec![
+            Turn::ToolCall { output_bytes: 8 },
+            Turn::Text("that is what the file says"),
+            Turn::Text(FENCED_CALL_C),
+        ],
+        "SUMMARY",
+    ));
+    let session = session_with_window(provider, 200_000);
+    run_prompt(&session, "start the work").await;
+    session.set_model("another-model".to_string());
+    run_prompt(&session, "keep going").await;
+    assert!(
+        marker.exists(),
+        "a model switch left the fallback off for a model that may need it"
+    );
+    let _ = std::fs::remove_file(marker);
+}

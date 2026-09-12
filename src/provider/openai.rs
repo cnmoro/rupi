@@ -95,8 +95,14 @@ struct ChunkDelta {
 
 #[derive(Debug, Default, Deserialize)]
 struct ChunkToolCall {
+    /// Absent on backends that only send it with the first fragment of a call.
+    ///
+    /// Defaulting a missing index to zero pointed every such fragment at the first
+    /// call: a second call's id and name overwrote the first's, and both calls'
+    /// argument text concatenated into one string that was no longer valid JSON.
+    /// The first call vanished with no error.
     #[serde(default)]
-    index: usize,
+    index: Option<usize>,
     #[serde(default)]
     id: Option<String>,
     #[serde(default)]
@@ -148,7 +154,14 @@ pub fn set_stream_idle_timeout(seconds: u64) {
     STREAM_IDLE_TIMEOUT.store(seconds.max(1), std::sync::atomic::Ordering::Relaxed);
 }
 
-fn stream_idle_timeout() -> u64 {
+/// Marks a stream that went silent, as opposed to one that failed.
+///
+/// One constant, used by the provider that writes it and the session that reads
+/// it. Every other error this module sends carries its own prefix, so no upstream
+/// text can be mistaken for this one.
+pub const IDLE_TIMEOUT_PREFIX: &str = "idle timeout";
+
+pub fn stream_idle_timeout() -> u64 {
     STREAM_IDLE_TIMEOUT.load(std::sync::atomic::Ordering::Relaxed)
 }
 
@@ -458,7 +471,36 @@ impl ChatProvider for OpenAIProvider {
                                                 }
                                                 if let Some(chunk_tool_calls) = delta.tool_calls {
                                                     for tc in chunk_tool_calls {
-                                                        let index = tc.index;
+                                                        // With no index, a fragment
+                                                        // belongs to the call being
+                                                        // accumulated. Only an id
+                                                        // that DIFFERS from the open
+                                                        // call starts a new one:
+                                                        // some servers repeat the
+                                                        // same id on every fragment,
+                                                        // and treating each repeat as
+                                                        // a new call split one call
+                                                        // into several, each holding
+                                                        // a piece of the arguments
+                                                        // and none of them valid JSON.
+                                                        let index = match tc.index {
+                                                            Some(index) => index,
+                                                            None => {
+                                                                let open = tool_calls
+                                                                    .last()
+                                                                    .map(|last: &AccumulatedToolCall| last.id.clone())
+                                                                    .unwrap_or_default();
+                                                                let starts_new = match tc.id.as_deref() {
+                                                                    Some(id) => !open.is_empty() && id != open,
+                                                                    None => false,
+                                                                };
+                                                                if tool_calls.is_empty() || starts_new {
+                                                                    tool_calls.len()
+                                                                } else {
+                                                                    tool_calls.len() - 1
+                                                                }
+                                                            }
+                                                        };
                                                         while tool_calls.len() <= index {
                                                             tool_calls.push(AccumulatedToolCall::default());
                                                         }
@@ -483,7 +525,19 @@ impl ChatProvider for OpenAIProvider {
                                 }
                             }
                             Some(Err(e)) => {
-                                let _ = tx.send(StreamEvent::Error(format!("Stream error: {}", e))).await;
+                                // A read timeout renders as "error decoding response
+                                // body", which reads as a malformed reply rather than
+                                // as silence. Name it, so the session can categorize
+                                // the turn and a reader can tell the two apart.
+                                let message = if e.is_timeout() {
+                                    format!(
+                                        "{IDLE_TIMEOUT_PREFIX}: the provider sent nothing for {}s",
+                                        stream_idle_timeout()
+                                    )
+                                } else {
+                                    format!("Stream error: {}", e)
+                                };
+                                let _ = tx.send(StreamEvent::Error(message)).await;
                                 return;
                             }
                             None => {

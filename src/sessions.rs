@@ -310,7 +310,10 @@ fn message_text(content: &serde_json::Value) -> String {
                     .get("name")
                     .and_then(|n| n.as_str())
                     .map(|name| format!("[called tool: {}]", name)),
-                _ => None,
+                // A block type from another agent that this one does not model.
+                // Dropping it silently lost real content from a transcript rupi
+                // claims to accept; a placeholder keeps the fact that it existed.
+                Some(other) => Some(format!("[{} content omitted on load]", other)),
             },
             _ => None,
         })
@@ -353,54 +356,109 @@ pub fn append_generation_id(path: &PathBuf, generation_id: &str) -> Result<(), S
 /// mirror image: a call with no result at the tail. Both are a hard 400 from every
 /// OpenAI-compatible endpoint on the first request after resume.
 pub fn repair_tool_pairing(messages: &mut Vec<Message>) -> usize {
-    let mut open: Vec<String> = Vec::new();
+    // Rebuilt rather than patched in place. Patching demoted an unmatched result
+    // where it stood, which put a user message between an assistant's calls and
+    // their answers — the very shape this repair exists to remove. Rebuilding makes
+    // the result well formed by construction: an assistant keeps only the calls
+    // that are answered, each answer follows it immediately, and anything else is
+    // carried after the batch.
+    let source = std::mem::take(messages);
+    let mut rebuilt: Vec<Message> = Vec::with_capacity(source.len());
     let mut repaired = 0usize;
+    let mut queue = source.into_iter().peekable();
 
-    for msg in messages.iter_mut() {
+    while let Some(mut msg) = queue.next() {
         if msg.role == "tool" {
-            let id = msg.tool_call_id.clone().unwrap_or_default();
-            if open.contains(&id) {
-                open.retain(|open_id| *open_id != id);
-                continue;
-            }
-            // Convert rather than drop. A transcript from another agent records
-            // its calls as text on the assistant message, so its results are
-            // legitimately unmatched here and deleting them would lose real
-            // content. Carrying the text on the user role keeps it and still
-            // satisfies the provider.
-            msg.role = "user".to_string();
-            msg.tool_call_id = None;
-            msg.content = format!(
-                "[tool result, its call is no longer in context]\n{}",
-                msg.content
-            );
+            // A result with no call above it at all.
+            demote_tool_result(&mut msg);
             repaired += 1;
+            rebuilt.push(msg);
             continue;
         }
-        open = msg
-            .tool_calls
-            .as_ref()
-            .map(|calls| calls.iter().map(|c| c.id.clone()).collect())
-            .unwrap_or_default();
-    }
 
-    // A call whose results never arrived cannot end the list. Keep whatever the
-    // assistant said, drop only the unanswered call.
-    if let Some(last) = messages.last_mut() {
-        let unanswered = last
-            .tool_calls
-            .as_ref()
-            .map(|calls| !calls.is_empty())
-            .unwrap_or(false);
-        if unanswered {
-            last.tool_calls = None;
-            repaired += 1;
-            if last.content.trim().is_empty() {
-                messages.pop();
+        let calls = match msg.tool_calls.take() {
+            Some(calls) if !calls.is_empty() => calls,
+            Some(_) => {
+                // An empty array is not a call, and some endpoints reject it.
+                repaired += 1;
+                rebuilt.push(msg);
+                continue;
+            }
+            None => {
+                rebuilt.push(msg);
+                continue;
+            }
+        };
+
+        // The results that follow, before any other kind of message.
+        let mut results: Vec<Option<Message>> = Vec::new();
+        while queue.peek().is_some_and(|next| next.role == "tool") {
+            results.push(queue.next());
+        }
+        // Index them by id, so a batch of thousands of calls stays linear. A linear
+        // scan per call made one large batch quadratic: 16,000 calls took 546ms.
+        let mut by_id: std::collections::HashMap<String, std::collections::VecDeque<usize>> =
+            std::collections::HashMap::new();
+        for (index, slot) in results.iter().enumerate() {
+            let Some(result) = slot else { continue };
+            let id = result.tool_call_id.clone().unwrap_or_default();
+            by_id.entry(id).or_default().push_back(index);
+        }
+
+        let mut kept_calls = Vec::new();
+        let mut answers: Vec<Message> = Vec::new();
+        for call in calls {
+            // The first unused result with this id answers the call. A second result
+            // for one call answers nothing, and is carried after the batch.
+            let position = by_id.get_mut(&call.id).and_then(|slots| slots.pop_front());
+            match position.and_then(|index| results[index].take()) {
+                Some(answer) => {
+                    kept_calls.push(call);
+                    answers.push(answer);
+                }
+                None => repaired += 1,
+            }
+        }
+
+        if kept_calls.is_empty() {
+            // Keep whatever the assistant said or thought. A message with neither
+            // text nor reasoning nor a call carries nothing at all.
+            let empty = msg.content.trim().is_empty() && msg.reasoning_content.is_none();
+            if !empty {
+                rebuilt.push(msg);
+            }
+        } else {
+            msg.tool_calls = Some(kept_calls);
+            rebuilt.push(msg);
+            rebuilt.extend(answers);
+        }
+
+        // Whatever the batch did not answer, in the order it arrived.
+        for slot in results.iter_mut() {
+            if let Some(mut leftover) = slot.take() {
+                demote_tool_result(&mut leftover);
+                repaired += 1;
+                rebuilt.push(leftover);
             }
         }
     }
+
+    *messages = rebuilt;
     repaired
+}
+
+/// Carry a tool result that answers nothing as ordinary user text.
+///
+/// Converted rather than dropped. A transcript from another agent records its calls
+/// as text on the assistant message, so its results are legitimately unmatched here
+/// and deleting them would lose real content.
+fn demote_tool_result(msg: &mut Message) {
+    msg.role = "user".to_string();
+    msg.tool_call_id = None;
+    msg.content = format!(
+        "[tool result, its call is no longer in context]\n{}",
+        msg.content
+    );
 }
 
 /// Load all entries from a session file.
@@ -829,6 +887,217 @@ mod tests {
     }
 
     #[test]
+    fn an_unanswered_call_inside_a_batch_is_dropped_on_load() {
+        // A reset that gave up waiting for a wedged tool, or a crash, can land
+        // between the calls of one batch. The assistant message then names two
+        // calls while only one result follows, and sending that to any
+        // OpenAI-compatible endpoint is a hard 400 — the repair used to look only
+        // at the last message, so this shape survived.
+        let mut messages = vec![
+            Message::new("user", "go"),
+            Message::tool_call(
+                "running two things",
+                vec![
+                    crate::tools::ToolCall {
+                        id: "c1".into(),
+                        name: "bash".into(),
+                        arguments: serde_json::json!({}),
+                        raw_arguments: None,
+                    },
+                    crate::tools::ToolCall {
+                        id: "c2".into(),
+                        name: "read".into(),
+                        arguments: serde_json::json!({}),
+                        raw_arguments: None,
+                    },
+                ],
+            ),
+            Message::tool_result("c1", "done"),
+        ];
+        let repaired = repair_tool_pairing(&mut messages);
+        assert_eq!(repaired, 1);
+        let calls = messages[1].tool_calls.as_ref().expect("the answered call");
+        assert_eq!(calls.len(), 1, "the unanswered call was kept");
+        assert_eq!(calls[0].id, "c1");
+        assert_eq!(messages[2].role, "tool");
+    }
+
+    #[test]
+    fn a_reused_call_id_does_not_rescue_an_earlier_unanswered_call() {
+        // A model can reuse a call id across turns. Keyed by id alone, the answered
+        // second call reported the unanswered first one as answered, and the
+        // transcript kept the exact shape this repair removes.
+        let call = |id: &str| crate::tools::ToolCall {
+            id: id.into(),
+            name: "bash".into(),
+            arguments: serde_json::json!({}),
+            raw_arguments: None,
+        };
+        let mut messages = vec![
+            Message::new("user", "go"),
+            Message::tool_call("first attempt", vec![call("c1")]),
+            Message::new("user", "never mind, try again"),
+            Message::tool_call("second attempt", vec![call("c1")]),
+            Message::tool_result("c1", "done"),
+        ];
+        assert_eq!(repair_tool_pairing(&mut messages), 1);
+        assert!(
+            messages[1].tool_calls.is_none(),
+            "the first, unanswered call was kept"
+        );
+        assert!(messages[3].tool_calls.is_some(), "the answered call went");
+    }
+
+    /// The two rules every OpenAI-compatible endpoint enforces.
+    fn assert_well_formed(messages: &[Message], label: &str) {
+        let mut expecting: Vec<String> = Vec::new();
+        for (index, msg) in messages.iter().enumerate() {
+            if msg.role == "tool" {
+                let id = msg.tool_call_id.clone().unwrap_or_default();
+                assert!(
+                    expecting.contains(&id),
+                    "{}: message {} is an orphan tool result ({:?})",
+                    label,
+                    index,
+                    id
+                );
+                expecting.retain(|open| *open != id);
+                continue;
+            }
+            assert!(
+                expecting.is_empty(),
+                "{}: message {} ({}) follows {} unanswered call(s)",
+                label,
+                index,
+                msg.role,
+                expecting.len()
+            );
+            expecting = msg
+                .tool_calls
+                .as_ref()
+                .map(|calls| calls.iter().map(|c| c.id.clone()).collect())
+                .unwrap_or_default();
+        }
+        assert!(
+            expecting.is_empty(),
+            "{}: the transcript ends on {} unanswered call(s)",
+            label,
+            expecting.len()
+        );
+    }
+
+    fn a_call(id: &str) -> crate::tools::ToolCall {
+        crate::tools::ToolCall {
+            id: id.into(),
+            name: "bash".into(),
+            arguments: serde_json::json!({}),
+            raw_arguments: None,
+        }
+    }
+
+    #[test]
+    fn a_stray_result_never_splits_a_real_pair() {
+        // Demoting the stray result where it stood put a user message between the
+        // assistant's call and its answer, which is the shape this repair removes.
+        let mut messages = vec![
+            Message::tool_call("working", vec![a_call("A")]),
+            Message::tool_result("not_a_real_id", "output of something else"),
+            Message::tool_result("A", "the real answer"),
+        ];
+        assert_eq!(repair_tool_pairing(&mut messages), 1);
+        assert_well_formed(&messages, "stray result");
+        assert!(
+            messages
+                .iter()
+                .any(|m| m.content.contains("the real answer")),
+            "the real answer was lost"
+        );
+        assert!(
+            messages
+                .iter()
+                .any(|m| m.content.contains("output of something else")),
+            "the stray result's text was lost"
+        );
+
+        // The same shape with no id at all.
+        let mut headless = vec![
+            Message::tool_call("working", vec![a_call("A")]),
+            Message {
+                role: "tool".into(),
+                content: "no id on this one".into(),
+                tool_calls: None,
+                tool_call_id: None,
+                reasoning_content: None,
+            },
+            Message::tool_result("A", "the real answer"),
+        ];
+        assert_eq!(repair_tool_pairing(&mut headless), 1);
+        assert_well_formed(&headless, "result with no id");
+    }
+
+    #[test]
+    fn interleaved_batches_are_made_well_formed() {
+        // Two assistants call before either is answered. No provider emits this,
+        // but a merged or hand-edited transcript can, and the repair must not hand
+        // back something the next request rejects.
+        let mut messages = vec![
+            Message::tool_call("first", vec![a_call("A")]),
+            Message::tool_call("second", vec![a_call("B")]),
+            Message::tool_result("A", "answer to A"),
+            Message::tool_result("B", "answer to B"),
+        ];
+        repair_tool_pairing(&mut messages);
+        assert_well_formed(&messages, "interleaved");
+        assert!(
+            messages.iter().any(|m| m.content.contains("answer to A")),
+            "a real result was deleted"
+        );
+    }
+
+    #[test]
+    fn an_empty_call_array_is_not_a_call() {
+        let mut messages = vec![Message {
+            role: "assistant".into(),
+            content: "thinking".into(),
+            tool_calls: Some(Vec::new()),
+            tool_call_id: None,
+            reasoning_content: None,
+        }];
+        assert_eq!(repair_tool_pairing(&mut messages), 1);
+        assert!(messages[0].tool_calls.is_none());
+        assert_well_formed(&messages, "empty call array");
+    }
+
+    #[test]
+    fn reasoning_survives_a_dropped_call() {
+        // The message is emptied of its call, but its reasoning is real content.
+        let mut messages = vec![Message {
+            role: "assistant".into(),
+            content: String::new(),
+            tool_calls: Some(vec![a_call("gone")]),
+            tool_call_id: None,
+            reasoning_content: Some("the chain of thought that led here".into()),
+        }];
+        repair_tool_pairing(&mut messages);
+        assert_eq!(messages.len(), 1, "the reasoning was deleted with the call");
+        assert_eq!(
+            messages[0].reasoning_content.as_deref(),
+            Some("the chain of thought that led here")
+        );
+    }
+
+    #[test]
+    fn a_duplicate_result_does_not_answer_twice() {
+        let mut messages = vec![
+            Message::tool_call("working", vec![a_call("A")]),
+            Message::tool_result("A", "first"),
+            Message::tool_result("A", "second"),
+        ];
+        assert_eq!(repair_tool_pairing(&mut messages), 1);
+        assert_well_formed(&messages, "duplicate result");
+    }
+
+    #[test]
     fn a_well_formed_transcript_is_left_alone() {
         let mut messages = vec![
             Message::new("user", "go"),
@@ -1147,14 +1416,19 @@ mod tests {
         ]);
         append_message(&path, &msg).unwrap();
 
-        // Create a tool result
+        // Both calls are answered. A batch with an unanswered call is not a valid
+        // request, and loading repairs it; see
+        // `an_unanswered_call_inside_a_batch_is_dropped_on_load`.
         let mut tr = Message::tool_result("call_1", "file1.txt\nfile2.txt");
         tr.tool_call_id = Some("call_1".into());
         append_message(&path, &tr).unwrap();
+        let mut tr2 = Message::tool_result("call_2", "the file body");
+        tr2.tool_call_id = Some("call_2".into());
+        append_message(&path, &tr2).unwrap();
 
         // Load and verify
         let loaded = load_session(&path).unwrap();
-        assert_eq!(loaded.len(), 2);
+        assert_eq!(loaded.len(), 3);
         assert!(
             loaded[0].tool_calls.is_some(),
             "Tool calls should be preserved"

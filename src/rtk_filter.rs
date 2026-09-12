@@ -130,6 +130,8 @@ fn filter_git_status(output: &str) -> String {
     // Track if we're in a rebase/merge state
     let mut state_line = String::new();
     let mut changes: Vec<String> = Vec::new();
+    // 'S' staged, 'U' not staged, '?' untracked.
+    let mut section = 'S';
 
     for line in &lines {
         let trimmed = line.trim();
@@ -144,10 +146,24 @@ fn filter_git_status(output: &str) -> String {
             || trimmed
                 == "nothing added to commit but untracked files present (use \"git add\" to track)"
             || trimmed == "nothing to commit, working tree clean"
-            || trimmed.starts_with("Changes not staged for commit:")
-            || trimmed.starts_with("Changes to be committed:")
-            || trimmed.starts_with("Untracked files:")
         {
+            continue;
+        }
+        // The section headers decide whether a change is staged. Discarding them
+        // before classification made every modified file read as staged, so a
+        // model could believe a commit would include work it had not added.
+        if trimmed.starts_with("Changes to be committed:") {
+            section = 'S';
+            continue;
+        }
+        if trimmed.starts_with("Changes not staged for commit:")
+            || trimmed.starts_with("Unmerged paths:")
+        {
+            section = 'U';
+            continue;
+        }
+        if trimmed.starts_with("Untracked files:") {
+            section = '?';
             continue;
         }
         // Rebase/merge state
@@ -170,22 +186,23 @@ fn filter_git_status(output: &str) -> String {
             if let Some(pos) = trimmed.rfind(':') {
                 let file = trimmed[pos + 1..].trim().to_string();
                 if !file.is_empty() {
-                    changes.push(
-                        if trimmed.starts_with("modified:") || line.trim().starts_with("\tmodified")
-                        {
-                            format!(" M {}", file)
-                        } else if trimmed.starts_with("new file:")
-                            || line.trim().starts_with("\tnew file")
-                        {
-                            format!(" A {}", file)
-                        } else if trimmed.starts_with("deleted:")
-                            || line.trim().starts_with("\tdeleted")
-                        {
-                            format!(" D {}", file)
-                        } else {
-                            format!("  {}", file)
-                        },
-                    );
+                    let code = if trimmed.starts_with("both modified:") {
+                        'C'
+                    } else if trimmed.starts_with("modified:") {
+                        'M'
+                    } else if trimmed.starts_with("new file:") {
+                        'A'
+                    } else if trimmed.starts_with("deleted:") {
+                        'D'
+                    } else {
+                        ' '
+                    };
+                    // A conflict is never reported as an ordinary edit.
+                    changes.push(match (section, code) {
+                        (_, 'C') => format!("UU {}", file),
+                        ('S', code) => format!("{} {}", code, file),
+                        (_, code) => format!(" {} {}", code.to_ascii_lowercase(), file),
+                    });
                 }
             }
             continue;
@@ -1040,6 +1057,38 @@ fn strip_ansi(s: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn an_unstaged_edit_is_not_reported_as_staged() {
+        // Every modified file used to read as staged, so a model could believe a
+        // commit would include work that was never added.
+        let raw = "On branch main\nChanges not staged for commit:\n\tmodified:   a.txt\n";
+        let out = filter_output("git status", raw);
+        assert!(out.contains("unstaged"), "{}", out);
+        assert!(!out.contains("\nstaged ("), "reported as staged: {}", out);
+        assert!(out.contains("a.txt"), "{}", out);
+    }
+
+    #[test]
+    fn a_staged_edit_is_still_reported_as_staged() {
+        let raw = "On branch main\nChanges to be committed:\n\tmodified:   a.txt\n";
+        let out = filter_output("git status", raw);
+        assert!(out.contains("staged ("), "{}", out);
+        assert!(!out.contains("unstaged ("), "{}", out);
+        assert!(out.contains("a.txt"), "{}", out);
+    }
+
+    #[test]
+    fn a_conflicted_file_is_marked_as_a_conflict() {
+        let raw = "On branch main\nUnmerged paths:\n\tboth modified:   f.txt\n";
+        let out = filter_output("git status", raw);
+        assert!(out.contains("f.txt"), "{}", out);
+        assert!(
+            out.contains("UU") || out.to_lowercase().contains("both modified"),
+            "a conflict read as an ordinary edit: {}",
+            out
+        );
+    }
+
     #[test]
     fn a_porcelain_status_with_changes_is_never_called_clean() {
         // The long form is recognized; the porcelain form was not, so a repository

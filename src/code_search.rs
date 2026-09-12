@@ -498,6 +498,32 @@ struct CachedRepository {
     index: Option<Arc<CodeSearchIndex>>,
 }
 
+/// One repository's cache, with its own lock.
+///
+/// The whole map used to sit behind a single mutex held for the entire refresh —
+/// the directory walk, every file read, and the embedding call. A search of a
+/// small repository then waited on an unrelated large one being indexed, which
+/// matters because several sessions share this process. The map lock is now held
+/// only long enough to find the slot.
+struct CacheSlot {
+    /// When this repository was last searched, for eviction order. Read while
+    /// holding the map lock, so it lives outside the per-repository mutex.
+    last_used: std::sync::atomic::AtomicU64,
+    repo: Mutex<CachedRepository>,
+}
+
+impl Default for CacheSlot {
+    fn default() -> Self {
+        CacheSlot {
+            last_used: std::sync::atomic::AtomicU64::new(0),
+            repo: Mutex::new(CachedRepository::default()),
+        }
+    }
+}
+
+/// Ticks once per search, so the cache can order its entries by recency.
+static CACHE_CLOCK: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 impl CachedRepository {
     fn refresh(
         &mut self,
@@ -523,11 +549,20 @@ impl CachedRepository {
                 changed: status_changed,
                 inode,
             };
-            if self
+            // On unix the stamp carries a status change time, which moves on every
+            // write, so a matching stamp is trustworthy and costs no read.
+            //
+            // Off unix there is no such field: a same-size edit made in place with
+            // the modification time restored compares equal, which is the bug this
+            // whole stamp exists to prevent. There the content is read and digested
+            // instead, bounded by the same size limit the indexer already applies —
+            // a read per file is far cheaper than serving results for code that is
+            // no longer on disk.
+            let stamp_matches = self
                 .files
                 .get(&path)
-                .is_some_and(|file| file.stamp == stamp)
-            {
+                .is_some_and(|file| file.stamp == stamp);
+            if stamp_matches && cfg!(unix) {
                 continue;
             }
             let content = if stamp.len > 1_000_000 {
@@ -612,27 +647,47 @@ impl CachedRepository {
 /// A bounded cache keyed by canonical repository path. Unchanged files keep
 /// their chunks and embeddings; edits, additions, and deletions refresh the index.
 pub fn cached_index(path: &Path) -> Result<Arc<CodeSearchIndex>, AgentError> {
-    static CACHE: OnceLock<Mutex<HashMap<PathBuf, CachedRepository>>> = OnceLock::new();
+    static CACHE: OnceLock<Mutex<HashMap<PathBuf, Arc<CacheSlot>>>> = OnceLock::new();
     let root = path.canonicalize()?;
-    let mut cache = CACHE
-        .get_or_init(Default::default)
+
+    // Hold the map lock only to find the slot, then release it before any I/O or
+    // embedding work, so an unrelated repository is never blocked behind this one.
+    let slot = {
+        let mut cache = CACHE
+            .get_or_init(Default::default)
+            .lock()
+            .map_err(|_| AgentError::Config("Search cache lock poisoned".into()))?;
+        if cache.len() >= 4 && !cache.contains_key(&root) {
+            // Evict the least recently used, not whichever bucket the hasher
+            // happens to yield first. Dropping the repository that was just
+            // searched sends the next query back into a full re-embed of it.
+            let victim = cache
+                .iter()
+                .min_by_key(|(_, slot)| slot.last_used.load(std::sync::atomic::Ordering::Relaxed))
+                .map(|(key, _)| key.clone());
+            if let Some(key) = victim {
+                cache.remove(&key);
+            }
+        }
+        let slot = cache.entry(root.clone()).or_default().clone();
+        slot.last_used.store(
+            CACHE_CLOCK.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+            std::sync::atomic::Ordering::Relaxed,
+        );
+        slot
+    };
+
+    let mut repo = slot
+        .repo
         .lock()
         .map_err(|_| AgentError::Config("Search cache lock poisoned".into()))?;
-    if cache.len() >= 4 && !cache.contains_key(&root) {
-        if let Some(key) = cache.keys().next().cloned() {
-            cache.remove(&key);
-        }
-    }
-    cache
-        .entry(root.clone())
-        .or_default()
-        .refresh(&root, |texts| {
-            let guard = get_model()?;
-            let model = guard
-                .as_ref()
-                .ok_or_else(|| AgentError::Config("Model not loaded".into()))?;
-            Ok(model.encode(texts))
-        })
+    repo.refresh(&root, |texts| {
+        let guard = get_model()?;
+        let model = guard
+            .as_ref()
+            .ok_or_else(|| AgentError::Config("Model not loaded".into()))?;
+        Ok(model.encode(texts))
+    })
 }
 
 fn ranking_boost(chunk: &CodeChunk) -> f32 {

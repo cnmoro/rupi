@@ -361,3 +361,397 @@ async fn rpc_reset_cannot_overtake_a_just_submitted_prompt() {
     .await
     .unwrap();
 }
+
+/// Read one `response` line for `id` and report whether it succeeded.
+async fn response_success(rx: &mut mpsc::UnboundedReceiver<String>, id: &str) -> bool {
+    tokio::time::timeout(Duration::from_secs(3), async {
+        while let Some(line) = rx.recv().await {
+            let value: serde_json::Value = serde_json::from_str(&line).unwrap();
+            if value["type"] == "response" && value["id"] == id {
+                return value["success"].as_bool().unwrap_or(false);
+            }
+        }
+        panic!("missing response")
+    })
+    .await
+    .unwrap()
+}
+
+#[tokio::test]
+async fn a_loop_refuses_a_plain_prompt_but_admits_a_steer() {
+    // Refusing every `prompt` blocked the one steering path the README documents,
+    // while the undocumented `steer` command went through untouched.
+    let provider = Arc::new(ControlledProvider::default());
+    let handler = RpcHandler::new(session(provider.clone()));
+    let (tx, mut rx) = mpsc::unbounded_channel();
+    handler
+        .handle(
+            serde_json::from_value(
+                serde_json::json!({"type":"set_loop","id":"loop","message":"keep going"}),
+            )
+            .unwrap(),
+            tx.clone(),
+        )
+        .await;
+    assert!(response_success(&mut rx, "loop").await, "set_loop refused");
+
+    handler
+        .handle(
+            serde_json::from_value(
+                serde_json::json!({"type":"prompt","id":"plain","message":"unrelated"}),
+            )
+            .unwrap(),
+            tx.clone(),
+        )
+        .await;
+    assert!(
+        !response_success(&mut rx, "plain").await,
+        "a plain prompt was admitted while a loop was running"
+    );
+
+    handler
+        .handle(
+            serde_json::from_value(serde_json::json!({
+                "type":"prompt","id":"steering","message":"fix the indentation",
+                "streamingBehavior":"steer"
+            }))
+            .unwrap(),
+            tx.clone(),
+        )
+        .await;
+    assert!(
+        response_success(&mut rx, "steering").await,
+        "a documented steer was refused while a loop was running"
+    );
+}
+
+/// A provider that streams one delta and then reports an idle timeout.
+struct SilentAfterDelta;
+
+#[async_trait]
+impl ChatProvider for SilentAfterDelta {
+    async fn stream_chat(
+        &self,
+        _: &str,
+        _: &[Message],
+        _: watch::Receiver<bool>,
+    ) -> Result<mpsc::Receiver<StreamEvent>, AgentError> {
+        let (tx, rx) = mpsc::channel(4);
+        tx.send(StreamEvent::Delta("partial answer".into()))
+            .await
+            .unwrap();
+        tx.send(StreamEvent::Error(
+            "idle timeout: the provider sent nothing for 2s".into(),
+        ))
+        .await
+        .unwrap();
+        Ok(rx)
+    }
+    async fn complete(&self, _: &str, _: &[Message]) -> Result<String, AgentError> {
+        Ok("summary".into())
+    }
+    fn model_info(&self) -> ModelInfo {
+        ModelInfo {
+            provider: "openai-compatible".into(),
+            id: "test".into(),
+            context_window: 128000,
+            reasoning: false,
+        }
+    }
+}
+
+#[tokio::test]
+async fn a_stream_that_goes_silent_keeps_what_it_already_said() {
+    // The HTTP read timeout fires before the session's own idle limit, so this is
+    // the path a real stall takes. Reported as an error, it threw away the text the
+    // user had already seen and called the turn a decode failure.
+    init_sessions();
+    let session = AgentSession::new(
+        Arc::new(SilentAfterDelta),
+        "test".into(),
+        128000,
+        ".".into(),
+        vec![],
+        vec![],
+    );
+    let (tx, mut rx) = mpsc::unbounded_channel();
+    let collector = tokio::spawn(async move {
+        let mut seen = None;
+        while let Some(event) = rx.recv().await {
+            let value = serde_json::to_value(&event).unwrap();
+            if value["type"] == "message_end" {
+                seen = value["message"]["stop_reason"].as_str().map(str::to_string);
+            }
+        }
+        seen
+    });
+    let outcome = session.prompt("say something", tx).await;
+    assert!(outcome.is_ok(), "a stall was reported as a failed turn");
+    let stop_reason = collector.await.unwrap();
+    assert_eq!(stop_reason.as_deref(), Some("timeout"), "stop reason");
+    let kept = session.messages().await;
+    assert!(
+        kept.iter()
+            .any(|m| m.role == "assistant" && m.content == "partial answer"),
+        "the text the user already saw was dropped from the conversation"
+    );
+}
+
+/// A provider that ignores cancellation and answers long after it was told to stop.
+struct Unstoppable;
+
+#[async_trait]
+impl ChatProvider for Unstoppable {
+    async fn stream_chat(
+        &self,
+        _: &str,
+        _: &[Message],
+        _: watch::Receiver<bool>,
+    ) -> Result<mpsc::Receiver<StreamEvent>, AgentError> {
+        tokio::time::sleep(Duration::from_millis(2500)).await;
+        let (tx, rx) = mpsc::channel(2);
+        tx.send(StreamEvent::Done(StreamResult {
+            content: "answer from the old conversation".into(),
+            ..Default::default()
+        }))
+        .await
+        .unwrap();
+        Ok(rx)
+    }
+    async fn complete(&self, _: &str, _: &[Message]) -> Result<String, AgentError> {
+        Ok("summary".into())
+    }
+    fn model_info(&self) -> ModelInfo {
+        ModelInfo {
+            provider: "openai-compatible".into(),
+            id: "test".into(),
+            context_window: 128000,
+            reasoning: false,
+        }
+    }
+}
+
+#[tokio::test]
+async fn a_generation_that_outlives_reset_cannot_write_into_the_new_session() {
+    // `reset` waits for the generation, but the wait is bounded. A tool that
+    // ignores cancellation outlives it, and the task used to come back and append
+    // its reply to the cleared history and the new session file.
+    init_sessions();
+    let session = Arc::new(AgentSession::new(
+        Arc::new(Unstoppable),
+        "test".into(),
+        128000,
+        ".".into(),
+        vec![],
+        vec![],
+    ));
+    session.set_reset_wait_secs(1);
+    let running = session.clone();
+    let generation = tokio::spawn(async move {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        tokio::spawn(async move { while rx.recv().await.is_some() {} });
+        let _ = running.prompt("the old question", tx).await;
+    });
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    session.reset().await;
+    assert!(
+        session.messages().await.is_empty(),
+        "reset left the old conversation behind"
+    );
+
+    let _ = tokio::time::timeout(Duration::from_secs(6), generation).await;
+    let kept = session.messages().await;
+    assert!(
+        !kept.iter().any(|m| m.content.contains("old conversation")),
+        "a reset conversation wrote into the new one: {:?}",
+        kept.iter().map(|m| m.content.clone()).collect::<Vec<_>>()
+    );
+}
+
+/// A provider whose generation never finishes and never honours cancellation.
+struct NeverFinishes;
+
+#[async_trait]
+impl ChatProvider for NeverFinishes {
+    async fn stream_chat(
+        &self,
+        _: &str,
+        _: &[Message],
+        _: watch::Receiver<bool>,
+    ) -> Result<mpsc::Receiver<StreamEvent>, AgentError> {
+        std::future::pending::<()>().await;
+        unreachable!()
+    }
+    async fn complete(&self, _: &str, _: &[Message]) -> Result<String, AgentError> {
+        Ok("summary".into())
+    }
+    fn model_info(&self) -> ModelInfo {
+        ModelInfo {
+            provider: "openai-compatible".into(),
+            id: "test".into(),
+            context_window: 128000,
+            reasoning: false,
+        }
+    }
+}
+
+#[tokio::test]
+async fn reset_returns_even_when_a_generation_never_finishes() {
+    // The bounded wait was decorative. An ordinary generation held a read lock on
+    // the loop prompt for its whole duration, so `reset` blocked in `set_loop(None)`
+    // right after giving up on the wait it does bound.
+    init_sessions();
+    let session = Arc::new(AgentSession::new(
+        Arc::new(NeverFinishes),
+        "test".into(),
+        128000,
+        ".".into(),
+        vec![],
+        vec![],
+    ));
+    session.set_reset_wait_secs(1);
+    let running = session.clone();
+    tokio::spawn(async move {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        tokio::spawn(async move { while rx.recv().await.is_some() {} });
+        let _ = running.prompt("start work that never ends", tx).await;
+    });
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    tokio::time::timeout(Duration::from_secs(8), session.reset())
+        .await
+        .expect("reset hung on a generation that never finishes");
+}
+
+/// A provider that answers each turn after a short, cancellable pause.
+#[derive(Default)]
+struct SlowAnswers {
+    calls: AtomicUsize,
+    started: Notify,
+}
+
+#[async_trait]
+impl ChatProvider for SlowAnswers {
+    async fn stream_chat(
+        &self,
+        _: &str,
+        _: &[Message],
+        mut signal: watch::Receiver<bool>,
+    ) -> Result<mpsc::Receiver<StreamEvent>, AgentError> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        self.started.notify_one();
+        tokio::select! {
+            _ = tokio::time::sleep(Duration::from_millis(300)) => {}
+            _ = signal.changed() => return Err(AgentError::Cancelled),
+        }
+        let (tx, rx) = mpsc::channel(2);
+        tx.send(StreamEvent::Done(StreamResult {
+            content: "round done".into(),
+            ..Default::default()
+        }))
+        .await
+        .unwrap();
+        Ok(rx)
+    }
+    async fn complete(&self, _: &str, _: &[Message]) -> Result<String, AgentError> {
+        Ok("summary".into())
+    }
+    fn model_info(&self) -> ModelInfo {
+        ModelInfo {
+            provider: "openai-compatible".into(),
+            id: "test".into(),
+            context_window: 128000,
+            reasoning: false,
+        }
+    }
+}
+
+#[tokio::test]
+async fn steering_a_loop_keeps_the_loop_running() {
+    // A steer cancels the round it interrupts. That used to end the loop silently
+    // while `is_loop_active` still said it was running, so plain prompts stayed
+    // refused for a loop that would never run another round.
+    init_sessions();
+    let provider = Arc::new(SlowAnswers::default());
+    let session = Arc::new(AgentSession::new(
+        provider.clone(),
+        "test".into(),
+        128000,
+        ".".into(),
+        vec![],
+        vec![],
+    ));
+    session.set_loop(Some("keep going".into())).await;
+    let running = session.clone();
+    tokio::spawn(async move {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        tokio::spawn(async move { while rx.recv().await.is_some() {} });
+        let _ = running.prompt("start the loop", tx).await;
+    });
+    tokio::time::timeout(Duration::from_secs(2), provider.started.notified())
+        .await
+        .unwrap();
+
+    session.steer("please also check the tests").await;
+    let before = provider.calls.load(Ordering::SeqCst);
+    tokio::time::sleep(Duration::from_millis(1200)).await;
+
+    assert!(
+        provider.calls.load(Ordering::SeqCst) > before + 1,
+        "the loop stopped cycling after a steer"
+    );
+    assert!(
+        session.is_loop_active().await,
+        "the loop was reported inactive while it kept running"
+    );
+    session.cancel_loop().await;
+}
+
+#[tokio::test]
+async fn stopping_a_loop_beats_a_steer_that_arrived_first() {
+    // `cancel_loop` must end the loop even when a steer is already pending. The
+    // steered message is still processed as one ordinary turn, because dropping
+    // what the user typed would be worse than running it.
+    init_sessions();
+    let provider = Arc::new(SlowAnswers::default());
+    let session = Arc::new(AgentSession::new(
+        provider.clone(),
+        "test".into(),
+        128000,
+        ".".into(),
+        vec![],
+        vec![],
+    ));
+    session.set_loop(Some("keep going".into())).await;
+    let running = session.clone();
+    let driver = tokio::spawn(async move {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        tokio::spawn(async move { while rx.recv().await.is_some() {} });
+        let _ = running.prompt("start the loop", tx).await;
+    });
+    tokio::time::timeout(Duration::from_secs(2), provider.started.notified())
+        .await
+        .unwrap();
+
+    session.steer("one more thing").await;
+    session.cancel_loop().await;
+
+    tokio::time::timeout(Duration::from_secs(5), driver)
+        .await
+        .expect("the loop kept running after it was stopped")
+        .unwrap();
+    assert!(!session.is_loop_active().await, "the loop is still active");
+    assert!(
+        !session.is_streaming().await,
+        "a generation is still running"
+    );
+    let said = session.messages().await;
+    let steered = said
+        .iter()
+        .filter(|m| m.content == "one more thing")
+        .count();
+    assert_eq!(steered, 1, "the steered message was lost or duplicated");
+    let rounds = said.iter().filter(|m| m.content == "keep going").count();
+    assert_eq!(rounds, 0, "a loop round started after the loop was stopped");
+}
