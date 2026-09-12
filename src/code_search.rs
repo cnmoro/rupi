@@ -411,16 +411,88 @@ pub fn index_path(path: &Path) -> Vec<CodeChunk> {
     all_chunks
 }
 
-#[derive(PartialEq, Eq)]
+#[derive(Debug, PartialEq, Eq)]
+/// Identity of a file revision, used to decide whether its chunks can be reused.
+///
+/// Modification time and length alone are not enough. A checkout, `tar -x`,
+/// `rsync -a`, and `cp -p` all restore the recorded mtime, and coarse-granularity
+/// filesystems collide on it anyway — so two different revisions of the same size
+/// compared equal, and search then served content that no longer existed while
+/// missing what did.
+///
+/// Status change time closes that. Unlike mtime it is set by the kernel on every
+/// write and cannot be restored by the tools above. The inode catches a file
+/// replaced wholesale. Both come from the same `metadata` call, so this costs no
+/// extra I/O — which matters, because the whole point of the stamp is to avoid
+/// reading the file.
+///
+/// Residual: an edit that lands inside the filesystem's own timestamp granularity
+/// still looks unchanged. Catching that needs the content itself, which is the
+/// read this exists to avoid; git handles the same case with its racy-timestamp
+/// rule. The realistic cases — a checkout, `rsync -a`, `cp -p`, `tar -x` — all
+/// happen far outside that window and are caught.
 struct FileStamp {
     modified: Option<std::time::SystemTime>,
     len: u64,
+    /// Seconds and nanoseconds of the last status change, on unix.
+    changed: Option<(i64, i64)>,
+    /// Inode, on unix.
+    inode: Option<u64>,
+}
+
+/// Read the unix-only parts of a stamp.
+#[cfg(unix)]
+fn unix_identity(metadata: &std::fs::Metadata) -> (Option<(i64, i64)>, Option<u64>) {
+    use std::os::unix::fs::MetadataExt;
+    (
+        Some((metadata.ctime(), metadata.ctime_nsec())),
+        Some(metadata.ino()),
+    )
+}
+
+/// Windows has no status change time. The file index identifies a replacement,
+/// which is what most tools do, but a same-size edit made in place with the
+/// modification time restored afterwards is not detected there. The content digest
+/// still prevents needless re-embedding; it cannot prompt a read that never happens.
+#[cfg(windows)]
+fn unix_identity(metadata: &std::fs::Metadata) -> (Option<(i64, i64)>, Option<u64>) {
+    use std::os::windows::fs::MetadataExt;
+    (
+        metadata
+            .creation_time()
+            .try_into()
+            .ok()
+            .map(|t: i64| (t, 0)),
+        metadata.file_index(),
+    )
+}
+
+#[cfg(not(any(unix, windows)))]
+fn unix_identity(_metadata: &std::fs::Metadata) -> (Option<(i64, i64)>, Option<u64>) {
+    (None, None)
 }
 
 struct CachedFile {
     stamp: FileStamp,
+    /// Digest of the content these chunks were built from.
+    ///
+    /// The stamp decides whether to LOOK at a file; this decides whether to
+    /// re-embed it. Status change time moves on `chmod`, `chown`, `touch`, and on
+    /// every file of a tree restored by `rsync -a` or `tar -x` — none of which
+    /// alter a byte. Without this, each of those forced a full re-embed of the
+    /// whole repository, which is a worse problem than the stale results the
+    /// stricter stamp was added to prevent.
+    content_hash: String,
     chunks: Vec<CodeChunk>,
     embeddings: Vec<Vec<f32>>,
+}
+
+/// Digest of a file's content, used to decide whether embeddings can be kept.
+fn content_digest(content: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    hasher.update(content.as_bytes());
+    format!("{:x}", hasher.finalize())
 }
 
 #[derive(Default)]
@@ -447,9 +519,12 @@ impl CachedRepository {
         }
         for path in paths {
             let metadata = std::fs::metadata(&path)?;
+            let (status_changed, inode) = unix_identity(&metadata);
             let stamp = FileStamp {
                 modified: metadata.modified().ok(),
                 len: metadata.len(),
+                changed: status_changed,
+                inode,
             };
             if self
                 .files
@@ -458,10 +533,26 @@ impl CachedRepository {
             {
                 continue;
             }
-            let chunks = if stamp.len > 1_000_000 {
+            let content = if stamp.len > 1_000_000 {
+                String::new()
+            } else {
+                std::fs::read_to_string(&path).unwrap_or_default()
+            };
+            let content_hash = content_digest(&content);
+
+            // The stamp changed but the bytes did not: keep the work. This is the
+            // ordinary outcome of a permission change or a tree restore, and
+            // re-embedding there costs the whole repository for nothing.
+            if let Some(existing) = self.files.get_mut(&path) {
+                if existing.content_hash == content_hash {
+                    existing.stamp = stamp;
+                    continue;
+                }
+            }
+
+            let chunks = if content.is_empty() {
                 Vec::new()
             } else {
-                let content = std::fs::read_to_string(&path).unwrap_or_default();
                 let relative = path.strip_prefix(root).unwrap_or(&path).to_string_lossy();
                 let language = path
                     .extension()
@@ -486,6 +577,7 @@ impl CachedRepository {
                 path,
                 CachedFile {
                     stamp,
+                    content_hash,
                     chunks,
                     embeddings,
                 },
@@ -832,6 +924,103 @@ mod tests {
     fn test_chunk_file_empty() {
         let chunks = chunk_file("empty.rs", "", Some("rust".into()));
         assert!(chunks.is_empty());
+    }
+
+    #[test]
+    fn unchanged_content_keeps_its_embeddings() {
+        // A permission change, a `touch`, or a tree restored by `rsync -a` moves
+        // the status change time on every file without altering a byte. The stamp
+        // is deliberately strict enough to notice, so the digest has to stop that
+        // from re-embedding the whole repository for nothing.
+        let body = "fn alpha() {}\nfn beta() {}\n";
+        assert_eq!(content_digest(body), content_digest(body));
+        assert_ne!(
+            content_digest(body),
+            content_digest("fn alpha() {}\nfn gamma() {}\n")
+        );
+        // Same length, different bytes — the case a length check cannot see.
+        assert_ne!(content_digest("aaaa"), content_digest("aaab"));
+        assert_eq!(content_digest(""), content_digest(""));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn a_same_size_edit_with_a_restored_mtime_is_not_missed() {
+        // The realistic case: a checkout, `tar -x`, `rsync -a` or `cp -p` restores
+        // the recorded mtime, and a coarse filesystem collides on it anyway. Two
+        // revisions of the same size then compared equal, so search served content
+        // that no longer existed and missed what did.
+        let dir = std::env::temp_dir().join(format!("rupi-stale-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("a.rs");
+
+        std::fs::write(&path, "fn alpha_marker() {}\n").unwrap();
+        let first = std::fs::metadata(&path).unwrap();
+        let (first_changed, first_inode) = unix_identity(&first);
+        let before = FileStamp {
+            modified: first.modified().ok(),
+            len: first.len(),
+            changed: first_changed,
+            inode: first_inode,
+        };
+
+        // A real checkout or restore happens later, and some filesystems record
+        // timestamps coarsely, so give the clock room to move.
+        std::thread::sleep(std::time::Duration::from_millis(20));
+
+        // Same byte length, and the modification time put back exactly.
+        std::fs::write(&path, "fn omega_marker() {}\n").unwrap();
+        let restored = std::fs::File::options().write(true).open(&path).unwrap();
+        restored.set_modified(first.modified().unwrap()).unwrap();
+        drop(restored);
+
+        let second = std::fs::metadata(&path).unwrap();
+        let (second_changed, second_inode) = unix_identity(&second);
+        let after = FileStamp {
+            modified: second.modified().ok(),
+            len: second.len(),
+            changed: second_changed,
+            inode: second_inode,
+        };
+
+        assert_eq!(
+            before.modified, after.modified,
+            "the test must restore the mtime"
+        );
+        assert_eq!(
+            before.len, after.len,
+            "the two revisions must be the same size"
+        );
+        assert_ne!(
+            before, after,
+            "a changed file compared equal, so its chunks would be reused"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn an_untouched_file_still_compares_equal() {
+        // The stamp must not become so strict that nothing is ever reused.
+        let dir = std::env::temp_dir().join(format!("rupi-stable-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("a.rs");
+        std::fs::write(&path, "fn stable() {}\n").unwrap();
+
+        let read_stamp = || {
+            let m = std::fs::metadata(&path).unwrap();
+            let (changed, inode) = unix_identity(&m);
+            FileStamp {
+                modified: m.modified().ok(),
+                len: m.len(),
+                changed,
+                inode,
+            }
+        };
+        assert_eq!(read_stamp(), read_stamp());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

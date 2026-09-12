@@ -44,6 +44,34 @@ pub struct SessionEntry<'a> {
     pub summary: Option<&'a str>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tokens_before: Option<u64>,
+    /// How many messages, counted from the start of the transcript, this summary
+    /// replaced.
+    ///
+    /// Replay used to treat the record's POSITION in the file as the boundary and
+    /// clear everything above it. That only holds while compaction is the sole
+    /// writer: another task appending during the summarization round trip lands
+    /// above the record, and its messages were deleted on the next resume even
+    /// though they were correctly persisted and had nothing to do with the
+    /// summary. Recording the count makes the boundary a fact about the summary
+    /// rather than a fact about file ordering.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub replaced_count: Option<usize>,
+    /// The complete checkpoint message body, framing and tags included.
+    ///
+    /// `summary` holds only the raw model text, so rebuilding a checkpoint from it
+    /// lost the preamble that tells the reader it is established background.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub checkpoint: Option<&'a str>,
+    /// The task anchor re-emitted directly below the checkpoint.
+    ///
+    /// Carried here rather than written as its own line. The rebuild puts the
+    /// anchor between the checkpoint and the retained tail, but a separate line
+    /// can only land after the tail in the file — so replay reconstructed a
+    /// different order than the process held, and the next compaction's index,
+    /// measured against one order and applied to the other, deleted messages no
+    /// summary had touched. One record, one write, one order.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub anchor: Option<&'a str>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub session_id: Option<&'a str>,
 }
@@ -124,6 +152,9 @@ fn write_session_header(path: &std::path::Path, id: &str, model: &str) -> Result
         message: None,
         summary: None,
         tokens_before: None,
+        replaced_count: None,
+        checkpoint: None,
+        anchor: None,
         session_id: Some(id),
     };
     let mut file =
@@ -209,6 +240,9 @@ pub fn append_message(path: &PathBuf, msg: &Message) -> Result<(), String> {
         }),
         summary: None,
         tokens_before: None,
+        replaced_count: None,
+        checkpoint: None,
+        anchor: None,
         session_id: None,
     };
     let mut file = open_for_append(path)?;
@@ -219,13 +253,29 @@ pub fn append_message(path: &PathBuf, msg: &Message) -> Result<(), String> {
 }
 
 /// Append a compaction entry to a session file.
-pub fn append_compaction(path: &PathBuf, summary: &str, tokens_before: u64) -> Result<(), String> {
+/// Record one compaction as a single, self-describing line.
+///
+/// The checkpoint body and the anchor travel inside the record rather than as
+/// their own message lines. That keeps replay's ordering identical to the
+/// process's, and makes the whole compaction one atomic append: a crash can no
+/// longer land between the summary, the record, and the anchor.
+pub fn append_compaction(
+    path: &PathBuf,
+    summary: &str,
+    tokens_before: u64,
+    replaced_count: usize,
+    checkpoint: &str,
+    anchor: Option<&str>,
+) -> Result<(), String> {
     let entry = SessionEntry {
         entry_type: "compaction",
         model: None,
         message: None,
         summary: Some(summary),
         tokens_before: Some(tokens_before),
+        replaced_count: Some(replaced_count),
+        checkpoint: Some(checkpoint),
+        anchor,
         session_id: None,
     };
     let mut file = open_for_append(path)?;
@@ -375,25 +425,50 @@ pub fn load_session(path: &PathBuf) -> Result<Vec<Message>, String> {
         if let Ok(val) = serde_json::from_str::<serde_json::Value>(line) {
             let entry_type = val["type"].as_str().unwrap_or("");
             if entry_type == "compaction" {
-                // Everything above this point was summarized. Replaying it too
-                // would restore the very context the compaction just dropped —
-                // the session would resume over budget and immediately compact
-                // again, paying for a summary every single time.
-                let summary_msg = match messages.last() {
-                    Some(last) if last.content.starts_with(COMPACTION_PREFIX) => last.clone(),
-                    // Written by a different tool, or the summary message never
-                    // made it to disk: rebuild it from the compaction record.
-                    _ => Message::new(
-                        "user",
-                        &format!(
+                // Rebuild exactly the list the process held: the checkpoint, then
+                // the anchor, then whatever the summary did not replace. All three
+                // come from this one record, so replay cannot reorder them.
+                let checkpoint_body = val["checkpoint"]
+                    .as_str()
+                    .map(|body| body.to_string())
+                    .or_else(|| match messages.last() {
+                        // Written before the checkpoint field existed: the body was
+                        // its own message line just above this record.
+                        Some(last) if last.content.starts_with(COMPACTION_PREFIX) => {
+                            Some(last.content.clone())
+                        }
+                        _ => None,
+                    })
+                    .unwrap_or_else(|| {
+                        format!(
                             "{}\n{}",
                             COMPACTION_PREFIX,
                             val["summary"].as_str().unwrap_or_default()
-                        ),
-                    ),
+                        )
+                    });
+
+                let kept: Vec<Message> = match val["replaced_count"].as_u64() {
+                    Some(replaced) => {
+                        // Drop only what this summary actually replaced. Anything
+                        // another writer appended while the summary was in flight
+                        // sits past that boundary and has to survive.
+                        let boundary = (replaced as usize).min(messages.len());
+                        let mut kept: Vec<Message> = messages.split_off(boundary);
+                        // An older transcript also has the body as its own line.
+                        kept.retain(|m| !m.content.starts_with(COMPACTION_PREFIX));
+                        kept
+                    }
+                    // A record written before the count existed. Keep the old
+                    // meaning so an existing transcript still resumes.
+                    None => Vec::new(),
                 };
+
                 messages.clear();
-                messages.push(summary_msg);
+                messages.push(Message::new("user", &checkpoint_body));
+                if let Some(anchor) = val["anchor"].as_str() {
+                    messages.push(Message::new("user", anchor));
+                }
+                messages.extend(kept);
                 continue;
             }
             if entry_type == "message" {
@@ -531,6 +606,149 @@ pub fn find_session_path(id: &str) -> Option<PathBuf> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_concurrent_write_survives_a_compaction() {
+        // The race: compaction snapshots the history, spends a round trip
+        // summarizing, and writes its record. Another writer appends during that
+        // window, so its messages land ABOVE the record in the file. Replay used
+        // to read the record's position as the boundary and delete them.
+        let dir = std::env::temp_dir().join(format!("rupi-concurrent-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("s.jsonl");
+        write_session_header(&path, "s", "m").unwrap();
+
+        // Three messages exist when compaction takes its snapshot.
+        for text in ["one", "two", "three"] {
+            append_message(&path, &Message::new("user", text)).unwrap();
+        }
+        // A concurrent writer appends while the summary is in flight.
+        append_message(
+            &path,
+            &Message::new("assistant", "written during compaction"),
+        )
+        .unwrap();
+        // Compaction then lands, as one record.
+        append_compaction(
+            &path,
+            "the summary",
+            1234,
+            3,
+            &format!("{}\nthe summary", COMPACTION_PREFIX),
+            None,
+        )
+        .unwrap();
+
+        let loaded = load_session(&path).unwrap();
+        assert!(
+            loaded[0].content.starts_with(COMPACTION_PREFIX),
+            "the checkpoint must lead: {:?}",
+            loaded[0].content
+        );
+        assert!(
+            loaded
+                .iter()
+                .any(|m| m.content == "written during compaction"),
+            "a correctly persisted message was deleted by an unrelated compaction"
+        );
+        // And what the summary really replaced is gone.
+        assert!(!loaded.iter().any(|m| m.content == "one"));
+        assert!(!loaded.iter().any(|m| m.content == "three"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_second_compaction_on_a_resumed_session_lands_correctly() {
+        // The count indexes into the list compaction held in memory. After a
+        // resume that list is the replayed one, so the loader and the compactor
+        // must agree on the same origin. This is the case where an off-by-N would
+        // silently delete real history.
+        let dir = std::env::temp_dir().join(format!("rupi-second-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("s.jsonl");
+        write_session_header(&path, "s", "m").unwrap();
+
+        // First run: ten messages, then a compaction that replaced all ten.
+        for i in 0..10 {
+            append_message(&path, &Message::new("user", &format!("first-{}", i))).unwrap();
+        }
+        append_compaction(
+            &path,
+            "summary A",
+            100,
+            10,
+            &format!("{}\nsummary A", COMPACTION_PREFIX),
+            Some("the anchor"),
+        )
+        .unwrap();
+
+        // Resume: the in-memory list is now [summary A, anchor].
+        let resumed = load_session(&path).unwrap();
+        assert_eq!(resumed.len(), 2, "{:?}", resumed);
+
+        // Second run appends ten more, so memory holds twelve.
+        for i in 0..10 {
+            append_message(&path, &Message::new("user", &format!("second-{}", i))).unwrap();
+        }
+        // A second compaction replaces the first eight of those twelve.
+        append_compaction(
+            &path,
+            "summary B",
+            200,
+            8,
+            &format!("{}\nsummary B", COMPACTION_PREFIX),
+            None,
+        )
+        .unwrap();
+
+        let loaded = load_session(&path).unwrap();
+        // Expect the checkpoint plus exactly what the second compaction kept:
+        // indices 8..12 of [summary A, anchor, second-0 .. second-9].
+        let texts: Vec<&str> = loaded.iter().map(|m| m.content.as_str()).collect();
+        assert!(texts[0].contains("summary B"), "{:?}", texts);
+        assert_eq!(loaded.len(), 5, "{:?}", texts);
+        for expected in ["second-6", "second-7", "second-8", "second-9"] {
+            assert!(
+                texts.iter().any(|t| t.contains(expected)),
+                "{} was lost: {:?}",
+                expected,
+                texts
+            );
+        }
+        // And what it replaced is gone.
+        assert!(!texts.iter().any(|t| t.contains("second-5")), "{:?}", texts);
+        assert!(
+            !texts.iter().any(|t| t.contains("summary A")),
+            "{:?}",
+            texts
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_record_without_a_count_still_resumes() {
+        // Transcripts written before the count existed keep the old meaning.
+        let dir = std::env::temp_dir().join(format!("rupi-oldrecord-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("s.jsonl");
+        write_session_header(&path, "s", "m").unwrap();
+        append_message(&path, &Message::new("user", "old message")).unwrap();
+        {
+            use std::io::Write;
+            let mut file = open_for_append(&path).unwrap();
+            file.write_all(
+                b"{\"type\":\"compaction\",\"summary\":\"older summary\",\"tokens_before\":10}\n",
+            )
+            .unwrap();
+        }
+        let loaded = load_session(&path).unwrap();
+        assert_eq!(loaded.len(), 1);
+        assert!(loaded[0].content.contains("older summary"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn a_session_id_cannot_escape_the_sessions_directory() {
         // `PathBuf::join` discards the base for an absolute path, so an id like
@@ -743,7 +961,15 @@ mod tests {
         .unwrap();
         drop(file);
 
-        append_compaction(&path, "test summary", 1000).unwrap();
+        append_compaction(
+            &path,
+            "test summary",
+            1000,
+            0,
+            "[Compacted conversation history]\ntest summary",
+            None,
+        )
+        .unwrap();
         let contents = fs::read_to_string(&path).unwrap();
         assert!(contents.contains("test summary"));
 

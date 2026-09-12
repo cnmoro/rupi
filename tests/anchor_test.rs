@@ -1332,9 +1332,12 @@ async fn a_declined_compaction_leaves_the_history_untouched() {
 
 #[tokio::test]
 async fn only_a_compaction_breaks_the_prefix() {
+    // Each Text ends a prompt, so the tool calls have to come first within a turn.
     let mut script: Vec<Turn> = Vec::new();
-    for _ in 0..6 {
-        script.push(Turn::ToolCall { output_bytes: 3000 });
+    for _ in 0..2 {
+        for _ in 0..4 {
+            script.push(Turn::ToolCall { output_bytes: 3000 });
+        }
         script.push(Turn::Text("step done"));
     }
     let provider = Arc::new(MockProvider::new(script, &valid_summary("work")));
@@ -1897,4 +1900,104 @@ async fn cancelling_a_tool_kills_its_descendants() {
     );
 
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test]
+async fn replay_reproduces_the_order_the_process_held() {
+    // The bug this guards: the rebuild puts the anchor between the checkpoint and
+    // the retained tail, but persisting it as its own line could only place it
+    // AFTER the tail in the file. Replay then produced a different order, and the
+    // next compaction's index — measured against one order, applied to the other —
+    // deleted messages no summary had touched.
+    let provider = Arc::new(MockProvider::new(
+        vec![
+            Turn::ToolCall { output_bytes: 6000 },
+            Turn::ToolCall { output_bytes: 6000 },
+            Turn::Text("done"),
+        ],
+        &valid_summary("work"),
+    ));
+    let session = session_with(provider.clone());
+    run_prompt(&session, ORIGINAL_REQUEST).await;
+    assert!(
+        !provider.aligned_requests().is_empty(),
+        "this run must compact"
+    );
+
+    let in_memory = session.messages().await;
+    let path = session.session_path().await.expect("a session file");
+    let replayed = rupi::sessions::load_session(&path).expect("the transcript must load");
+
+    // The anchor sits directly below the checkpoint in both.
+    assert!(in_memory[0]
+        .content
+        .starts_with("[Compacted conversation history]"));
+    assert!(rupi::anchor::is_anchor(&in_memory[1].content));
+    assert!(replayed[0]
+        .content
+        .starts_with("[Compacted conversation history]"));
+    assert!(
+        rupi::anchor::is_anchor(&replayed[1].content),
+        "replay put something else after the checkpoint: {:?}",
+        replayed[1].content.chars().take(60).collect::<String>()
+    );
+
+    // And the whole sequence agrees, so a later compaction's index means the same
+    // thing to both.
+    let shape = |messages: &[Message]| -> Vec<(String, String)> {
+        messages
+            .iter()
+            .map(|m| (m.role.clone(), m.content.chars().take(80).collect()))
+            .collect()
+    };
+    assert_eq!(
+        shape(&in_memory),
+        shape(&replayed),
+        "replay reordered history"
+    );
+}
+
+#[tokio::test]
+async fn a_second_compaction_after_a_resume_keeps_untouched_history() {
+    // The consequence of the ordering bug, end to end: compact, resume, compact
+    // again, and check that nothing the summaries never covered went missing.
+    // Each Text ends a prompt, so the tool calls have to come first within a turn.
+    let mut script: Vec<Turn> = Vec::new();
+    for _ in 0..2 {
+        for _ in 0..4 {
+            script.push(Turn::ToolCall { output_bytes: 3000 });
+        }
+        script.push(Turn::Text("step done"));
+    }
+    let provider = Arc::new(MockProvider::new(script, &valid_summary("work")));
+    let session = session_with(provider.clone());
+
+    run_prompt(&session, ORIGINAL_REQUEST).await;
+    let path = session.session_path().await.expect("a session file");
+
+    // Resume from disk, exactly as a restart would.
+    let resumed = rupi::sessions::load_session(&path).expect("load");
+    assert!(resumed[0]
+        .content
+        .starts_with("[Compacted conversation history]"));
+    assert!(rupi::anchor::is_anchor(&resumed[1].content));
+
+    // Keep going, which compacts again.
+    run_prompt(&session, "carry on with the refactor").await;
+    let after = rupi::sessions::load_session(&path).expect("load");
+
+    // The anchor must still be recoverable, and the checkpoint must still lead.
+    assert!(after[0]
+        .content
+        .starts_with("[Compacted conversation history]"));
+    assert!(
+        rupi::agent::session::recover_anchor(&after).is_some(),
+        "the anchor was lost across two compactions and a resume"
+    );
+    // No duplicate checkpoints stacked up in the retained tail.
+    let checkpoints = after
+        .iter()
+        .filter(|m| m.content.starts_with("[Compacted conversation history]"))
+        .count();
+    assert_eq!(checkpoints, 1, "replay left {} checkpoints", checkpoints);
 }

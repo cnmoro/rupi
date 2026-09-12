@@ -710,9 +710,23 @@ recoverable. Re-run the command if you need it.]",
     }
 
     /// Persist a compaction record to the session file.
-    async fn persist_compaction(&self, summary: &str, tokens_before: u64) {
+    async fn persist_compaction(
+        &self,
+        summary: &str,
+        tokens_before: u64,
+        replaced: usize,
+        checkpoint: &str,
+        anchor: Option<&str>,
+    ) {
         if let Some(ref path) = *self.session_path.read().await {
-            if let Err(e) = sessions::append_compaction(path, summary, tokens_before) {
+            if let Err(e) = sessions::append_compaction(
+                path,
+                summary,
+                tokens_before,
+                replaced,
+                checkpoint,
+                anchor,
+            ) {
                 eprintln!("rupi: failed to persist compaction: {}", e);
             }
         }
@@ -1714,8 +1728,10 @@ recoverable. Re-run the command if you need it.]",
         // Replace summarized messages with a compaction checkpoint message.
         // Use role "user" (not "system") because OpenAI-compatible endpoints
         // expect at most one system message — the one built fresh each turn.
-        let summary_msg = Message::new("user", &compaction::build_checkpoint_body(&summary));
-        self.persist_message(&summary_msg).await;
+        // Not persisted as its own line. The compaction record below carries it, so
+        // replay rebuilds exactly the order this function builds in memory.
+        let checkpoint_body = compaction::build_checkpoint_body(&summary);
+        let summary_msg = Message::new("user", &checkpoint_body);
 
         // Re-emit the anchor directly below the checkpoint. This is the position that
         // makes the fix structural: the exact request the user typed is present in
@@ -1750,13 +1766,17 @@ recoverable. Re-run the command if you need it.]",
         }
         *self.tool_results_since_user.write().await = 0;
 
-        self.persist_compaction(&summary, total_tokens).await;
-        // Persist the anchor AFTER the compaction record. Replay clears everything
-        // above that record, so an anchor written before it would be dropped on
-        // resume and the fix would hold only until the process restarted.
-        if let Some(ref anchor) = anchor_msg {
-            self.persist_message(anchor).await;
-        }
+        // One record, one write. `cut_index` is exactly how many messages this
+        // summary replaced, and the checkpoint and anchor travel with it so a crash
+        // cannot land between the three and replay cannot reorder them.
+        self.persist_compaction(
+            &summary,
+            total_tokens,
+            cut_index,
+            &checkpoint_body,
+            anchor_msg.as_ref().map(|m| m.content.as_str()),
+        )
+        .await;
 
         // Released only now. `reset()` polls this flag and then swaps
         // `session_path`, so clearing it before the writes above let a concurrent

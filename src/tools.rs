@@ -658,13 +658,170 @@ async fn drain_pipe<R: tokio::io::AsyncRead + Unpin>(mut pipe: R, sink: Arc<Mute
     }
 }
 
+/// Every descendant of `pid`, found by walking parent links.
+///
+/// A process group kill cannot reach a descendant that called `setsid`, because
+/// that call is precisely how a process leaves the group. `nohup`, `disown`,
+/// daemonizing servers and double-forking test runners all do it, so "killed as a
+/// tree" was not true for a realistic set of commands.
+///
+/// The walk has to happen BEFORE anything is killed. Once a parent dies its
+/// children are reparented to init and the link that identifies them is gone.
+/// Read one process's parent and start time from `/proc`.
+///
+/// The start time is what makes a later kill safe. A pid can exit between being
+/// collected and being signalled, and the number can be reused by something
+/// unrelated; comparing the start time catches that, because a new process cannot
+/// share both the number and the boot-relative start tick.
+#[cfg(target_os = "linux")]
+fn proc_parent_and_start(pid: u32) -> Option<(u32, u64)> {
+    let stat = std::fs::read_to_string(format!("/proc/{}/stat", pid)).ok()?;
+    // The command name can contain spaces and parentheses, so the fields after it
+    // are found from the LAST `)`, never by splitting the whole line.
+    let after_name = stat.rfind(')').map(|i| &stat[i + 1..])?;
+    let fields: Vec<&str> = after_name.split_whitespace().collect();
+    // After the name: state, ppid, ... and starttime is the twentieth.
+    let parent = fields.get(1)?.parse::<u32>().ok()?;
+    let start = fields.get(19)?.parse::<u64>().ok()?;
+    Some((parent, start))
+}
+
+#[cfg(target_os = "linux")]
+fn descendants_with_start(pid: u32) -> Vec<(u32, u64)> {
+    // Index children by parent during the single `/proc` pass, then walk down.
+    //
+    // Rescanning a flat list for every node found, with a linear membership check
+    // inside it, made this quadratic. A command that spawned thousands of workers —
+    // a parallel build, a fuzz run, exactly what a timeout has to kill — turned the
+    // walk into seconds of work at the moment the kill needed to be fast.
+    let mut children: std::collections::HashMap<u32, Vec<(u32, u64)>> =
+        std::collections::HashMap::new();
+    let Ok(entries) = std::fs::read_dir("/proc") else {
+        return Vec::new();
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else { continue };
+        let Ok(candidate) = name.parse::<u32>() else {
+            continue;
+        };
+        // Never walk to ourselves or to init, whatever `/proc` claims.
+        if candidate == pid || candidate <= 1 {
+            continue;
+        }
+        // A pid can vanish between the listing and the read; that is ordinary.
+        let Some((parent, start)) = proc_parent_and_start(candidate) else {
+            continue;
+        };
+        children.entry(parent).or_default().push((candidate, start));
+    }
+
+    let mut seen: std::collections::HashSet<u32> = std::collections::HashSet::new();
+    seen.insert(pid);
+    let mut frontier = vec![pid];
+    let mut result: Vec<(u32, u64)> = Vec::new();
+    while let Some(current) = frontier.pop() {
+        let Some(kids) = children.get(&current) else {
+            continue;
+        };
+        for (candidate, start) in kids {
+            if seen.insert(*candidate) {
+                result.push((*candidate, *start));
+                frontier.push(*candidate);
+            }
+        }
+    }
+    result
+}
+
+/// Descendants on a unix without `/proc`, via `pgrep`.
+#[cfg(all(unix, not(target_os = "linux")))]
+fn descendants_with_start(pid: u32) -> Vec<(u32, u64)> {
+    descendants_of(pid)
+        .into_iter()
+        .map(|pid| (pid, 0))
+        .collect()
+}
+
+#[cfg(not(unix))]
+fn descendants_with_start(_pid: u32) -> Vec<(u32, u64)> {
+    Vec::new()
+}
+
+#[cfg(all(unix, not(target_os = "linux")))]
+fn descendants_of(pid: u32) -> Vec<u32> {
+    let mut found: Vec<u32> = Vec::new();
+    let mut frontier = vec![pid];
+    while let Some(current) = frontier.pop() {
+        let Ok(output) = std::process::Command::new("pgrep")
+            .arg("-P")
+            .arg(current.to_string())
+            .output()
+        else {
+            break;
+        };
+        for line in String::from_utf8_lossy(&output.stdout).lines() {
+            if let Ok(child) = line.trim().parse::<u32>() {
+                if !found.contains(&child) {
+                    found.push(child);
+                    frontier.push(child);
+                }
+            }
+        }
+    }
+    found
+}
+
+#[cfg(not(unix))]
+fn descendants_of(_pid: u32) -> Vec<u32> {
+    Vec::new()
+}
+
+/// Whether the pid still identifies the process that was collected.
+#[cfg(target_os = "linux")]
+fn still_the_same_process(entry: &(u32, u64)) -> bool {
+    proc_parent_and_start(entry.0).map(|(_, start)| start) == Some(entry.1)
+}
+
+/// Without `/proc` there is nothing cheap to compare, so the collected pid is
+/// taken at face value. The window is the few microseconds between the walk and
+/// the kill.
+#[cfg(all(unix, not(target_os = "linux")))]
+fn still_the_same_process(_entry: &(u32, u64)) -> bool {
+    true
+}
+
 async fn kill_process_tree(child: &mut tokio::process::Child) {
     if let Some(pid) = child.id() {
+        // Collected first, while the parent links still exist. Once a parent dies
+        // its children reparent to init and the link identifying them is gone.
+        let escaped = descendants_with_start(pid);
+
         #[cfg(unix)]
-        // The child is the leader of the private process group created below.
+        // The child leads the private process group created at spawn.
         unsafe {
             libc::kill(-(pid as i32), libc::SIGKILL);
         }
+
+        #[cfg(unix)]
+        for descendant in escaped {
+            // Signal only a pid that is still the process we collected. A pid can
+            // exit in between and the number be reused by something unrelated, and
+            // killing that would be far worse than missing a descendant.
+            if !still_the_same_process(&descendant) {
+                continue;
+            }
+            let target = descendant.0;
+            if target <= 1 {
+                continue;
+            }
+            unsafe {
+                libc::kill(target as i32, libc::SIGKILL);
+            }
+        }
+        #[cfg(not(unix))]
+        let _ = escaped;
+
         #[cfg(windows)]
         {
             let _ = tokio::process::Command::new("taskkill")
@@ -2377,6 +2534,116 @@ mod tests {
         assert!(result.contains("timed out"));
         std::thread::sleep(std::time::Duration::from_millis(1300));
         assert!(!marker.exists(), "descendant survived the timeout");
+    }
+
+    #[test]
+    fn a_timeout_kills_a_descendant_that_left_the_process_group() {
+        // `setsid` is exactly how a process leaves the group, so a group kill
+        // cannot reach it. `nohup`, `disown` and daemonizing servers all do this,
+        // and the command reported as killed while its work ran on.
+        let dir = std::env::temp_dir().join(format!("rupi-setsid-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let marker = dir.join("descendant-survived");
+
+        let result = execute_bash(&serde_json::json!({
+            "command": format!(
+                "setsid bash -c 'sleep 2; touch {}' & sleep 5",
+                marker.display()
+            ),
+            "timeout": 1
+        }));
+        assert!(result.contains("timed out"), "{}", result);
+
+        // Long enough for the descendant to have fired had it survived.
+        std::thread::sleep(std::time::Duration::from_secs(3));
+        assert!(
+            !marker.exists(),
+            "a setsid descendant outlived the command it was told killed it"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_reused_pid_is_never_signalled() {
+        // A collected pid can exit before the kill and its number be reused. The
+        // start time is what distinguishes the process we meant from whatever now
+        // holds that number, and killing the wrong process is far worse than
+        // missing a descendant.
+        let mut child = std::process::Command::new("bash")
+            .arg("-c")
+            .arg("true")
+            .spawn()
+            .unwrap();
+        let pid = child.id();
+        let _ = child.wait();
+
+        // The process is gone, so nothing with that start time exists any more.
+        assert!(!still_the_same_process(&(pid, 1)));
+        assert!(!still_the_same_process(&(pid, u64::MAX)));
+    }
+
+    #[test]
+    fn a_live_process_matches_its_own_start_time() {
+        let mut child = std::process::Command::new("bash")
+            .arg("-c")
+            .arg("sleep 2")
+            .spawn()
+            .unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        let collected = descendants_with_start(std::process::id());
+        if let Some(entry) = collected.iter().find(|(pid, _)| *pid == child.id()) {
+            assert!(
+                still_the_same_process(entry),
+                "a live process failed its own check"
+            );
+        }
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+
+    #[test]
+    fn a_wide_process_tree_is_walked_quickly() {
+        // The walk used to rescan a flat list for every node it found, with a
+        // linear membership check inside that scan. A command spawning many
+        // workers turned a timeout into seconds of work before the kill.
+        let started = std::time::Instant::now();
+        for _ in 0..20 {
+            let _ = descendants_with_start(std::process::id());
+        }
+        let each = started.elapsed() / 20;
+        assert!(
+            each < std::time::Duration::from_millis(500),
+            "one walk took {:?}",
+            each
+        );
+    }
+
+    #[test]
+    fn the_walk_never_returns_the_seed_or_init() {
+        let found = descendants_with_start(std::process::id());
+        assert!(!found.iter().any(|(pid, _)| *pid == std::process::id()));
+        assert!(!found.iter().any(|(pid, _)| *pid <= 1));
+    }
+
+    #[test]
+    fn descendants_are_found_before_they_are_killed() {
+        // The walk has to happen while the parent links still exist. Once a parent
+        // dies its children reparent to init and become unfindable.
+        let mut child = std::process::Command::new("bash")
+            .arg("-c")
+            .arg("sleep 3 & sleep 3")
+            .spawn()
+            .unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        let found = descendants_with_start(child.id());
+        assert!(
+            !found.is_empty(),
+            "no descendant of {} was found",
+            child.id()
+        );
+        let _ = child.kill();
+        let _ = child.wait();
     }
 
     #[test]
