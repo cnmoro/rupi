@@ -190,9 +190,35 @@ struct ChunkBoundary {
     end: usize,
 }
 
+/// Deepest AST nesting this will descend into.
+///
+/// Recursion here follows the syntax tree, so nesting depth is attacker-chosen: a
+/// 30 KB file of nested brackets drove it past the 2 MiB stack of the blocking
+/// worker that runs `search_code`. A Rust stack overflow aborts the process — it is
+/// not a catchable panic — so a file placed in any indexed repository could take
+/// down the whole agent, every session in it, from a tool call that only reads code.
+///
+/// Past this depth the node is emitted whole rather than split. A chunk larger than
+/// the target is a worse search result; a dead process is a worse outcome than that.
+const MAX_AST_DEPTH: usize = 200;
+
 /// Recursively merge child nodes up to desired_length.
 /// Mirrors seemb's _merge_node_inner algorithm.
 fn merge_node_inner(node: &tree_sitter::Node, desired_length: usize) -> Vec<ChunkBoundary> {
+    merge_node_depth(node, desired_length, 0)
+}
+
+fn merge_node_depth(
+    node: &tree_sitter::Node,
+    desired_length: usize,
+    depth: usize,
+) -> Vec<ChunkBoundary> {
+    if depth >= MAX_AST_DEPTH {
+        return vec![ChunkBoundary {
+            start: node.start_byte(),
+            end: node.end_byte(),
+        }];
+    }
     if node.child_count() == 0 {
         return vec![ChunkBoundary {
             start: node.start_byte(),
@@ -215,7 +241,7 @@ fn merge_node_inner(node: &tree_sitter::Node, desired_length: usize) -> Vec<Chun
 
         // If this single chunk is too large, recurse to split it
         if length > desired_length {
-            groups.extend(merge_node_inner(child, desired_length));
+            groups.extend(merge_node_depth(child, desired_length, depth + 1));
             continue;
         }
 
@@ -809,37 +835,58 @@ mod tests {
     }
 
     #[test]
-    fn test_chunk_file_rust_ast() {
-        let content = r#"
-fn main() {
-    println!("hello");
-}
-
-fn helper() -> i32 {
-    42
-}
-
-struct Config {
-    name: String,
-}
-
-impl Config {
-    fn new(name: &str) -> Self {
-        Self { name: name.to_string() }
+    fn deep_nesting_does_not_abort_the_process() {
+        // A stack overflow in Rust aborts; it cannot be caught. A file like this in
+        // any indexed repository used to take the whole agent down from a tool call
+        // that only reads code.
+        for depth in [1_000usize, 20_000, 60_000] {
+            let content = format!("x = {}1{};\n", "(".repeat(depth), ")".repeat(depth));
+            let chunks = chunk_file("deep.js", &content, Some("javascript".to_string()));
+            assert!(!chunks.is_empty(), "depth {} produced no chunks", depth);
+        }
     }
-}
-"#;
-        let chunks = chunk_file("test.rs", content, Some("rust".into()));
-        // AST chunking should produce meaningful chunks
-        assert!(!chunks.is_empty());
-        // Should contain the function definitions
-        let all_content: String = chunks
-            .iter()
-            .map(|c| c.content.as_str())
-            .collect::<Vec<_>>()
-            .join("\n");
-        assert!(all_content.contains("fn main"));
-        assert!(all_content.contains("fn helper"));
+
+    #[test]
+    fn test_chunk_file_rust_ast() {
+        // Large enough to exceed DESIRED_CHUNK_LENGTH, so chunking really splits.
+        // A small file legitimately produces one chunk, which is why the earlier
+        // version of this test could not tell AST chunking from a line chunker.
+        let mut content = String::new();
+        for i in 0..30 {
+            content.push_str(&format!(
+                "fn function_{i}() -> i32 {{\n    // body marker {i}\n    let a = {i};\n    let b = a * 2;\n    b + {i}\n}}\n\n"
+            ));
+        }
+        let chunks = chunk_file("test.rs", &content, Some("rust".to_string()));
+
+        assert!(
+            chunks.len() >= 2,
+            "expected a split, got {} chunk(s)",
+            chunks.len()
+        );
+
+        // The property that distinguishes AST chunking from arbitrary line cuts:
+        // a function's signature and its body stay in the same chunk.
+        for i in 0..30 {
+            let signature = format!("fn function_{i}()");
+            let marker = format!("// body marker {i}");
+            let holding: Vec<usize> = chunks
+                .iter()
+                .enumerate()
+                .filter(|(_, c)| c.content.contains(&signature))
+                .map(|(index, _)| index)
+                .collect();
+            assert_eq!(
+                holding.len(),
+                1,
+                "function_{i} appears in {} chunks",
+                holding.len()
+            );
+            assert!(
+                chunks[holding[0]].content.contains(&marker),
+                "function_{i} was split from its own body"
+            );
+        }
     }
 
     #[test]

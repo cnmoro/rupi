@@ -12,6 +12,7 @@ pub mod opencode_models;
 pub mod output_parser;
 pub mod provider;
 pub mod quality;
+pub mod redact;
 pub mod rpc;
 pub mod rtk_filter;
 pub mod sessions;

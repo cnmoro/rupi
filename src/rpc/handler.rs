@@ -10,6 +10,14 @@ pub struct RpcHandler {
 }
 
 impl RpcHandler {
+    /// The session this handler drives.
+    ///
+    /// Exposed so a test can assert on state the handler changed, rather than
+    /// calling a command and asserting nothing.
+    pub fn session(&self) -> Arc<tokio::sync::RwLock<AgentSession>> {
+        self.session.clone()
+    }
+
     pub fn new(session: AgentSession) -> Self {
         RpcHandler {
             session: Arc::new(tokio::sync::RwLock::new(session)),
@@ -206,6 +214,22 @@ impl RpcHandler {
                 .await;
             }
             RpcCommand::SetLoop { id, message } => {
+                // Refuse while a generation is running. `set_loop` writes global
+                // session state that the NEXT `prompt_inner` to reach its branch
+                // check reads — which, mid-turn, is the prompt already in flight.
+                // That prompt was then driven into an endless loop of this
+                // message, never produced its own `agent_end`, and left the flag
+                // armed so the next unrelated prompt was hijacked as well.
+                if session.read().await.is_streaming().await {
+                    write_error(
+                        tx,
+                        id,
+                        "set_loop",
+                        "a generation is already running; send stop or steer first".to_string(),
+                    )
+                    .await;
+                    return;
+                }
                 let msg = message.clone();
                 session.read().await.set_loop(Some(msg.clone())).await;
                 let session2 = session.clone();
@@ -304,20 +328,29 @@ mod tests {
         RpcHandler::new(session)
     }
 
+    /// Collect the responses to one command, waiting up to five seconds for the
+    /// first one.
+    ///
+    /// The previous version raced a fixed 100ms sleep, so on a loaded machine it
+    /// returned an empty vector and every caller then panicked on `responses[0]`
+    /// with an index error rather than a readable failure.
     async fn handle_and_collect(handler: &RpcHandler, command: RpcCommand) -> Vec<RpcResponse> {
         let (tx, mut rx) = mpsc::unbounded_channel::<String>();
         handler.handle(command, tx).await;
         let mut responses = Vec::new();
-        loop {
-            tokio::select! {
-                Some(line) = rx.recv() => {
-                    if let Ok(resp) = serde_json::from_str::<RpcResponse>(line.trim()) {
-                        responses.push(resp);
-                    }
-                }
-                _ = tokio::time::sleep(std::time::Duration::from_millis(100)) => {
-                    break;
-                }
+        let deadline = std::time::Duration::from_secs(5);
+        while let Ok(Some(line)) = tokio::time::timeout(
+            if responses.is_empty() {
+                deadline
+            } else {
+                std::time::Duration::from_millis(50)
+            },
+            rx.recv(),
+        )
+        .await
+        {
+            if let Ok(resp) = serde_json::from_str::<RpcResponse>(line.trim()) {
+                responses.push(resp);
             }
         }
         responses
@@ -543,20 +576,43 @@ mod tests {
         let handler = create_test_handler();
         let (tx, _rx) = mpsc::unbounded_channel::<String>();
 
-        let steer_cmd = RpcCommand::Steer {
-            id: Some("req_1".into()),
-            message: "Steer me".into(),
-            images: None,
-        };
-        handler.handle(steer_cmd, tx.clone()).await;
+        handler
+            .handle(
+                RpcCommand::Steer {
+                    id: Some("req_1".into()),
+                    message: "Steer me".into(),
+                    images: None,
+                },
+                tx.clone(),
+            )
+            .await;
+        handler
+            .handle(
+                RpcCommand::FollowUp {
+                    id: Some("req_2".into()),
+                    message: "Follow up".into(),
+                    images: None,
+                },
+                tx,
+            )
+            .await;
 
-        let follow_cmd = RpcCommand::FollowUp {
-            id: Some("req_2".into()),
-            message: "Follow up".into(),
-            images: None,
-        };
-        handler.handle(follow_cmd, tx).await;
-
-        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        // This used to assert nothing at all, so it passed whether the messages
+        // were queued, dropped, or swallowed by a panic.
+        let session = handler.session();
+        let mut queued = Vec::new();
+        for _ in 0..50 {
+            let guard = session.read().await;
+            if guard.has_pending_steer().await || guard.has_pending_follow_up().await {
+                queued.push(true);
+                break;
+            }
+            drop(guard);
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert!(
+            !queued.is_empty(),
+            "neither the steer nor the follow-up was queued"
+        );
     }
 }

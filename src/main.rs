@@ -325,7 +325,20 @@ async fn run_interactive_mode(
             // command hides its payload in the omitted middle while the visible
             // head and tail read as harmless, and the full string is what runs. A
             // long prompt is ugly; a short one that lies is a vulnerability.
-            let shown = args.to_string();
+            // Strip control bytes. The fused-command prompt receives the raw
+            // command string, so an ESC sequence in it could erase the real line
+            // and repaint a harmless-looking one above the y/N — the human then
+            // approves something other than what they read.
+            let shown: String = args
+                .chars()
+                .map(|c| {
+                    if c == '\n' || c == '\t' || !c.is_control() {
+                        c
+                    } else {
+                        '\u{fffd}'
+                    }
+                })
+                .collect();
             let warning = if args.chars().count() > 2000 {
                 "\n  [long input — decline if you cannot review all of it]"
             } else {

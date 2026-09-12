@@ -191,10 +191,20 @@ async fn process_prompt(session: &Arc<AgentSession>, initial_input: &str) {
         }
     });
 
-    // Spawn a temporary stdin reader for steer/follow-up during streaming
+    // Spawn a temporary stdin reader for steer/follow-up during streaming.
+    //
+    // Not while a human approves each tool call. The approval prompt blocks on
+    // stdin, and this reader is already parked in its own blocking read, so it wins
+    // the keystroke every time: the answer is queued as a steer, the prompt never
+    // returns, and the tool call hangs for good. Approval mode is the stricter
+    // guarantee, so it keeps the terminal; mid-turn steering is unavailable while
+    // it is on.
     let (stdin_tx, mut stdin_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
     let streaming_stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-    spawn_streaming_reader(stdin_tx, streaming_stop.clone());
+    let approval_owns_stdin = session.requires_approval().await;
+    if !approval_owns_stdin {
+        spawn_streaming_reader(stdin_tx, streaming_stop.clone());
+    }
 
     // Event loop
     let mut got_text = false;
@@ -282,7 +292,13 @@ async fn process_prompt(session: &Arc<AgentSession>, initial_input: &str) {
                             // In full. This is the only place the fused command is
                             // shown before it runs, and a silent cut here lets a
                             // long command look complete while its tail is hidden.
-                            let _ = writeln!(stdout(), "[Tool: bash (fused) {}]", fused);
+                            // Control bytes stripped: a command carrying an ESC
+                            // sequence could otherwise repaint this line.
+                            let safe: String = fused
+                                .chars()
+                                .map(|c| if c == '\t' || !c.is_control() { c } else { '\u{fffd}' })
+                                .collect();
+                            let _ = writeln!(stdout(), "[Tool: bash (fused) {}]", safe);
                         }
                         let _ = stdout().flush();
                     }

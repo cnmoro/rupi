@@ -206,14 +206,29 @@ fn edit_tool() -> ToolDef {
 fn grep_tool() -> ToolDef {
     ToolDef {
         name: "grep",
-        description: "Search file contents using a regular expression. Supports case-insensitive search and glob file patterns. Use this to find where functions are defined, search for specific patterns, or locate code references.",
+        description: "Search file contents with a regular expression. Start broad with output_mode \"files_with_matches\" to see WHERE the matches are, then search again narrowly, or read the file. A content search that returns hundreds of lines is a question that was too broad: narrow the pattern, the path, or the include glob instead of asking for everything.",
         parameters: serde_json::json!({
             "type": "object",
             "properties": {
                 "pattern": { "type": "string", "description": "The regex pattern to search for" },
                 "include": { "type": "string", "description": "Glob pattern for files to include (e.g. '*.rs', '*.{ts,js}')", "default": "" },
-                "path": { "type": "string", "description": "Directory to search in (default: current directory)", "default": "." },
-                "ignore_case": { "type": "boolean", "description": "Case-insensitive search", "default": false }
+                "path": { "type": "string", "description": "Directory or file to search in (default: current directory)", "default": "." },
+                "ignore_case": { "type": "boolean", "description": "Case-insensitive search", "default": false },
+                "output_mode": {
+                    "type": "string",
+                    "enum": ["content", "files_with_matches", "count"],
+                    "description": "content: matching lines with line numbers. files_with_matches: just the file paths, much cheaper for a broad search. count: matches per file.",
+                    "default": "content"
+                },
+                "head_limit": {
+                    "type": "number",
+                    "description": format!("Return at most this many lines (default {}). Raise it only after a narrower search has proved the matches are all wanted.", GREP_DEFAULT_HEAD)
+                },
+                "context": {
+                    "type": "number",
+                    "description": "Lines of context around each match, like grep -C. Only applies to output_mode \"content\".",
+                    "default": 0
+                }
             },
             "required": ["pattern"]
         }),
@@ -1108,6 +1123,17 @@ No edits were applied."
 }
 
 // ---- grep ----
+/// Lines a content search returns unless the model asks for more.
+///
+/// A limit the model can raise beats a cap it cannot see. The old grep took no
+/// limit at all, returned everything, cut the result at 10000 bytes, and then had
+/// the storage cap cut it again at 4000 — so the model could neither ask for less
+/// nor reach what was removed.
+const GREP_DEFAULT_HEAD: usize = 100;
+
+/// Upper bound on what a single search can return, whatever it asks for.
+const GREP_MAX_HEAD: usize = 2000;
+
 fn execute_grep(args: &Value) -> String {
     let pattern = match get_arg(args, "pattern") {
         Some(p) => p,
@@ -1116,10 +1142,35 @@ fn execute_grep(args: &Value) -> String {
     let include = get_arg(args, "include").unwrap_or("");
     let search_path = get_arg(args, "path").unwrap_or(".");
     let ignore_case = get_arg_bool(args, "ignore_case", false);
+    let mode = get_arg(args, "output_mode").unwrap_or("content");
+    if !matches!(mode, "content" | "files_with_matches" | "count") {
+        return format!(
+            "Error: output_mode {:?} is not one of content, files_with_matches, count.",
+            mode
+        );
+    }
+    let head = get_arg_i64(args, "head_limit")
+        .filter(|n| *n > 0)
+        .map(|n| (n as usize).min(GREP_MAX_HEAD))
+        .unwrap_or(GREP_DEFAULT_HEAD);
+    let context = get_arg_i64(args, "context").unwrap_or(0).clamp(0, 20) as usize;
 
-    // Build rg (ripgrep) command
     let mut cmd = std::process::Command::new("rg");
-    cmd.arg("--line-number").arg("--color").arg("never");
+    cmd.arg("--color").arg("never");
+    match mode {
+        "files_with_matches" => {
+            cmd.arg("--files-with-matches");
+        }
+        "count" => {
+            cmd.arg("--count");
+        }
+        _ => {
+            cmd.arg("--line-number");
+            if context > 0 {
+                cmd.arg("--context").arg(context.to_string());
+            }
+        }
+    }
     if !include.is_empty() {
         cmd.arg("--glob").arg(include);
     }
@@ -1131,27 +1182,32 @@ fn execute_grep(args: &Value) -> String {
 
     match cmd.output() {
         Ok(output) => {
-            let mut result = String::new();
-            if !output.stdout.is_empty() {
-                result.push_str(&String::from_utf8_lossy(&output.stdout));
-            }
-            if !output.stderr.is_empty() && result.is_empty() {
-                result.push_str(&String::from_utf8_lossy(&output.stderr));
-            }
-            if result.is_empty() {
-                result = "No matches found.".to_string();
-            }
-            // Truncate long output
-            if result.len() > 10000 {
-                result.truncate(10000);
-                result.push_str("\n... [output truncated]");
-            }
-            result
+            let text = if !output.stdout.is_empty() {
+                String::from_utf8_lossy(&output.stdout).to_string()
+            } else if !output.stderr.is_empty() {
+                String::from_utf8_lossy(&output.stderr).to_string()
+            } else {
+                String::new()
+            };
+            grep_result(&text, head, mode)
         }
         Err(e) => {
-            // Fallback to grep if rg is not available
+            // Fall back to grep when ripgrep is absent.
             let mut cmd = std::process::Command::new("grep");
-            cmd.arg("-rn");
+            match mode {
+                "files_with_matches" => {
+                    cmd.arg("-rl");
+                }
+                "count" => {
+                    cmd.arg("-rc");
+                }
+                _ => {
+                    cmd.arg("-rn");
+                    if context > 0 {
+                        cmd.arg(format!("-C{}", context));
+                    }
+                }
+            }
             if ignore_case {
                 cmd.arg("-i");
             }
@@ -1163,23 +1219,43 @@ fn execute_grep(args: &Value) -> String {
 
             match cmd.output() {
                 Ok(o) => {
-                    let mut r = String::new();
-                    if !o.stdout.is_empty() {
-                        r.push_str(&String::from_utf8_lossy(&o.stdout));
-                    }
-                    if r.is_empty() {
-                        r = "No matches found.".to_string();
-                    }
-                    if r.len() > 10000 {
-                        r.truncate(10000);
-                        r.push_str("\n... [output truncated]");
-                    }
-                    r
+                    let text = String::from_utf8_lossy(&o.stdout).to_string();
+                    grep_result(&text, head, mode)
                 }
                 Err(e2) => format!("Error running grep: {} (rg also unavailable: {})", e2, e),
             }
         }
     }
+}
+
+/// Trim a search result to `head` lines and say what was left out.
+///
+/// Counting lines rather than bytes is what makes the limit something the model can
+/// reason about. The previous byte truncation also used `String::truncate`, which
+/// panics when the cut lands inside a multi-byte character — so a search over any
+/// file with non-ASCII content could take down the tool call.
+fn grep_result(text: &str, head: usize, mode: &str) -> String {
+    let trimmed = text.trim_end_matches('\n');
+    if trimmed.is_empty() {
+        return "No matches found.".to_string();
+    }
+    let total = trimmed.lines().count();
+    if total <= head {
+        return trimmed.to_string();
+    }
+    let kept: Vec<&str> = trimmed.lines().take(head).collect();
+    let advice = if mode == "content" {
+        " Narrow the pattern or the path, use output_mode \"files_with_matches\", or raise head_limit."
+    } else {
+        " Narrow the pattern or the path, or raise head_limit."
+    };
+    format!(
+        "{}\n... [{} of {} lines shown.{}]",
+        kept.join("\n"),
+        head,
+        total,
+        advice
+    )
 }
 
 // ---- find ----
@@ -1471,6 +1547,124 @@ the current <goal_round> block."
     match result {
         Ok(message) => message,
         Err(message) => message,
+    }
+}
+
+#[cfg(test)]
+mod grep_tests {
+    use super::*;
+
+    fn scratch(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("rupi-grep-{}-{}", name, std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn multibyte_output_does_not_panic() {
+        // `String::truncate` panics when the cut is not on a character boundary, so
+        // the old byte-based limit crashed on any search over non-ASCII content.
+        let body: String = (0..4000)
+            .map(|i| format!("行 {} のマッチ target\n", i))
+            .collect();
+        let out = grep_result(&body, 100, "content");
+        assert!(out.contains("行"), "{}", &out[..60]);
+        assert!(out.contains("of 4000 lines shown"), "{}", out);
+    }
+
+    #[test]
+    fn the_limit_counts_lines_and_says_what_was_left_out() {
+        let body: String = (0..500)
+            .map(|i| format!("src/f.rs:{}:match\n", i))
+            .collect();
+        let out = grep_result(&body, 10, "content");
+        assert_eq!(out.lines().count(), 11, "10 results plus one notice");
+        assert!(out.contains("10 of 500 lines shown"), "{}", out);
+        assert!(
+            out.contains("files_with_matches"),
+            "the notice must name the cheaper mode"
+        );
+    }
+
+    #[test]
+    fn a_result_within_the_limit_is_untouched() {
+        let body = "src/a.rs:1:hit\nsrc/b.rs:2:hit\n";
+        assert_eq!(
+            grep_result(body, 100, "content"),
+            "src/a.rs:1:hit\nsrc/b.rs:2:hit"
+        );
+    }
+
+    #[test]
+    fn an_empty_result_says_so() {
+        assert_eq!(grep_result("", 100, "content"), "No matches found.");
+        assert_eq!(grep_result("\n\n", 100, "content"), "No matches found.");
+    }
+
+    #[test]
+    fn output_mode_is_validated() {
+        let out = execute_grep(&serde_json::json!({"pattern": "x", "output_mode": "everything"}));
+        assert!(out.starts_with("Error: output_mode"), "{}", out);
+    }
+
+    #[test]
+    fn files_with_matches_returns_paths_not_content() {
+        let dir = scratch("modes");
+        std::fs::write(dir.join("a.rs"), "fn unique_marker_alpha() {}\n").unwrap();
+        std::fs::write(dir.join("b.rs"), "fn unique_marker_alpha() {}\n").unwrap();
+
+        let paths = execute_grep(&serde_json::json!({
+            "pattern": "unique_marker_alpha",
+            "path": dir.display().to_string(),
+            "output_mode": "files_with_matches"
+        }));
+        assert!(paths.contains("a.rs"), "{}", paths);
+        assert!(!paths.contains("fn unique_marker_alpha() {}"), "{}", paths);
+
+        let content = execute_grep(&serde_json::json!({
+            "pattern": "unique_marker_alpha",
+            "path": dir.display().to_string()
+        }));
+        assert!(content.contains("fn unique_marker_alpha"), "{}", content);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn head_limit_is_bounded_and_positive() {
+        let dir = scratch("head");
+        let body: String = (0..300).map(|i| format!("line {} needle\n", i)).collect();
+        std::fs::write(dir.join("a.txt"), body).unwrap();
+
+        let two = execute_grep(&serde_json::json!({
+            "pattern": "needle", "path": dir.display().to_string(), "head_limit": 2
+        }));
+        assert_eq!(two.lines().count(), 3, "{}", two);
+
+        // A nonsense limit falls back to the default rather than returning nothing.
+        for bad in [serde_json::json!(0), serde_json::json!(-5)] {
+            let out = execute_grep(&serde_json::json!({
+                "pattern": "needle", "path": dir.display().to_string(), "head_limit": bad
+            }));
+            assert!(
+                out.lines().count() > 2,
+                "limit {:?} returned {}",
+                bad,
+                out.lines().count()
+            );
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_schema_offers_the_limits() {
+        let grep = all_tools().into_iter().find(|t| t.name == "grep").unwrap();
+        let props = &grep.parameters["properties"];
+        assert!(!props["output_mode"].is_null());
+        assert!(!props["head_limit"].is_null());
+        assert!(!props["context"].is_null());
+        // Only `pattern` stays required, so an existing caller is unaffected.
+        assert_eq!(grep.parameters["required"].as_array().unwrap().len(), 1);
     }
 }
 

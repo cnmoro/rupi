@@ -81,9 +81,11 @@ mod tests {
 
     #[test]
     fn test_empty_command() {
-        let result = resolve_api_key("!");
-        // The command is just "!", which might fail, fallback to original
-        assert!(!result.is_empty());
+        // `!` with nothing after it runs an empty command, which produces no
+        // output, so the original string is returned unchanged. Asserting only
+        // that the result is non-empty could not fail: every branch of
+        // `resolve_api_key` returns something non-empty for this input.
+        assert_eq!(resolve_api_key("!"), "!");
     }
 
     #[test]

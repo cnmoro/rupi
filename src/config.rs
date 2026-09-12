@@ -18,13 +18,23 @@ pub struct RupiConfig {
 impl RupiConfig {
     pub fn load() -> Result<Self, String> {
         let path = config_path().ok_or_else(|| "Could not determine home directory".to_string())?;
+        Self::load_from(&path)
+    }
+
+    /// Load and validate the config at an explicit path.
+    ///
+    /// Split out from `load` so the real resolution, parsing, and validation can be
+    /// tested. Previously the only test hand-rolled a `serde_json::from_str` and
+    /// never called this code at all, so every error message and every validation
+    /// rule here was uncovered.
+    pub fn load_from(path: &std::path::Path) -> Result<Self, String> {
         if !path.exists() {
             return Err(format!(
                 "Config file not found at {}. Create it with:\n{{\n  \"base_url\": \"...\",\n  \"api_key\": \"...\",\n  \"model_tag\": \"...\"\n}}",
                 path.display()
             ));
         }
-        let contents = std::fs::read_to_string(&path)
+        let contents = std::fs::read_to_string(path)
             .map_err(|e| format!("Failed to read {}: {}", path.display(), e))?;
         let config: RupiConfig = serde_json::from_str(&contents)
             .map_err(|e| format!("Failed to parse {}: {}", path.display(), e))?;
@@ -89,7 +99,6 @@ pub fn skills_dir() -> Option<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::fs;
 
     #[test]
     fn test_config_path() {
@@ -107,24 +116,88 @@ mod tests {
         assert!(p.ends_with(".config/rupi/skills"));
     }
 
-    #[test]
-    fn test_load_valid_config() {
-        let dir = std::env::temp_dir().join(format!("rupi-test-{}", std::process::id()));
-        fs::create_dir_all(&dir).unwrap();
-        let config_path = dir.join("rupi.json");
-        fs::write(
-            &config_path,
-            r#"{"base_url":"https://api.example.com","api_key":"sk-test","model_tag":"gpt-4"}"#,
-        )
-        .unwrap();
+    fn scratch_config(name: &str, body: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("rupi-config-{}-{}", name, std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("rupi.json");
+        std::fs::write(&path, body).unwrap();
+        path
+    }
 
-        // Temporarily redirect config_path to our test file
-        let contents = fs::read_to_string(&config_path).unwrap();
-        let config: RupiConfig = serde_json::from_str(&contents).unwrap();
-        assert_eq!(config.base_url.as_deref(), Some("https://api.example.com"));
+    #[test]
+    fn load_from_accepts_a_complete_config() {
+        let path = scratch_config(
+            "valid",
+            r#"{"base_url":"https://api.test/v1","api_key":"sk-test","model_tag":"m"}"#,
+        );
+        let config = RupiConfig::load_from(&path).unwrap();
+        assert_eq!(config.base_url.as_deref(), Some("https://api.test/v1"));
         assert_eq!(config.api_key.as_deref(), Some("sk-test"));
-        assert_eq!(config.model_tag.as_deref(), Some("gpt-4"));
-        fs::remove_dir_all(&dir).unwrap();
+        assert_eq!(config.model_tag.as_deref(), Some("m"));
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn load_from_reports_a_missing_file_with_a_usable_message() {
+        let missing = std::env::temp_dir().join("rupi-config-does-not-exist.json");
+        let _ = std::fs::remove_file(&missing);
+        let error = RupiConfig::load_from(&missing).unwrap_err();
+        assert!(error.contains("Config file not found"), "{}", error);
+        // The message has to show the user what to write, not just complain.
+        assert!(error.contains("base_url"), "{}", error);
+        assert!(error.contains("api_key"), "{}", error);
+        assert!(error.contains("model_tag"), "{}", error);
+    }
+
+    #[test]
+    fn load_from_rejects_malformed_json() {
+        let path = scratch_config("malformed", "{not json");
+        let error = RupiConfig::load_from(&path).unwrap_err();
+        assert!(error.contains("Failed to parse"), "{}", error);
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn load_from_validates_every_required_field() {
+        let cases = [
+            (
+                r#"{"base_url":"","api_key":"k","model_tag":"m"}"#,
+                "base_url",
+            ),
+            (r#"{"api_key":"k","model_tag":"m"}"#, "base_url"),
+            (
+                r#"{"base_url":"u","api_key":"","model_tag":"m"}"#,
+                "api_key",
+            ),
+            (r#"{"base_url":"u","model_tag":"m"}"#, "api_key"),
+            (
+                r#"{"base_url":"u","api_key":"k","model_tag":""}"#,
+                "model_tag",
+            ),
+            (r#"{"base_url":"u","api_key":"k"}"#, "model_tag"),
+        ];
+        for (body, expected) in cases {
+            let path = scratch_config("invalid", body);
+            let error = RupiConfig::load_from(&path).unwrap_err();
+            assert!(
+                error.contains(expected),
+                "{} did not report {}: {}",
+                body,
+                expected,
+                error
+            );
+            let _ = std::fs::remove_dir_all(path.parent().unwrap());
+        }
+    }
+
+    #[test]
+    fn an_opencode_key_bypasses_the_standard_fields() {
+        let path = scratch_config("opencode", r#"{"opencode_api_key":"oc-test"}"#);
+        let config = RupiConfig::load_from(&path).unwrap();
+        assert_eq!(config.opencode_api_key.as_deref(), Some("oc-test"));
+        assert!(config.base_url.is_none());
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
     }
 
     #[test]

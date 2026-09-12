@@ -235,7 +235,7 @@ Available tools:
 - write: Create a NEW file. REFUSES if the file already exists — use edit to modify existing files instead. Creates parent directories if needed.
 - edit: Replace exact text in a file. Supports batch edits via the edits array. Each old_text is matched against the ORIGINAL file content (not after other edits). Edits must not overlap. Prefer this over write for any change to an existing file.
 - edit and write both accept an optional then_run: {{\"command\": \"...\"}}. It runs that command in the SAME call, right after the change lands. Use it whenever you already know what you would run next to check the change — the tests, a build, a linter, a restart. It is skipped if the change fails, and a non-zero exit is reported without undoing the change.
-- grep: Search file contents for patterns (uses ripgrep, respects .gitignore, falls back to grep).
+- grep: Search file contents for patterns (uses ripgrep, respects .gitignore, falls back to grep). Takes output_mode, head_limit and context — start with output_mode \"files_with_matches\" for a broad search, then narrow.
 - find: Find files by glob pattern (uses fd, respects .gitignore, falls back to find).
 - ls: List directory contents.
 - search_code: Search code using natural language queries. Uses a local AI model (Model2Vec with potion-code-16M) to find relevant code by what it does, not just by keyword matching. Describe what you are looking for in plain English. Falls back to keyword search if the model is unavailable.
@@ -250,6 +250,7 @@ Guidelines:
 - If you don't have enough information to complete a task, use bash, read, grep, or find to get the necessary context
 - For work of more than a few steps, plan it with todo_write first and keep the list current as you go
 - Fuse the check into the change: pass then_run on edit or write instead of spending a separate turn on the command that verifies it
+- Ask narrow questions of the tools. A whole-repository `git diff` runs to tens of thousands of characters and is truncated before you see it: run `git diff --stat` first, then diff the specific paths. The same applies to grep — find the files first, then read what matters
 - A message inside <active-task> tags re-states the request that started this session. It is context, not a new instruction — do not restart finished work when you see it
 - A message inside <compacted-summary> tags is a checkpoint of earlier context. Treat it as established background and continue from the messages after it",
         time_str
@@ -737,9 +738,19 @@ recoverable. Re-run the command if you need it.]",
         // changing either history or its transcript destination.
         let _lifecycle = self.lifecycle.write().await;
         // Wait for any in-progress compaction to finish
+        let waited_from = std::time::Instant::now();
         loop {
             let c = *self.is_compacting.lock().await;
             if !c {
+                break;
+            }
+            // Bounded. `is_compacting` is cleared by hand at each exit of
+            // `compact`, so a panic in between leaves it set for the life of the
+            // process, and an unbounded poll here turns that into a reset that
+            // never returns. Force it instead, and say so.
+            if waited_from.elapsed() > std::time::Duration::from_secs(30) {
+                eprintln!("rupi: compaction did not finish within 30s; resetting anyway");
+                *self.is_compacting.lock().await = false;
                 break;
             }
             tokio::time::sleep(std::time::Duration::from_millis(50)).await;
@@ -1142,8 +1153,12 @@ recoverable. Re-run the command if you need it.]",
             let drained = self.drain_pending().await;
             if !drained.is_empty() {
                 eprintln!("rupi: processing {} queued message(s)", drained.len());
-                // Add drained messages to the in-memory conversation and persist
                 for msg in &drained {
+                    // Persist as well as push. The comment here claimed this
+                    // happened for a long time while it did not, so a steer
+                    // delivered mid-turn never reached the transcript and was gone
+                    // on resume.
+                    self.persist_message(msg).await;
                     self.messages.write().await.push(msg.clone());
                 }
             }
@@ -2082,6 +2097,15 @@ Has the assistant's output satisfied this exact condition? Reply with only YES o
     /// Called with (tool_name, args_json) before execution. Return true to allow.
     pub async fn set_approval_fn(&self, f: Option<ApprovalFn>) {
         *self.approval_fn.write().await = f;
+    }
+
+    /// Whether a human approves each tool call.
+    ///
+    /// Interactive mode consults this before it starts reading stdin for steering:
+    /// the approval prompt reads stdin too, and two readers on one terminal means
+    /// the prompt never receives the answer.
+    pub async fn requires_approval(&self) -> bool {
+        self.approval_fn.read().await.is_some()
     }
 
     pub fn provider_model_info(&self) -> ModelInfo {

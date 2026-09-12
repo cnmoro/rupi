@@ -1705,3 +1705,196 @@ async fn an_alternating_pattern_is_not_a_repeat() {
         "an alternating pattern must not raise a repeat alarm"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Properties that had no test at all
+// ---------------------------------------------------------------------------
+
+/// Run a prompt and return every event it produced.
+async fn run_prompt_collecting(session: &AgentSession, prompt: &str) -> Vec<AgentEvent> {
+    let (tx, mut rx) = mpsc::unbounded_channel::<AgentEvent>();
+    let collector = tokio::spawn(async move {
+        let mut seen = Vec::new();
+        while let Some(event) = rx.recv().await {
+            seen.push(event);
+        }
+        seen
+    });
+    let _ = session.prompt(prompt, tx).await;
+    collector.await.unwrap_or_default()
+}
+
+fn count_agent_end(events: &[AgentEvent]) -> usize {
+    events
+        .iter()
+        .filter(|e| matches!(e, AgentEvent::AgentEnd { .. }))
+        .count()
+}
+
+#[tokio::test]
+async fn every_prompt_emits_exactly_one_agent_end() {
+    // An embedder waits on `agent_end` to know a turn finished. Zero hangs it
+    // forever; two makes it finalize twice. Every existing test only checked that
+    // at least one arrived, so both failures would have passed.
+    let cases: Vec<(&str, Vec<Turn>)> = vec![
+        ("plain text", vec![Turn::Text("done")]),
+        (
+            "one tool call",
+            vec![Turn::ToolCall { output_bytes: 20 }, Turn::Text("done")],
+        ),
+        (
+            "several tool calls",
+            (0..4)
+                .map(|_| Turn::ToolCall { output_bytes: 20 })
+                .chain(std::iter::once(Turn::Text("done")))
+                .collect(),
+        ),
+        ("a failing fused command", vec![Turn::Text("done")]),
+    ];
+
+    for (label, script) in cases {
+        let provider = Arc::new(MockProvider::new(script, "NO"));
+        let session = session_with_window(provider, 400_000);
+        session.set_auto_compaction_enabled(false).await;
+        let events = run_prompt_collecting(&session, ORIGINAL_REQUEST).await;
+        assert_eq!(
+            count_agent_end(&events),
+            1,
+            "{}: wrong agent_end count",
+            label
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_compacting_turn_still_emits_exactly_one_agent_end() {
+    let provider = Arc::new(MockProvider::new(
+        vec![
+            Turn::ToolCall { output_bytes: 6000 },
+            Turn::ToolCall { output_bytes: 6000 },
+            Turn::Text("done"),
+        ],
+        &valid_summary("work"),
+    ));
+    let session = session_with(provider.clone());
+    let events = run_prompt_collecting(&session, ORIGINAL_REQUEST).await;
+    assert!(
+        !provider.aligned_requests().is_empty(),
+        "this run must compact"
+    );
+    assert_eq!(count_agent_end(&events), 1);
+}
+
+#[tokio::test]
+async fn a_goal_run_emits_exactly_one_agent_end() {
+    // Goal mode suppresses the per-round agent_end events and forwards one at the
+    // end. That held/forwarded logic is exactly where a count can go wrong.
+    let provider = Arc::new(MockProvider::new(
+        (0..12).map(|_| Turn::Text("still working")).collect(),
+        "NO",
+    ));
+    let session = session_with_window(provider, 400_000);
+    session.set_auto_compaction_enabled(false).await;
+    session
+        .set_goal(Some("make the tests pass".to_string()))
+        .await;
+
+    let events = run_prompt_collecting(&session, ORIGINAL_REQUEST).await;
+    assert_eq!(
+        count_agent_end(&events),
+        1,
+        "goal mode emitted the wrong count"
+    );
+}
+
+#[tokio::test]
+async fn concurrent_tool_calls_are_bounded() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::{Duration, Instant};
+
+    // Nothing protected the four-permit semaphore. Deleting it, or raising the
+    // limit, would not have turned any test red.
+    let live = Arc::new(AtomicUsize::new(0));
+    let peak = Arc::new(AtomicUsize::new(0));
+
+    let mut handles = Vec::new();
+    for _ in 0..10 {
+        let live = Arc::clone(&live);
+        let peak = Arc::clone(&peak);
+        handles.push(tokio::spawn(async move {
+            let call = ToolCall {
+                id: "c".into(),
+                name: "bash".into(),
+                arguments: serde_json::json!({"command": "sleep 1"}),
+                raw_arguments: None,
+            };
+            let context = rupi::tools::ToolContext::new();
+            let started = Instant::now();
+            let now = live.fetch_add(1, Ordering::SeqCst) + 1;
+            peak.fetch_max(now, Ordering::SeqCst);
+            let _ = rupi::tools::execute_tool_async(call, context, None).await;
+            live.fetch_sub(1, Ordering::SeqCst);
+            started.elapsed()
+        }));
+    }
+
+    let mut elapsed = Vec::new();
+    for handle in handles {
+        elapsed.push(handle.await.unwrap());
+    }
+
+    // Ten one-second commands through four slots cannot all finish in one second.
+    let longest = elapsed.iter().max().unwrap();
+    assert!(
+        *longest > Duration::from_millis(1800),
+        "ten 1s tools finished in {:?}; the concurrency limit is not applied",
+        longest
+    );
+}
+
+#[tokio::test]
+async fn cancelling_a_tool_kills_its_descendants() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::time::Duration;
+
+    // The timeout path has a descendant-kill test. The cancellation path reaches
+    // `kill_process_tree` through a different `select!` arm, and had none — so
+    // removing that call would have left a process tree alive with nothing red.
+    let dir = std::env::temp_dir().join(format!("rupi-cancel-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let marker = dir.join("descendant-survived");
+
+    let cancelled = Arc::new(AtomicBool::new(false));
+    let context = rupi::tools::ToolContext {
+        cancelled: Arc::clone(&cancelled),
+        ..rupi::tools::ToolContext::new()
+    };
+    let call = ToolCall {
+        id: "c".into(),
+        name: "bash".into(),
+        arguments: serde_json::json!({
+            "command": format!("(sleep 2; touch {}) & sleep 5", marker.display())
+        }),
+        raw_arguments: None,
+    };
+
+    let task = tokio::spawn(rupi::tools::execute_tool_async(call, context, None));
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    cancelled.store(true, Ordering::SeqCst);
+
+    let result = tokio::time::timeout(Duration::from_secs(10), task)
+        .await
+        .expect("cancellation must not hang")
+        .unwrap();
+    assert!(result.contains("cancelled"), "{}", result);
+
+    // Long enough for the backgrounded child to have fired if it survived.
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    assert!(
+        !marker.exists(),
+        "a descendant outlived the cancelled command"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}

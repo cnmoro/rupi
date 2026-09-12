@@ -20,10 +20,55 @@ pub fn filter_output(command: &str, output: &str) -> String {
         None
     };
 
-    match filtered {
+    let result = match filtered {
         Some(f) => f,
         None => filter_generic(output),
+    };
+
+    // Fail open. Compression exists to drop noise, and it is only ever correct
+    // while it keeps the signal. Every reviewed filter had at least one case where
+    // a failure was compressed into something that reads as success: a porcelain
+    // `git status` with real changes rendered as "working tree clean", a `git diff`
+    // whose `fatal:` became "[diff filtered]", a merge conflict shown as an
+    // ordinary edit. Rather than trust each filter to enumerate every failure it
+    // might meet, check afterwards: if the input carried a failure marker and the
+    // output no longer does, the compression is wrong and the original stands.
+    if drops_failure_signal(output, &result) {
+        return output.to_string();
     }
+    result
+}
+
+/// Markers that mean the command did not do what was asked.
+///
+/// Matched case-insensitively against whole output. Anything here that survives
+/// into the filtered text is fine; anything that disappears means the filter turned
+/// a failure into a success.
+const FAILURE_MARKERS: [&str; 14] = [
+    "fatal:",
+    "error:",
+    "error[",
+    "panicked",
+    "test result: FAILED",
+    "failures:",
+    "unmerged",
+    "both modified",
+    "conflict",
+    "[rejected]",
+    "permission denied",
+    "no such file",
+    "command not found",
+    "traceback",
+];
+
+/// Whether compression removed a failure the original reported.
+fn drops_failure_signal(original: &str, filtered: &str) -> bool {
+    let original_lower = original.to_lowercase();
+    let filtered_lower = filtered.to_lowercase();
+    FAILURE_MARKERS.iter().any(|marker| {
+        let marker = marker.to_lowercase();
+        original_lower.contains(&marker) && !filtered_lower.contains(&marker)
+    })
 }
 
 // ── Git filters ──────────────────────────────────────────────────────────
@@ -36,6 +81,12 @@ fn filter_git(cmd: &str, output: &str) -> Option<String> {
 
     // git status
     if rest == "status" || rest.starts_with("status ") {
+        // `--porcelain`/`-s` is a different, already-compact grammar. Running it
+        // through the long-format reader found none of the markers it looks for
+        // and reported a repository full of changes as a clean working tree.
+        if rest.contains("--porcelain") || rest.contains(" -s") || rest.ends_with(" -s") {
+            return Some(output.to_string());
+        }
         return Some(filter_git_status(output));
     }
 
@@ -140,7 +191,7 @@ fn filter_git_status(output: &str) -> String {
             continue;
         }
         // Untracked files
-        if trimmed.starts_with("\t") || trimmed.starts_with("        ") {
+        if line.starts_with('\t') || line.starts_with("    ") {
             let file = trimmed.trim().to_string();
             if !file.is_empty() && !changes.iter().any(|c| c.contains(&file)) {
                 changes.push(format!("?? {}", file));
@@ -319,7 +370,12 @@ fn filter_git_commit(output: &str) -> String {
                 if let Some(hash_start) = bracket.rfind(' ') {
                     let hash = bracket[hash_start + 1..].trim();
                     if hash.len() >= 7 {
-                        return format!("ok {} [savings: ~95%]", &hash[..7.min(hash.len())]);
+                        // Take characters, not bytes. A commit hook that prints a
+                        // `[branch token]` line containing non-ASCII made this slice
+                        // land inside a character and panic, which takes down the
+                        // tool call from a crafted repository.
+                        let short: String = hash.chars().take(7).collect();
+                        return format!("ok {}", short);
                     }
                 }
             }
@@ -340,7 +396,7 @@ fn filter_git_push_pull(output: &str) -> String {
         if line.contains("->") && line.contains("refs/") {
             let parts: Vec<&str> = line.split_whitespace().collect();
             if let Some(last) = parts.last() {
-                return format!("ok {} [savings: ~90%]", last);
+                return format!("ok {}", last);
             }
         }
         if line.contains("Already up to date") || line.contains("Everything up-to-date") {
@@ -921,23 +977,62 @@ fn filter_generic(output: &str) -> String {
 }
 
 /// Strip ANSI escape codes from text.
+/// Remove ANSI escape sequences.
+///
+/// An escape ends at the first byte in `@`..`~`, which is what the standard says.
+/// The previous version recognized only `m`, `H`, `J` and `K`, so any other real
+/// terminator — cursor movement, mode set, anything a progress bar emits — left it
+/// stuck consuming, and the whole rest of the line was deleted. That path is the
+/// generic filter, which handles every command without a specific rule, so a single
+/// odd escape could erase an error message from npm, pytest, docker, or make.
 fn strip_ansi(s: &str) -> String {
     let mut result = String::with_capacity(s.len());
-    let mut in_escape = false;
-    for c in s.chars() {
-        if in_escape {
-            if c == 'm' || c == 'H' || c == 'J' || c == 'K' || (c as u8) < 0x20 {
-                in_escape = false;
-                if c == 'm' {
-                    continue;
-                }
-            }
+    let mut chars = s.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c != '\x1b' {
+            result.push(c);
             continue;
         }
-        if c == '\x1b' {
-            in_escape = true;
-        } else {
-            result.push(c);
+        match chars.peek() {
+            // CSI: parameters and intermediates, then a final byte in 0x40..=0x7E.
+            // The opening `[` is itself in that range, so it must be consumed
+            // before the search for the final byte begins.
+            Some('[') => {
+                chars.next();
+                for next in chars.by_ref() {
+                    if ('\u{40}'..='\u{7e}').contains(&next) {
+                        break;
+                    }
+                    // A control character means the sequence was cut short. Keep it
+                    // rather than swallowing the rest of the line.
+                    if (next as u32) < 0x20 {
+                        result.push(next);
+                        break;
+                    }
+                }
+            }
+            // OSC: runs until BEL or a string terminator.
+            Some(']') => {
+                chars.next();
+                while let Some(next) = chars.next() {
+                    if next == '\u{7}' {
+                        break;
+                    }
+                    if next == '\x1b' {
+                        chars.next();
+                        break;
+                    }
+                    if (next as u32) < 0x20 {
+                        result.push(next);
+                        break;
+                    }
+                }
+            }
+            // Any other escape is two characters.
+            Some(_) => {
+                chars.next();
+            }
+            None => {}
         }
     }
     result
@@ -945,6 +1040,114 @@ fn strip_ansi(s: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_porcelain_status_with_changes_is_never_called_clean() {
+        // The long form is recognized; the porcelain form was not, so a repository
+        // with real changes was reported as a clean working tree.
+        let out = filter_output("git status --porcelain", " M a.txt\n?? new_file.txt\n");
+        assert!(!out.contains("working tree clean"), "{}", out);
+        assert!(out.contains("a.txt"), "{}", out);
+        assert!(out.contains("new_file.txt"), "{}", out);
+    }
+
+    #[test]
+    fn a_failing_git_diff_keeps_its_error() {
+        // This became "[diff filtered: context lines stripped]" — the fatal was
+        // gone and the message implied a successful, empty diff.
+        let out = filter_output(
+            "git diff nonexistent-branch",
+            "fatal: bad revision 'nonexistent-branch'\n",
+        );
+        assert!(out.contains("fatal:"), "{}", out);
+    }
+
+    #[test]
+    fn a_merge_conflict_is_never_compressed_away() {
+        let raw =
+            "On branch main\nYou have unmerged paths.\nUnmerged paths:\n\tboth modified:   f.txt\n";
+        let out = filter_output("git status", raw);
+        assert!(
+            out.to_lowercase().contains("both modified") || out.to_lowercase().contains("unmerged"),
+            "a conflict was compressed into an ordinary edit: {}",
+            out
+        );
+    }
+
+    #[test]
+    fn untracked_files_survive_a_status_filter() {
+        let raw = "On branch main\nUntracked files:\n  (use \"git add\")\n\tnew_file.txt\n";
+        let out = filter_output("git status", raw);
+        assert!(
+            out.contains("new_file.txt"),
+            "an untracked file vanished: {}",
+            out
+        );
+    }
+
+    #[test]
+    fn a_failing_test_run_keeps_every_failure_name() {
+        let mut raw = String::from("running 12 tests\n");
+        for i in 0..12 {
+            raw.push_str(&format!("test test_fail_{} ... FAILED\n", i));
+        }
+        raw.push_str("\nfailures:\n");
+        for i in 0..12 {
+            raw.push_str(&format!("    test_fail_{}\n", i));
+        }
+        raw.push_str("\ntest result: FAILED. 0 passed; 12 failed\n");
+        let out = filter_output("cargo test", &raw);
+        assert!(
+            out.contains("test_fail_11"),
+            "a failing test name was dropped: {}",
+            out
+        );
+    }
+
+    #[test]
+    fn an_unknown_escape_terminator_does_not_eat_the_line() {
+        // `strip_ansi` only knew four terminators, so any other one left it
+        // consuming and deleted the rest of the line — including error text, on
+        // the generic path that handles most commands.
+        let raw = "before\n\x1b[31FATAL ERROR CODE 500 SERVER DOWN\nafter\n";
+        let out = filter_output("npm test", raw);
+        assert!(
+            out.contains("SERVER DOWN"),
+            "an error was erased: {:?}",
+            out
+        );
+        assert!(out.contains("before") && out.contains("after"), "{:?}", out);
+    }
+
+    #[test]
+    fn a_commit_line_with_multibyte_text_does_not_panic() {
+        // A commit hook printing a `[branch token]` line with non-ASCII made a
+        // fixed byte slice land inside a character.
+        let out = filter_output(
+            "git commit -m x",
+            "[main 123456é789] msg\n 1 file changed\n",
+        );
+        assert!(!out.is_empty());
+    }
+
+    #[test]
+    fn compression_never_claims_savings_it_did_not_make() {
+        // The percentages were string literals, and the "compressed" result could
+        // be longer than its input while claiming 95 percent.
+        let raw = "[main abc1234] x\n";
+        let out = filter_output("git commit -m x", raw);
+        assert!(!out.contains("savings"), "{}", out);
+    }
+
+    #[test]
+    fn a_clean_command_is_still_compressed() {
+        // The fail-open net must not disable compression for ordinary output.
+        let raw: String = (0..400)
+            .map(|_| "identical progress line\n".to_string())
+            .collect();
+        let out = filter_output("npm install", &raw);
+        assert!(out.len() < raw.len(), "compression stopped working");
+    }
+
     use super::*;
 
     #[test]

@@ -338,12 +338,29 @@ pub fn frame_summary(summary: &str) -> String {
 }
 
 /// Build the full checkpoint message body that replaces the summarized region.
+///
+/// The summary is redacted first. The instruction tells the model to preserve
+/// commands verbatim, which is right for resuming work and wrong for credentials:
+/// compaction deletes the region that held the secret, so an unredacted checkpoint
+/// promotes it from something transient into something carried by every later
+/// request and written to the session file.
 pub fn build_checkpoint_body(summary: &str) -> String {
+    let (summary, redacted) = crate::redact::redact_secrets(summary);
+    let notice = if redacted > 0 {
+        format!(
+            "\n{} credential-shaped value(s) in this checkpoint were replaced with {}. Read the current files or re-run the command if you need the real value.",
+            redacted,
+            crate::redact::REDACTED
+        )
+    } else {
+        String::new()
+    };
     format!(
-        "{}\n{}\n\n{}",
+        "{}\n{}{}\n\n{}",
         crate::sessions::COMPACTION_PREFIX,
         CHECKPOINT_PREAMBLE,
-        frame_summary(summary)
+        notice,
+        frame_summary(&summary)
     )
 }
 
@@ -534,25 +551,6 @@ const MECHANICAL_MAX_COMMANDS: usize = 30;
 /// Longest narration excerpt kept per message.
 const MECHANICAL_NARRATION_CHARS: usize = 400;
 
-/// Patterns whose following value is replaced before a command is recorded.
-///
-/// Redaction is best-effort and cannot be complete. It exists because compaction
-/// is the one operation that would otherwise have dropped these strings from the
-/// live context, and a mechanical checkpoint would instead promote them into
-/// every later request.
-const SECRET_MARKERS: [&str; 10] = [
-    "authorization:",
-    "bearer ",
-    "api_key",
-    "apikey",
-    "secret",
-    "password",
-    "passwd",
-    "token",
-    "--header",
-    "-u ",
-];
-
 /// Shorten one model-authored string to a bounded, redacted single line.
 ///
 /// The length cap is the load-bearing part. `file_path` and `command` come
@@ -562,13 +560,11 @@ const SECRET_MARKERS: [&str; 10] = [
 /// again, wedging the session permanently.
 fn mechanical_item(value: &str) -> String {
     let line = value.lines().next().unwrap_or("").trim();
-    let lowered = line.to_lowercase();
-    if SECRET_MARKERS.iter().any(|marker| lowered.contains(marker)) {
-        let head: String = line.chars().take(24).collect();
-        return format!("{}... [redacted: may contain a credential]", head);
-    }
+    // Redact the value, not the line. Blanking a whole line on a keyword match
+    // threw away what the command was, which is the only reason to record it.
+    let (line, _) = crate::redact::redact_secrets(line);
     if line.chars().count() <= MECHANICAL_ITEM_CHARS {
-        return line.to_string();
+        return line;
     }
     let head: String = line.chars().take(MECHANICAL_ITEM_CHARS).collect();
     format!("{}... [{} chars]", head, line.chars().count())
@@ -1142,6 +1138,41 @@ mod tests {
         let checkpoint = mechanical_checkpoint(&region);
         assert!(!checkpoint.contains("sk-live-DEADBEEF"), "{}", checkpoint);
         assert!(checkpoint.contains("redacted"), "{}", checkpoint);
+        // The command itself must survive, or recording it was pointless.
+        assert!(checkpoint.contains("curl"), "{}", checkpoint);
+        assert!(checkpoint.contains("https://api.example"), "{}", checkpoint);
+    }
+
+    #[test]
+    fn an_accepted_summary_is_redacted_before_it_is_stored() {
+        // The instruction tells the model to preserve commands verbatim. That is
+        // right for resuming work and wrong for credentials: compaction deletes the
+        // region that held the secret, so an unredacted checkpoint carries it into
+        // every later request and onto disk.
+        let summary = format!(
+            "## Primary Request and Intent\n- call the billing API\n\n\
+             ## Current Work\n- ran `curl -H 'Authorization: Bearer sk-live-DEADBEEFCAFE1234' https://api.example/v1/charges`{}\n\n\
+             ## Next Step\n- verify the response\n",
+            " ".repeat(80)
+        );
+        assert_eq!(validate_summary(&summary), Ok(()));
+
+        let body = build_checkpoint_body(&summary);
+        assert!(!body.contains("sk-live-DEADBEEFCAFE1234"), "{}", body);
+        assert!(body.contains("credential-shaped value"), "{}", body);
+        // Everything useful survives.
+        assert!(body.contains("curl"), "{}", body);
+        assert!(body.contains("https://api.example/v1/charges"), "{}", body);
+        assert!(body.contains("call the billing API"), "{}", body);
+    }
+
+    #[test]
+    fn a_clean_summary_gets_no_redaction_notice() {
+        let body = build_checkpoint_body(
+            "## Primary Request and Intent\n- refactor the parser\n\n## Current Work\n- done",
+        );
+        assert!(!body.contains("credential-shaped value"), "{}", body);
+        assert!(body.contains("refactor the parser"));
     }
 
     #[test]

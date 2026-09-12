@@ -74,9 +74,37 @@ pub struct SessionInfo {
 /// `--session <id>` names the conversation, so an embedder that owns the id
 /// (one per chat, say) gets a predictable transcript path from the first turn
 /// instead of a UUID it then has to discover.
+/// Reduce a caller-supplied session id to a single safe path segment.
+///
+/// `PathBuf::join` discards the base entirely when given an absolute path, so
+/// `--session /etc/cron.d/x` wrote outside the sessions directory, and `..`
+/// segments walked out of it. The id arrives from a CLI flag and from embedders,
+/// so it names a file this process then creates and truncates on untrusted input.
+pub fn sanitize_session_id(id: &str) -> String {
+    let cleaned: String = id
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .take(128)
+        .collect();
+    // `.` and `..` still reference directories after the character filter.
+    let cleaned = cleaned.trim_matches('.').to_string();
+    if cleaned.is_empty() {
+        uuid::Uuid::new_v4().to_string()
+    } else {
+        cleaned
+    }
+}
+
 pub fn create_session_with_id(id: &str, model: &str) -> Result<PathBuf, String> {
     let dir = ensure_sessions_dir()?;
-    write_session_header(&dir.join(format!("{}.jsonl", id)), id, model)
+    let safe = sanitize_session_id(id);
+    write_session_header(&dir.join(format!("{}.jsonl", safe)), &safe, model)
 }
 
 /// Create a new session file. Returns the file path.
@@ -99,9 +127,12 @@ fn write_session_header(path: &std::path::Path, id: &str, model: &str) -> Result
         session_id: Some(id),
     };
     let mut file =
-        std::fs::File::create(&path).map_err(|e| format!("Cannot create session file: {}", e))?;
+        create_private(&path).map_err(|e| format!("Cannot create session file: {}", e))?;
     use std::io::Write;
-    writeln!(file, "{}", serialize_json_line(&header).trim())
+    // One write_all of a newline-terminated buffer. `writeln!` can split a line
+    // across several writes, and two processes sharing a session id then interleave
+    // mid-line — measured at roughly a third of all lines corrupted.
+    file.write_all(format!("{}\n", serialize_json_line(&header).trim()).as_bytes())
         .map_err(|e| format!("Cannot write session header: {}", e))?;
     Ok(path)
 }
@@ -112,7 +143,39 @@ fn write_session_header(path: &std::path::Path, id: &str, model: &str) -> Result
 /// `create(true)` every later write fails with ENOENT and the transcript is
 /// silently lost for the rest of the process's life — taking the compaction
 /// record and the generation ids with it.
+/// Create a transcript readable only by its owner.
+///
+/// Session files record every message and every tool result, so they carry
+/// anything a command printed. They were left at the umask default while
+/// `spill.rs` forces 0600 for the same class of content.
+#[cfg(unix)]
+fn create_private(path: &PathBuf) -> std::io::Result<std::fs::File> {
+    use std::os::unix::fs::OpenOptionsExt;
+    std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o600)
+        .open(path)
+}
+
+#[cfg(not(unix))]
+fn create_private(path: &PathBuf) -> std::io::Result<std::fs::File> {
+    std::fs::File::create(path)
+}
+
 fn open_for_append(path: &PathBuf) -> Result<std::fs::File, String> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        return std::fs::OpenOptions::new()
+            .append(true)
+            .create(true)
+            .mode(0o600)
+            .open(path)
+            .map_err(|e| format!("Cannot open session file: {}", e));
+    }
+    #[allow(unreachable_code)]
     std::fs::OpenOptions::new()
         .append(true)
         .create(true)
@@ -150,7 +213,7 @@ pub fn append_message(path: &PathBuf, msg: &Message) -> Result<(), String> {
     };
     let mut file = open_for_append(path)?;
     use std::io::Write;
-    writeln!(file, "{}", serialize_json_line(&entry).trim())
+    file.write_all(format!("{}\n", serialize_json_line(&entry).trim()).as_bytes())
         .map_err(|e| format!("Cannot append to session file: {}", e))?;
     Ok(())
 }
@@ -167,7 +230,7 @@ pub fn append_compaction(path: &PathBuf, summary: &str, tokens_before: u64) -> R
     };
     let mut file = open_for_append(path)?;
     use std::io::Write;
-    writeln!(file, "{}", serialize_json_line(&entry).trim())
+    file.write_all(format!("{}\n", serialize_json_line(&entry).trim()).as_bytes())
         .map_err(|e| format!("Cannot append compaction to session file: {}", e))?;
     Ok(())
 }
@@ -227,9 +290,67 @@ pub fn append_generation_id(path: &PathBuf, generation_id: &str) -> Result<(), S
     });
     let mut file = open_for_append(path)?;
     use std::io::Write;
-    writeln!(file, "{}", serialize_json_line(&entry).trim())
+    file.write_all(format!("{}\n", serialize_json_line(&entry).trim()).as_bytes())
         .map_err(|e| format!("Cannot append generation id to session file: {}", e))?;
     Ok(())
+}
+
+/// Drop tool results whose call was lost, and calls whose results were lost.
+///
+/// Replay can produce either. A compaction record clears everything above it, so a
+/// transcript where that record landed between an assistant's tool call and its
+/// result loads with an orphan result at the head. A crash mid-turn leaves the
+/// mirror image: a call with no result at the tail. Both are a hard 400 from every
+/// OpenAI-compatible endpoint on the first request after resume.
+pub fn repair_tool_pairing(messages: &mut Vec<Message>) -> usize {
+    let mut open: Vec<String> = Vec::new();
+    let mut repaired = 0usize;
+
+    for msg in messages.iter_mut() {
+        if msg.role == "tool" {
+            let id = msg.tool_call_id.clone().unwrap_or_default();
+            if open.contains(&id) {
+                open.retain(|open_id| *open_id != id);
+                continue;
+            }
+            // Convert rather than drop. A transcript from another agent records
+            // its calls as text on the assistant message, so its results are
+            // legitimately unmatched here and deleting them would lose real
+            // content. Carrying the text on the user role keeps it and still
+            // satisfies the provider.
+            msg.role = "user".to_string();
+            msg.tool_call_id = None;
+            msg.content = format!(
+                "[tool result, its call is no longer in context]\n{}",
+                msg.content
+            );
+            repaired += 1;
+            continue;
+        }
+        open = msg
+            .tool_calls
+            .as_ref()
+            .map(|calls| calls.iter().map(|c| c.id.clone()).collect())
+            .unwrap_or_default();
+    }
+
+    // A call whose results never arrived cannot end the list. Keep whatever the
+    // assistant said, drop only the unanswered call.
+    if let Some(last) = messages.last_mut() {
+        let unanswered = last
+            .tool_calls
+            .as_ref()
+            .map(|calls| !calls.is_empty())
+            .unwrap_or(false);
+        if unanswered {
+            last.tool_calls = None;
+            repaired += 1;
+            if last.content.trim().is_empty() {
+                messages.pop();
+            }
+        }
+    }
+    repaired
 }
 
 /// Load all entries from a session file.
@@ -239,6 +360,11 @@ pub fn load_session(path: &PathBuf) -> Result<Vec<Message>, String> {
     }
     let contents =
         std::fs::read_to_string(path).map_err(|e| format!("Cannot read session file: {}", e))?;
+    // A byte order mark is not valid JSON, so without this the first message of
+    // any transcript an editor touched was silently dropped.
+    let contents = contents
+        .strip_prefix('\u{feff}')
+        .unwrap_or(contents.as_str());
     let mut messages: Vec<Message> = Vec::new();
 
     for line in contents.lines() {
@@ -310,6 +436,14 @@ pub fn load_session(path: &PathBuf) -> Result<Vec<Message>, String> {
             }
         }
     }
+    let removed = repair_tool_pairing(&mut messages);
+    if removed > 0 {
+        eprintln!(
+            "rupi: dropped {} unpaired tool message(s) while resuming; the transcript was cut mid-turn",
+            removed
+        );
+    }
+
     Ok(messages)
 }
 
@@ -397,6 +531,122 @@ pub fn find_session_path(id: &str) -> Option<PathBuf> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_session_id_cannot_escape_the_sessions_directory() {
+        // `PathBuf::join` discards the base for an absolute path, so an id like
+        // this used to create and truncate an arbitrary file.
+        for hostile in [
+            "/tmp/evil",
+            "../../../etc/cron.d/x",
+            "..",
+            ".",
+            "....//....//x",
+            "a/b/c",
+            "",
+        ] {
+            let safe = sanitize_session_id(hostile);
+            assert!(!safe.contains('/'), "{} -> {}", hostile, safe);
+            assert!(!safe.contains('\\'), "{} -> {}", hostile, safe);
+            assert!(!safe.is_empty(), "{} produced an empty id", hostile);
+            assert_ne!(safe, ".", "{}", hostile);
+            assert_ne!(safe, "..", "{}", hostile);
+            let joined = std::path::Path::new("/base").join(format!("{}.jsonl", safe));
+            assert!(
+                joined.starts_with("/base"),
+                "{} escaped to {:?}",
+                hostile,
+                joined
+            );
+        }
+        // An ordinary id is untouched.
+        assert_eq!(sanitize_session_id("abc-123_XY"), "abc-123_XY");
+    }
+
+    #[test]
+    fn a_long_session_id_is_bounded() {
+        let safe = sanitize_session_id(&"a".repeat(5000));
+        assert!(safe.len() <= 128, "id was {} chars", safe.len());
+    }
+
+    #[test]
+    fn orphan_tool_results_are_repaired_on_load() {
+        // The shape a compaction record produces when it lands between an
+        // assistant's tool call and its result. Sending this to any
+        // OpenAI-compatible endpoint is a hard 400.
+        let mut messages = vec![
+            Message::new("user", "[Compacted conversation history]\nsummary"),
+            Message::tool_result("call_x", "a result whose call was summarized away"),
+            Message::new("user", "carry on"),
+        ];
+        let repaired = repair_tool_pairing(&mut messages);
+        assert_eq!(repaired, 1);
+        // No `tool` message survives without its call, but its text does.
+        assert!(!messages.iter().any(|m| m.role == "tool"));
+        assert_eq!(messages.len(), 3);
+        assert!(messages[1]
+            .content
+            .contains("a result whose call was summarized away"));
+    }
+
+    #[test]
+    fn unanswered_tool_calls_are_repaired_on_load() {
+        // The mirror case: a crash between the assistant's call and its result.
+        let mut messages = vec![
+            Message::new("user", "go"),
+            Message::tool_call(
+                "running",
+                vec![crate::tools::ToolCall {
+                    id: "c1".into(),
+                    name: "bash".into(),
+                    arguments: serde_json::json!({}),
+                    raw_arguments: None,
+                }],
+            ),
+        ];
+        let repaired = repair_tool_pairing(&mut messages);
+        assert_eq!(repaired, 1);
+        // The assistant's own text survives; only the unanswered call goes.
+        assert_eq!(messages.len(), 2);
+        assert!(messages[1].tool_calls.is_none());
+    }
+
+    #[test]
+    fn a_well_formed_transcript_is_left_alone() {
+        let mut messages = vec![
+            Message::new("user", "go"),
+            Message::tool_call(
+                "running",
+                vec![crate::tools::ToolCall {
+                    id: "c1".into(),
+                    name: "bash".into(),
+                    arguments: serde_json::json!({}),
+                    raw_arguments: None,
+                }],
+            ),
+            Message::tool_result("c1", "done"),
+            Message::new("assistant", "finished"),
+        ];
+        let before = messages.len();
+        assert_eq!(repair_tool_pairing(&mut messages), 0);
+        assert_eq!(messages.len(), before);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_transcript_is_readable_only_by_its_owner() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("rupi-sess-mode-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("s.jsonl");
+        write_session_header(&path, "s", "m").unwrap();
+        // Transcripts record every tool result, so they carry whatever a command
+        // printed. `spill.rs` already forces 0600 for the same content.
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "transcript mode was {:o}", mode);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     use super::*;
     use crate::tools::ToolCall;
     use std::fs;
@@ -805,9 +1055,13 @@ mod tests {
         assert_eq!(loaded.len(), 3);
         assert_eq!(loaded[0].content, "hello");
         assert_eq!(loaded[1].content, "part one\n[called tool: bash]");
-        assert_eq!(
-            loaded[2].role, "tool",
-            "toolResult must map to the tool role"
+        // `toolResult` maps to the tool role, but this transcript records its
+        // call as assistant text, so the result has no matching `tool_calls` and
+        // the pairing repair carries it on the user role instead of dropping it.
+        assert_eq!(loaded[2].role, "user");
+        assert!(
+            loaded[2].content.contains("exit 0"),
+            "the result text must survive"
         );
         fs::remove_dir_all(&dir).unwrap();
     }
