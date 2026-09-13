@@ -73,6 +73,8 @@ enum Turn {
     },
     /// Finish with plain text.
     Text(&'static str),
+    /// Fail the turn, the way a provider that drops mid-stream does.
+    Fail,
 }
 
 /// A scripted provider that records what the summarizer was actually sent.
@@ -227,6 +229,13 @@ impl ChatProvider for MockProvider {
                         finish_reason: Some("tool_calls".to_string()),
                         reasoning_content: String::new(),
                     })
+                    .await;
+            }
+            Some(Turn::Fail) => {
+                let _ = tx
+                    .send(StreamEvent::Error(
+                        "Stream error: the provider hung up".into(),
+                    ))
                     .await;
             }
             other => {
@@ -2107,4 +2116,52 @@ async fn switching_models_allows_the_text_fallback_again() {
         "a model switch left the fallback off for a model that may need it"
     );
     let _ = std::fs::remove_file(marker);
+}
+
+#[tokio::test]
+async fn one_shot_mode_returns_the_final_answer() {
+    // What a parent agent reads off stdout. The tool turns are the work; the last
+    // thing the agent says is the report of it.
+    let provider = Arc::new(MockProvider::new(
+        vec![
+            Turn::ToolCall { output_bytes: 12 },
+            Turn::Text("the review found one real defect"),
+        ],
+        "SUMMARY",
+    ));
+    let session = Arc::new(session_with_window(provider, 200_000));
+    let answer = rupi::modes::once::run_once(session, "review the parser")
+        .await
+        .expect("the subagent produced no answer");
+    assert_eq!(answer, "the review found one real defect");
+}
+
+#[tokio::test]
+async fn one_shot_mode_reports_a_failure_rather_than_an_empty_answer() {
+    // A subagent that failed must not look like one that had nothing to say.
+    let provider = Arc::new(MockProvider::new(vec![Turn::Text("")], "SUMMARY"));
+    let session = Arc::new(session_with_window(provider, 200_000));
+    let outcome = rupi::modes::once::run_once(session, "do the work").await;
+    assert!(outcome.is_err(), "an empty run reported success");
+}
+
+#[tokio::test]
+async fn one_shot_mode_never_reports_tool_narration_as_the_answer() {
+    // A run that ends on a tool call ended early. The narration around that call
+    // reads like a finished report, and printing it would tell the agent that
+    // started this one that the work is done.
+    let provider = Arc::new(MockProvider::new(
+        vec![Turn::ToolCall { output_bytes: 8 }, Turn::Fail],
+        "SUMMARY",
+    ));
+    let session = Arc::new(session_with_window(provider, 200_000));
+    let outcome = rupi::modes::once::run_once(session, "review the parser").await;
+    match outcome {
+        Ok(answer) => panic!("tool narration was reported as the answer: {:?}", answer),
+        Err(e) => assert!(
+            !e.contains("inspecting"),
+            "the narration leaked into the failure: {}",
+            e
+        ),
+    }
 }

@@ -23,7 +23,8 @@ pub fn set_bash_timeout_default(seconds: u64) {
     BASH_TIMEOUT_DEFAULT.store(seconds.max(1), Ordering::Relaxed);
 }
 
-fn bash_timeout_max() -> u64 {
+/// The ceiling a bash call's timeout is clamped to.
+pub fn bash_timeout_max() -> u64 {
     BASH_TIMEOUT_MAX.load(Ordering::Relaxed)
 }
 
@@ -846,6 +847,98 @@ fn still_the_same_process(_entry: &(u32, u64)) -> bool {
 /// another command's process.
 const EXEC_ID_VAR: &str = "RUPI_EXEC_ID";
 
+/// Most agents of this binary that may run at once.
+///
+/// Set once from the command line, and stated in the system prompt so the model
+/// knows the bound it is working inside rather than discovering it as a refusal.
+static AGENT_LIMIT: AtomicU64 = AtomicU64::new(12);
+
+/// Record the configured limit. Called once, before any session is built.
+pub fn set_agent_limit(limit: usize) {
+    AGENT_LIMIT.store(limit as u64, Ordering::Relaxed);
+}
+
+/// The configured limit on live agents.
+pub fn agent_limit() -> usize {
+    AGENT_LIMIT.load(Ordering::Relaxed) as usize
+}
+
+/// Whether this process was started by another rupi agent.
+///
+/// The environment marker alone is advisory: `env -i`, `unset`, or any wrapper that
+/// scrubs the environment strips it, and a subagent that loses the marker is told it
+/// may start agents of its own. Walking the parent links answers the same question
+/// from a place a command line cannot reach.
+///
+/// A user who runs this binary from a shell has no rupi ancestor. One that a tool
+/// call started does.
+#[cfg(target_os = "linux")]
+pub fn started_by_an_agent() -> bool {
+    if std::env::var_os(SUBAGENT_VAR).is_some() {
+        return true;
+    }
+    let Ok(me) = std::env::current_exe() else {
+        return false;
+    };
+    let mut walker = std::process::id();
+    // Bounded. A cycle in the parent links, which a malformed `/proc` can present,
+    // would otherwise spin here at startup.
+    for _ in 0..64 {
+        let Some((parent, _)) = proc_parent_and_start(walker) else {
+            return false;
+        };
+        if parent <= 1 {
+            return false;
+        }
+        if std::fs::read_link(format!("/proc/{parent}/exe")).is_ok_and(|path| path == me) {
+            return true;
+        }
+        walker = parent;
+    }
+    false
+}
+
+/// Without `/proc` the environment marker is all there is.
+#[cfg(not(target_os = "linux"))]
+pub fn started_by_an_agent() -> bool {
+    std::env::var_os(SUBAGENT_VAR).is_some()
+}
+
+/// How many processes are running this same binary, including this one.
+///
+/// The last bound on a runaway chain. The marker can be scrubbed and the parent
+/// links can be broken by a double fork, but the count of live agents cannot be
+/// hidden from a `/proc` scan.
+#[cfg(target_os = "linux")]
+pub fn live_agent_count() -> usize {
+    let Ok(me) = std::env::current_exe() else {
+        return 1;
+    };
+    let Ok(entries) = std::fs::read_dir("/proc") else {
+        return 1;
+    };
+    let mut count = 0usize;
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else { continue };
+        if name.parse::<u32>().is_err() {
+            continue;
+        }
+        if std::fs::read_link(format!("/proc/{name}/exe")).is_ok_and(|path| path == me) {
+            count += 1;
+        }
+    }
+    count.max(1)
+}
+
+#[cfg(not(target_os = "linux"))]
+pub fn live_agent_count() -> usize {
+    1
+}
+
+/// Marks a process as one an agent started, rather than a user.
+pub const SUBAGENT_VAR: &str = "RUPI_SUBAGENT";
+
 /// A fresh marker for one bash call.
 fn new_exec_id() -> String {
     uuid::Uuid::new_v4().simple().to_string()
@@ -1041,6 +1134,11 @@ async fn run_bash(args: &Value, cancelled: Arc<AtomicBool>) -> BashOutcome {
         .kill_on_drop(true);
     let exec_id = new_exec_id();
     process.env(EXEC_ID_VAR, &exec_id);
+    // Anything this agent starts is marked as started by an agent. A rupi launched
+    // from here is a subagent whatever the command line looks like, and a rupi the
+    // user starts in their own shell is not. Keying this on the mode instead would
+    // have denied a user's own one-shot run the ability to start agents.
+    process.env(SUBAGENT_VAR, "1");
     #[cfg(unix)]
     {
         use std::os::unix::process::CommandExt;
@@ -2825,6 +2923,48 @@ mod tests {
             }
         }
         count
+    }
+
+    #[test]
+    fn this_process_is_not_taken_for_a_subagent() {
+        // The test binary has no rupi ancestor and no marker, so it must read as a
+        // user-started process. A false positive here would silently strip the
+        // spawning instructions from every real session.
+        assert!(
+            !started_by_an_agent(),
+            "a process with no agent above it was taken for a subagent"
+        );
+    }
+
+    #[test]
+    fn the_live_agent_count_includes_this_process() {
+        // The count is the last bound on a runaway chain, so it must never be zero:
+        // a zero would compare below any limit and let every start through.
+        assert!(live_agent_count() >= 1);
+    }
+
+    #[test]
+    fn the_agent_limit_is_readable_where_the_prompt_needs_it() {
+        let before = agent_limit();
+        set_agent_limit(7);
+        assert_eq!(agent_limit(), 7);
+        set_agent_limit(before);
+    }
+
+    #[test]
+    fn a_command_started_by_the_agent_is_marked_as_such() {
+        // A rupi started from inside a tool call is a subagent, whatever the
+        // command line looks like. A rupi the user starts is not.
+        let result = execute_bash(&serde_json::json!({"command": "echo \"$RUPI_SUBAGENT\""}));
+        assert!(
+            result.contains('1'),
+            "the subagent marker is missing: {}",
+            result
+        );
+        assert!(
+            std::env::var_os(SUBAGENT_VAR).is_none(),
+            "the marker leaked into this process"
+        );
     }
 
     #[test]

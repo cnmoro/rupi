@@ -32,6 +32,27 @@ async fn main() {
     tools::set_bash_timeout_max(cli.bash_timeout_max);
     tools::set_bash_timeout_default(cli.bash_timeout_default);
     rupi::provider::openai::set_stream_idle_timeout(cli.stream_idle_timeout);
+    // An agent that another agent started is told so, and is not given the
+    // instructions for starting agents of its own. The answer comes from the
+    // environment marker the parent's bash tool sets AND from the parent links, so
+    // it holds even when the command scrubbed its environment.
+    rupi::agent::session::set_subagent_mode(tools::started_by_an_agent());
+    tools::set_agent_limit(cli.max_agents);
+
+    // The bound on a chain of agents. Advisory text in a prompt is not a limit, and
+    // a model that loops on starting agents would otherwise fan out until the
+    // machine gave up.
+    if cli.max_agents > 0 {
+        let live = tools::live_agent_count();
+        if live > cli.max_agents {
+            eprintln!(
+                "rupi: {} agents of this binary are already running, and the limit is {}. \
+Raise it with --max-agents or RUPI_MAX_AGENTS if this is intended.",
+                live, cli.max_agents
+            );
+            std::process::exit(3);
+        }
+    }
 
     // Load config from file
     let file_config = match RupiConfig::load() {
@@ -69,8 +90,9 @@ async fn main() {
         }
     };
 
-    // Handle --list-opencode-models early
-    if cli.list_opencode_models {
+    // Handle --list-opencode-models early, for the same reason as the session list:
+    // a prompt names work to do, and a listing is not that work.
+    if cli.list_opencode_models && cli.prompt.is_none() {
         let provider_id = match file_config
             .opencode_provider
             .as_deref()
@@ -148,8 +170,10 @@ async fn main() {
         .to_string();
     let context_files = agent_session::load_context_files(&cwd);
 
-    // Handle --list-sessions early
-    if cli.list_sessions {
+    // Handle --list-sessions early. Not when a prompt was given: that names one
+    // prompt to answer, and printing a list instead would leave the caller with a
+    // successful exit and no work done.
+    if cli.list_sessions && cli.prompt.is_none() {
         let sessions = rupi::sessions::list_sessions().unwrap_or_else(|e| {
             eprintln!("Error listing sessions: {}", e);
             std::process::exit(1);
@@ -172,6 +196,17 @@ async fn main() {
     let session_id = cli.session.as_deref();
 
     match cli.mode() {
+        "once" => {
+            let message = cli.prompt.clone().unwrap_or_default();
+            run_once_mode(
+                openai_config,
+                loaded_skills,
+                context_files,
+                session_id,
+                &message,
+            )
+            .await
+        }
         "rpc" => run_rpc_mode(openai_config, loaded_skills, context_files, session_id).await,
         "raw" => run_raw_mode(openai_config, loaded_skills, context_files, session_id).await,
         _ => {
@@ -362,6 +397,39 @@ async fn run_interactive_mode(
     }
 
     rupi::modes::interactive::run_interactive(session).await;
+}
+
+/// One prompt, printed to stdout, then exit.
+///
+/// The exit code is what a caller checks: zero and an answer on stdout, or a
+/// reason on stderr and a non-zero code. A subagent that failed must not look
+/// like one that had nothing to say.
+async fn run_once_mode(
+    config: OpenAIConfig,
+    skills: Vec<Skill>,
+    context_files: Vec<agent_session::ContextFile>,
+    session_id: Option<&str>,
+    message: &str,
+) {
+    if message.trim().is_empty() {
+        eprintln!("rupi: --prompt needs a task to run");
+        std::process::exit(2);
+    }
+    let cwd = std::env::current_dir()
+        .unwrap_or_default()
+        .to_string_lossy()
+        .to_string();
+    let session =
+        Arc::new(resolve_session(&config, session_id, &cwd, &skills, &context_files, false).await);
+    match rupi::modes::once::run_once(session, message).await {
+        Ok(answer) => {
+            println!("{}", answer);
+        }
+        Err(e) => {
+            eprintln!("rupi: {}", e);
+            std::process::exit(1);
+        }
+    }
 }
 
 async fn run_raw_mode(

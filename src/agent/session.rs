@@ -228,6 +228,73 @@ fn escape_for_prompt(value: &str) -> String {
         .collect()
 }
 
+/// Whether this process is a subagent another agent started.
+///
+/// Per process, not per session: the whole process is either an agent a user
+/// drives or one that another agent started with `-p`. A subagent is told it
+/// cannot start further agents, and is not given the instructions for it.
+static SUBAGENT_MODE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Mark this process as a subagent. Called once, before any session is built.
+pub fn set_subagent_mode(on: bool) {
+    SUBAGENT_MODE.store(on, std::sync::atomic::Ordering::Relaxed);
+}
+
+fn subagent_mode() -> bool {
+    SUBAGENT_MODE.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// What to tell the agent about starting other agents.
+///
+/// The path is this running binary, resolved at startup, so the command works
+/// whatever the binary is called and wherever it sits. A subagent gets one line
+/// instead: a chain of agents starting agents spends the user's money without
+/// anybody watching it.
+fn subagent_section() -> String {
+    subagent_section_for(subagent_mode())
+}
+
+/// The section itself, with the role passed in rather than read from the process.
+///
+/// Split out so a test can check both shapes without flipping a process-wide flag
+/// that every other test's system prompt reads.
+fn subagent_section_for(is_subagent: bool) -> String {
+    if is_subagent {
+        return "\n\nYou are a subagent: another agent started you with one task and reads \
+what you print. Do not start further agents. Answer the task you were given, and make the last \
+thing you say the answer itself — the agent that started you sees only your final message."
+            .to_string();
+    }
+    let binary = std::env::current_exe()
+        .map(|path| path.display().to_string())
+        .unwrap_or_else(|_| "rupi".to_string());
+    let ceiling = crate::tools::bash_timeout_max();
+    let limit = crate::tools::agent_limit();
+    format!(
+        "\n\nSubagents: you can start other agents to work in parallel, with the bash tool and \
+this binary:\n\
+  {binary} -p '<the whole task>'\n\
+It prints that agent's final answer to stdout and nothing else. The subagent starts with an empty \
+context and sees no part of this conversation, so the task string must carry everything it needs: \
+what to do, which paths, and what to report back. It runs in the current directory with the same \
+tools you have, including write access, so say plainly when it must only read.\n\
+Run several at once and collect them:\n\
+  {binary} -p 'task one' > /tmp/sub1.out 2> /tmp/sub1.err & {binary} -p 'task two' > /tmp/sub2.out 2> /tmp/sub2.err & wait\n\
+then read the files. Quote the task with single quotes so its own quotes survive the shell. A \
+subagent that fails exits non-zero and prints nothing on stdout, with the reason on stderr, so read \
+the error file when an output file is empty.\n\
+Pass a `timeout` on the bash call that fits the work; the ceiling is {ceiling}s. For work that needs \
+longer than that, start it with `&` and no `wait`, redirect its output to a file, and read the file \
+on a later turn.\n\
+Use a subagent when the user asks for one, or when parts of the work are genuinely independent — a \
+review of several areas at once, or a search that would fill your context. Doing it yourself is \
+cheaper and simpler when the steps depend on each other.\n\
+A subagent cannot start further agents, and this is enforced rather than asked: a rupi started from \
+inside a tool call is recognised by its parent process, whatever its command line says. At most \
+{limit} agents of this binary may run at once, and a start beyond that is refused."
+    )
+}
+
 fn build_system_prompt(
     skills: &[Skill],
     context_files: &[ContextFile],
@@ -308,6 +375,8 @@ Guidelines:
             }
         }
     }
+
+    prompt.push_str(&subagent_section());
 
     // Append context files content
     for cf in context_files {
@@ -1406,6 +1475,8 @@ recoverable. Re-run the command if you need it.]",
             let idle_limit =
                 std::time::Duration::from_secs(crate::provider::openai::stream_idle_timeout() * 2);
             let mut stalled = false;
+            // Which kind of incomplete turn it was, for the caller's stop reason.
+            let mut stall_kind = "timeout";
             loop {
                 let event = match tokio::time::timeout(idle_limit, rx.recv()).await {
                     Ok(Some(event)) => event,
@@ -1474,11 +1545,18 @@ recoverable. Re-run the command if you need it.]",
                         // same way. Reported as an error, the text already shown to
                         // the user was never persisted: it vanished from the
                         // conversation while the user could still see it on screen.
-                        if err.starts_with(crate::provider::openai::IDLE_TIMEOUT_PREFIX)
-                            && !full_content.is_empty()
-                        {
+                        // Silence and a cut-off stream are the same event for the
+                        // conversation: part of an answer arrived and the rest never
+                        // will. Keep what was said, and never call the turn finished.
+                        let incomplete = err
+                            .starts_with(crate::provider::openai::IDLE_TIMEOUT_PREFIX)
+                            || err.starts_with(crate::provider::openai::TRUNCATED_PREFIX);
+                        if incomplete && !full_content.is_empty() {
                             stalled = true;
-                            eprintln!("rupi: {}; ending the turn as a timeout", err);
+                            if err.starts_with(crate::provider::openai::TRUNCATED_PREFIX) {
+                                stall_kind = "truncated";
+                            }
+                            eprintln!("rupi: {}; ending the turn as incomplete", err);
                             break;
                         }
                         let error_text = if err == "cancelled" {
@@ -1752,7 +1830,7 @@ recoverable. Re-run the command if you need it.]",
                 // A stall is never reported as a clean stop. A caller that cannot
                 // tell the two apart stores a truncated answer as the real one.
                 stop_reason: Some(if stalled {
-                    "timeout".to_string()
+                    stall_kind.to_string()
                 } else {
                     finish_reason.unwrap_or_else(|| {
                         if had_stream_events {
@@ -2560,6 +2638,44 @@ mod prompt_escaping_tests {
         let long = escape_for_prompt(&"x".repeat(10_000));
         assert!(long.chars().count() <= 2000, "{}", long.chars().count());
         assert!(!escape_for_prompt("a\u{1b}[2Kb").contains('\u{1b}'));
+    }
+
+    #[test]
+    fn an_agent_is_told_how_to_start_another_one() {
+        let prompt = build_system_prompt(&[], &[], false, Some("a date"));
+        assert!(prompt.contains("Subagents:"), "no subagent instructions");
+        assert!(
+            prompt.contains(" -p "),
+            "the command to start one is missing"
+        );
+        assert!(
+            prompt.contains(&crate::tools::bash_timeout_max().to_string()),
+            "the real bash ceiling is not stated"
+        );
+        // The path must be this binary, not a bare name a shell may not resolve.
+        let binary = std::env::current_exe()
+            .map(|p| p.display().to_string())
+            .unwrap();
+        assert!(
+            prompt.contains(&binary),
+            "the binary path is not the real one"
+        );
+    }
+
+    #[test]
+    fn a_subagent_is_not_told_how_to_start_more_of_them() {
+        // A chain of agents starting agents spends the user's money with nobody
+        // watching it.
+        let sub = subagent_section_for(true);
+        assert!(sub.contains("You are a subagent"), "no subagent notice");
+        assert!(
+            !sub.contains("you can start other agents"),
+            "a subagent was told how to start more agents"
+        );
+        assert!(
+            subagent_section_for(false).contains("you can start other agents"),
+            "the main agent lost its instructions"
+        );
     }
 
     #[test]

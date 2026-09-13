@@ -44,6 +44,13 @@ pub struct Cli {
     #[arg(long)]
     pub raw: bool,
 
+    /// Run one prompt, print the final answer to stdout, and exit.
+    ///
+    /// This is how one agent starts another: the caller gets the answer on
+    /// stdout and nothing else, so it can be read straight out of a pipe.
+    #[arg(long, short = 'p')]
+    pub prompt: Option<String>,
+
     /// Resume a session by ID (loads ~/.config/rupi_sessions/<ID>.jsonl)
     #[arg(long)]
     pub session: Option<String>,
@@ -68,6 +75,13 @@ pub struct Cli {
     #[arg(long)]
     pub list_sessions: bool,
 
+    /// Most processes of this binary that may run at once, this one included.
+    ///
+    /// The bound on a chain of agents starting agents. A start beyond it is
+    /// refused, so a loop cannot fan out until the machine gives up.
+    #[arg(long, env = "RUPI_MAX_AGENTS", default_value_t = 12)]
+    pub max_agents: usize,
+
     /// List available models from Opencode (requires opencode_api_key in config)
     #[arg(long)]
     pub list_opencode_models: bool,
@@ -79,7 +93,11 @@ pub struct Cli {
 
 impl Cli {
     pub fn mode(&self) -> &str {
-        if self.rpc {
+        // One prompt wins over every other mode. A caller that passes it wants an
+        // answer on stdout, not a session that waits for more input.
+        if self.prompt.is_some() {
+            "once"
+        } else if self.rpc {
             "rpc"
         } else if self.raw {
             "raw"
@@ -109,6 +127,23 @@ mod tests {
     fn test_raw_mode() {
         let cli = Cli::parse_from(["rupi", "--raw"]);
         assert_eq!(cli.mode(), "raw");
+    }
+
+    #[test]
+    fn one_prompt_is_its_own_mode() {
+        let cli = Cli::parse_from(["rupi", "-p", "review this file"]);
+        assert_eq!(cli.mode(), "once");
+        assert_eq!(cli.prompt.as_deref(), Some("review this file"));
+    }
+
+    #[test]
+    fn one_prompt_wins_over_the_other_modes() {
+        // A caller that asked for an answer on stdout must not get a session that
+        // sits waiting for more input.
+        let cli = Cli::parse_from(["rupi", "--rpc", "--prompt", "do the work"]);
+        assert_eq!(cli.mode(), "once");
+        let cli = Cli::parse_from(["rupi", "--raw", "--prompt", "do the work"]);
+        assert_eq!(cli.mode(), "once");
     }
 
     #[test]

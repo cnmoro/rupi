@@ -161,6 +161,12 @@ pub fn set_stream_idle_timeout(seconds: u64) {
 /// text can be mistaken for this one.
 pub const IDLE_TIMEOUT_PREFIX: &str = "idle timeout";
 
+/// Marks a stream the provider cut off before it finished.
+///
+/// Distinct from silence: bytes arrived, then the connection ended with no
+/// `[DONE]` and no finish reason, so whatever was said is part of an answer.
+pub const TRUNCATED_PREFIX: &str = "stream truncated";
+
 pub fn stream_idle_timeout() -> u64 {
     STREAM_IDLE_TIMEOUT.load(std::sync::atomic::Ordering::Relaxed)
 }
@@ -412,6 +418,9 @@ impl ChatProvider for OpenAIProvider {
             let mut cost: Option<super::PromptCost> = None;
             let mut tool_calls: Vec<AccumulatedToolCall> = Vec::new();
             let mut finish_reason: Option<String> = None;
+            // Whether the provider said it was finished. Without this, a socket that
+            // closed mid-generation looked exactly like a completed answer.
+            let mut ended_cleanly = false;
             let mut stream = response.bytes_stream();
             // SSE reassembly buffer: accumulates partial lines across chunk boundaries
             let mut sse_buf = Vec::new();
@@ -437,6 +446,7 @@ impl ChatProvider for OpenAIProvider {
                                         continue;
                                     }
                                     if line == "data: [DONE]" || line == "data:[DONE]" {
+                                        ended_cleanly = true;
                                         break 'stream;
                                     }
                                     // Handle both "data: " and "data:" prefixes
@@ -541,6 +551,8 @@ impl ChatProvider for OpenAIProvider {
                                 return;
                             }
                             None => {
+                                // End of body. Whether that was a finished answer or
+                                // a dropped connection is decided after the loop.
                                 break;
                             }
                         }
@@ -575,6 +587,20 @@ impl ChatProvider for OpenAIProvider {
                         cost,
                         finish_reason,
                     })
+                    .await;
+                return;
+            }
+
+            // A stream that stopped without `[DONE]` and without a finish reason was
+            // cut off. Reported as a finished answer, a dropped connection handed the
+            // caller half a sentence and called it the result — and a subagent that
+            // printed it exited zero, so nothing downstream could tell.
+            if !ended_cleanly && finish_reason.is_none() {
+                let _ = tx
+                    .send(StreamEvent::Error(format!(
+                        "{TRUNCATED_PREFIX}: the provider closed the stream after {} characters",
+                        full_content.chars().count()
+                    )))
                     .await;
                 return;
             }

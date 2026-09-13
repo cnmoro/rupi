@@ -755,3 +755,89 @@ async fn stopping_a_loop_beats_a_steer_that_arrived_first() {
     let rounds = said.iter().filter(|m| m.content == "keep going").count();
     assert_eq!(rounds, 0, "a loop round started after the loop was stopped");
 }
+
+/// A provider that streams part of an answer and then closes the stream.
+struct CutsTheStream;
+
+#[async_trait]
+impl ChatProvider for CutsTheStream {
+    async fn stream_chat(
+        &self,
+        _: &str,
+        _: &[Message],
+        _: watch::Receiver<bool>,
+    ) -> Result<mpsc::Receiver<StreamEvent>, AgentError> {
+        let (tx, rx) = mpsc::channel(4);
+        tx.send(StreamEvent::Delta("partial thought that got cut".into()))
+            .await
+            .unwrap();
+        tx.send(StreamEvent::Error(format!(
+            "{}: the provider closed the stream after 28 characters",
+            rupi::provider::openai::TRUNCATED_PREFIX
+        )))
+        .await
+        .unwrap();
+        Ok(rx)
+    }
+    async fn complete(&self, _: &str, _: &[Message]) -> Result<String, AgentError> {
+        Ok("summary".into())
+    }
+    fn model_info(&self) -> ModelInfo {
+        ModelInfo {
+            provider: "openai-compatible".into(),
+            id: "test".into(),
+            context_window: 128000,
+            reasoning: false,
+        }
+    }
+}
+
+#[tokio::test]
+async fn a_cut_stream_is_never_reported_as_a_finished_answer() {
+    // A dropped connection used to look exactly like a completed answer: the text
+    // was kept, the turn said "stop", and a subagent printed half a sentence and
+    // exited zero. The text is still kept, but the turn says what happened.
+    init_sessions();
+    let session = Arc::new(AgentSession::new(
+        Arc::new(CutsTheStream),
+        "test".into(),
+        128000,
+        ".".into(),
+        vec![],
+        vec![],
+    ));
+    let (tx, mut rx) = mpsc::unbounded_channel();
+    let collector = tokio::spawn(async move {
+        let mut seen = None;
+        while let Some(event) = rx.recv().await {
+            let value = serde_json::to_value(&event).unwrap();
+            if value["type"] == "message_end" {
+                seen = value["message"]["stop_reason"].as_str().map(str::to_string);
+            }
+        }
+        seen
+    });
+    let outcome = session.prompt("tell me something", tx).await;
+    assert!(outcome.is_ok(), "a cut stream failed the whole turn");
+    assert_eq!(
+        collector.await.unwrap().as_deref(),
+        Some("truncated"),
+        "a cut stream was reported as a clean stop"
+    );
+
+    // One shot must refuse it rather than print a fragment as the answer.
+    let fresh = Arc::new(AgentSession::new(
+        Arc::new(CutsTheStream),
+        "test".into(),
+        128000,
+        ".".into(),
+        vec![],
+        vec![],
+    ));
+    let answer = rupi::modes::once::run_once(fresh, "tell me something").await;
+    assert!(
+        answer.is_err(),
+        "a fragment was printed as a finished answer: {:?}",
+        answer
+    );
+}
