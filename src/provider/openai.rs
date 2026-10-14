@@ -136,6 +136,28 @@ struct AccumulatedToolCall {
     arguments: String,
 }
 
+/// True for opencode.ai endpoints (the only ones that want `x-opencode-session`).
+fn is_opencode_url(base_url: &str) -> bool {
+    let rest = base_url.split("://").nth(1).unwrap_or(base_url);
+    let host = rest.split('/').next().unwrap_or("").split(':').next().unwrap_or("");
+    host == "opencode.ai" || host.ends_with(".opencode.ai")
+}
+
+/// Stable id for this run: `RUPI_SESSION_ID` when set (lets a host tie several runs together),
+/// otherwise derived from the pid and start time.
+fn opencode_session_id() -> String {
+    if let Ok(v) = std::env::var("RUPI_SESSION_ID") {
+        if !v.trim().is_empty() {
+            return v.trim().to_string();
+        }
+    }
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    format!("rupi-{:x}-{:x}", std::process::id(), nanos)
+}
+
 /// OpenAI-compatible API provider.
 pub struct OpenAIProvider {
     config: OpenAIConfig,
@@ -183,6 +205,16 @@ impl OpenAIProvider {
             .read_timeout(std::time::Duration::from_secs(stream_idle_timeout()));
         if config.timeout_secs > 0 {
             builder = builder.timeout(std::time::Duration::from_secs(config.timeout_secs));
+        }
+        builder = builder.user_agent(concat!("rupi/", env!("CARGO_PKG_VERSION")));
+        // opencode.ai (Go/Zen) routes and rate-limits per conversation and rejects requests
+        // without a stable session id (`MissingSessionID`). One id per provider = per run.
+        if is_opencode_url(&config.base_url) {
+            let mut headers = reqwest::header::HeaderMap::new();
+            if let Ok(v) = reqwest::header::HeaderValue::from_str(&opencode_session_id()) {
+                headers.insert("x-opencode-session", v);
+            }
+            builder = builder.default_headers(headers);
         }
         let client = builder.build().unwrap_or_else(|_| Client::new());
         let cached_tools = tools::serialize_tools(&tools::all_tools());
@@ -771,5 +803,26 @@ mod tests {
             "stream_chat should not fail for empty messages"
         );
         mock.assert_async().await;
+    }
+}
+
+#[cfg(test)]
+mod opencode_tests {
+    use super::*;
+
+    #[test]
+    fn detects_opencode_hosts_only() {
+        assert!(is_opencode_url("https://opencode.ai/zen/go/v1"));
+        assert!(is_opencode_url("https://api.opencode.ai/v1"));
+        assert!(!is_opencode_url("http://127.0.0.1:8080/v1"));
+        assert!(!is_opencode_url("https://evil-opencode.ai.example.com/v1"));
+        assert!(!is_opencode_url("https://notopencode.ai/v1"));
+    }
+
+    #[test]
+    fn session_id_is_non_empty_header_safe() {
+        let id = opencode_session_id();
+        assert!(reqwest::header::HeaderValue::from_str(&id).is_ok());
+        assert!(!id.is_empty());
     }
 }
