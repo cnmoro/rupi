@@ -508,6 +508,12 @@ pub struct AgentSession {
     native_tool_calls_seen: std::sync::atomic::AtomicBool,
     /// Which conversation the session is on. `reset` moves it forward.
     generation_epoch: std::sync::atomic::AtomicU64,
+    /// Files the compactions of this session have named so far: (read, modified).
+    ///
+    /// Carried forward, because a later compaction replaces a span that holds a
+    /// checkpoint and little else. Its own tool calls name no files, so the list
+    /// would vanish exactly when the conversation can no longer be read back.
+    compaction_files: RwLock<(Vec<String>, Vec<String>)>,
     /// Seconds `reset` waits for a running generation before it gives up.
     ///
     /// Per session, not per process: a process-wide knob let one session, or one
@@ -595,6 +601,7 @@ impl AgentSession {
             native_tool_calls_seen: std::sync::atomic::AtomicBool::new(false),
             generation_epoch: std::sync::atomic::AtomicU64::new(0),
             reset_wait_secs: std::sync::atomic::AtomicU64::new(30),
+            compaction_files: RwLock::new((Vec::new(), Vec::new())),
             loop_prompt: RwLock::new(None),
             loop_cancelled: std::sync::atomic::AtomicBool::new(false),
             system_prompt: RwLock::new(system_prompt),
@@ -694,6 +701,10 @@ impl AgentSession {
         // Restore the anchor so a resumed session that compacts again still carries
         // the request it started from.
         *session.task_anchor.write().await = recover_anchor(&messages);
+        // Carry the file list forward. Starting empty here would drop it on the
+        // first resume, which is when the conversation is least readable.
+        *session.compaction_files.write().await =
+            crate::sessions::last_compaction_files(&session_path);
         *session.session_path.write().await = Some(session_path);
         Ok(session)
     }
@@ -820,6 +831,7 @@ recoverable. Re-run the command if you need it.]",
     }
 
     /// Persist a compaction record to the session file.
+    #[allow(clippy::too_many_arguments)]
     async fn persist_compaction(
         &self,
         summary: &str,
@@ -827,6 +839,7 @@ recoverable. Re-run the command if you need it.]",
         replaced: usize,
         checkpoint: &str,
         anchor: Option<&str>,
+        boundary: sessions::CompactionBoundary<'_>,
     ) {
         if let Some(ref path) = *self.session_path.read().await {
             if let Err(e) = sessions::append_compaction(
@@ -836,6 +849,7 @@ recoverable. Re-run the command if you need it.]",
                 replaced,
                 checkpoint,
                 anchor,
+                boundary,
             ) {
                 eprintln!("rupi: failed to persist compaction: {}", e);
             }
@@ -941,6 +955,7 @@ recoverable. Re-run the command if you need it.]",
         *self.is_compacting.lock().await = false;
         self.messages.write().await.clear();
         self.recent_tool_calls.write().await.clear();
+        *self.compaction_files.write().await = (Vec::new(), Vec::new());
         *self.consecutive_quality_issues.write().await = 0;
         self.pending_steer.write().await.clear();
         self.pending_follow_up.write().await.clear();
@@ -1330,6 +1345,11 @@ recoverable. Re-run the command if you need it.]",
         event_tx: mpsc::UnboundedSender<AgentEvent>,
         epoch: u64,
     ) -> Result<(), AgentError> {
+        // One context-overflow recovery per run. Compaction decides when to run
+        // from an estimate, and an estimate is sometimes wrong; a second failure
+        // in the same run means compacting did not help, so the turn must fail
+        // rather than loop on the summarizer.
+        let mut overflow_recovered = false;
         for _turn_num in 0.. {
             // Check abort signal; also check persistent abort_requested flag
             let abort_now = std::mem::take(&mut *self.abort_requested.lock().await);
@@ -1435,6 +1455,20 @@ recoverable. Re-run the command if you need it.]",
                 None => {
                     let err = last_error
                         .unwrap_or(AgentError::Config("Request failed after retries".into()));
+                    // The provider refused the request for not fitting its window.
+                    // The agent can fix that by itself: make room and ask again.
+                    // Reported as an error instead, an unattended run stopped on
+                    // the one failure it was equipped to handle.
+                    if err.is_context_overflow() && !overflow_recovered {
+                        overflow_recovered = true;
+                        eprintln!("rupi: the provider refused the request for its size; compacting and retrying once");
+                        match self.compact_forced().await {
+                            Ok(_) => continue,
+                            Err(e) => {
+                                eprintln!("rupi: could not compact after an overflow: {}", e)
+                            }
+                        }
+                    }
                     if matches!(err, AgentError::Cancelled) {
                         *self.abort_requested.lock().await = false;
                     }
@@ -1730,7 +1764,25 @@ recoverable. Re-run the command if you need it.]",
                     let approval = self.approval_fn.read().await.clone();
                     let call = tc.clone();
                     let context = self.tool_context.clone();
+                    // A running command reports its output to this turn's stream.
+                    // Set per call and cleared after, so a tool that runs outside a
+                    // turn sends nothing to a receiver nobody is reading.
+                    {
+                        let mut updates = context
+                            .updates
+                            .lock()
+                            .unwrap_or_else(|poisoned| poisoned.into_inner());
+                        *updates = Some(event_tx.clone());
+                    }
                     let result = tools::execute_tool_async(call, context, approval).await;
+                    {
+                        let mut updates = self
+                            .tool_context
+                            .updates
+                            .lock()
+                            .unwrap_or_else(|poisoned| poisoned.into_inner());
+                        *updates = None;
+                    }
 
                     let _ = event_tx.send(AgentEvent::tool_execution_end(
                         tc.name.clone(),
@@ -1852,6 +1904,19 @@ recoverable. Re-run the command if you need it.]",
     /// Run compaction on the conversation history.
     /// Summarizes older messages to free up context window space.
     pub async fn compact(&self) -> Result<CompactionResult, AgentError> {
+        self.compact_inner(false).await
+    }
+
+    /// Compact even when the token estimate says the context still fits.
+    ///
+    /// For the one caller that knows better than the estimate: the provider
+    /// refused the request for its size. Asking the ordinary path there is
+    /// useless, because it declines for exactly the reason that was wrong.
+    pub async fn compact_forced(&self) -> Result<CompactionResult, AgentError> {
+        self.compact_inner(true).await
+    }
+
+    async fn compact_inner(&self, force: bool) -> Result<CompactionResult, AgentError> {
         {
             let mut compacting = self.is_compacting.lock().await;
             if *compacting {
@@ -1877,7 +1942,7 @@ recoverable. Re-run the command if you need it.]",
         let pristine = self.messages.read().await.clone();
         let total_tokens = compaction::estimate_total_tokens(&pristine);
 
-        if !compaction::should_compact(total_tokens, self.context_window) {
+        if !force && !compaction::should_compact(total_tokens, self.context_window) {
             {
                 let mut compacting = self.is_compacting.lock().await;
                 *compacting = false;
@@ -1896,7 +1961,14 @@ recoverable. Re-run the command if you need it.]",
         let removed = compaction::snip_old_tool_results(&mut snipped, 6);
         let snipped_len = snipped.len();
 
-        let keep_recent = self.context_window.saturating_div(10).clamp(1, 20000);
+        let mut keep_recent = self.context_window.saturating_div(10).clamp(1, 20000);
+        if force {
+            // The estimate said this conversation fits, and the provider refused it
+            // anyway. The same estimate decides how much to keep, so leaving it
+            // alone finds no cut at all and the recovery frees nothing. Halving
+            // what is kept guarantees a cut exists.
+            keep_recent = keep_recent.min(total_tokens / 2);
+        }
         let cut_index = match compaction::find_cut_point(&snipped, keep_recent) {
             Some(i) => i,
             None => {
@@ -1972,8 +2044,57 @@ recoverable. Re-run the command if you need it.]",
         // expect at most one system message — the one built fresh each turn.
         // Not persisted as its own line. The compaction record below carries it, so
         // replay rebuilds exactly the order this function builds in memory.
-        let checkpoint_body = compaction::build_checkpoint_body(&summary);
+        // A cut cannot land inside a parallel batch of tool calls: that would orphan
+        // a result. When the batch alone is over budget, the summary frees nothing
+        // and every later turn compacts again for no result. Two moves are left,
+        // in order of what they cost the conversation.
+        let mut cut_index = cut_index;
+        let tail_fits = |msgs: &[Message], window: u64| {
+            !compaction::should_compact(compaction::estimate_total_tokens(msgs), window)
+        };
+        if !tail_fits(&snipped[cut_index..], self.context_window) {
+            // First: cut the results themselves. The full text was spilled to disk
+            // when it was stored, so this costs detail, not information.
+            let freed = compaction::shrink_tool_results(
+                &mut snipped[cut_index..],
+                compaction::TAIL_RESULT_CHARS,
+            );
+            if freed > 0 {
+                eprintln!(
+                    "rupi: the kept tail could not be cut into, so {} chars of tool results in it were shortened",
+                    freed
+                );
+            }
+            if !tail_fits(&snipped[cut_index..], self.context_window) {
+                // Then: keep nothing. The checkpoint and the anchor become the whole
+                // conversation, which is a valid request and always fits.
+                eprintln!(
+                    "rupi: the kept tail is over budget on its own, so this checkpoint replaces the whole conversation"
+                );
+                cut_index = snipped.len();
+            }
+        }
+
+        // The paths come from the replaced span's own tool calls, so the checkpoint
+        // names them even when the summarizer's text left them out.
+        let (span_read, span_modified) = compaction::files_touched(&pristine[..cut_index]);
+        let (read_files, modified_files) = {
+            let carried = self.compaction_files.read().await;
+            let modified = compaction::merge_files(&span_modified, &carried.1);
+            let mut read = compaction::merge_files(&span_read, &carried.0);
+            // A file that was changed is more interesting as changed than as read,
+            // across the whole session and not only inside one span. Otherwise a
+            // file edited early and read later appeared in both lists.
+            read.retain(|path| !modified.contains(path));
+            (read, modified)
+        };
+        let checkpoint_body =
+            compaction::build_checkpoint_body_with_files(&summary, &read_files, &modified_files);
         let summary_msg = Message::new("user", &checkpoint_body);
+        // The boundary is named, not only counted. A message appended while the
+        // summary was in flight shifts every position by one, and replay then cut
+        // in the wrong place.
+        let first_kept_digest = pristine.get(cut_index).map(compaction::message_digest);
 
         // Re-emit the anchor directly below the checkpoint. This is the position that
         // makes the fix structural: the exact request the user typed is present in
@@ -2025,8 +2146,14 @@ recoverable. Re-run the command if you need it.]",
             cut_index,
             &checkpoint_body,
             anchor_msg.as_ref().map(|m| m.content.as_str()),
+            sessions::CompactionBoundary {
+                first_kept_digest: first_kept_digest.as_deref(),
+                read_files: &read_files,
+                modified_files: &modified_files,
+            },
         )
         .await;
+        *self.compaction_files.write().await = (read_files, modified_files);
 
         // Released only now. `reset()` polls this flag and then swaps
         // `session_path`, so clearing it before the writes above let a concurrent
@@ -2115,6 +2242,38 @@ recoverable. Re-run the command if you need it.]",
 
         let result = self.compact().await?;
         Ok(Some(result))
+    }
+
+    /// The tool context this session passes to every tool call.
+    ///
+    /// Exposed so a caller, or a test, can reach the per-command controls without
+    /// a prompt in flight.
+    pub fn tool_context(&self) -> &tools::ToolContext {
+        &self.tool_context
+    }
+
+    /// Stop the command that is running, and let the turn continue.
+    ///
+    /// `abort` ends the whole run, which is the wrong answer to "this build is
+    /// stuck". The command returns its cancellation notice as its result, and the
+    /// model carries on from there.
+    pub fn abort_bash(&self) {
+        self.tool_context
+            .command_cancelled
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// Drop every queued steer and follow-up, and report how many went.
+    ///
+    /// A caller that queued a message and changed its mind had no way to withdraw
+    /// it: the message waited and then redirected a turn that had moved on.
+    pub async fn clear_queue(&self) -> usize {
+        let mut dropped = self.pending_steer.write().await;
+        let mut follow_up = self.pending_follow_up.write().await;
+        let total = dropped.len() + follow_up.len();
+        dropped.clear();
+        follow_up.clear();
+        total
     }
 
     /// Abort the current streaming operation.
@@ -2403,6 +2562,32 @@ Has the assistant's output satisfied this exact condition? Reply with only YES o
                 .as_ref()
                 .map(|p| p.to_string_lossy().to_string()),
         }
+    }
+
+    /// Every message the transcript holds, including what compaction replaced.
+    ///
+    /// `get_messages_as_rpc` returns the context, which is what the next request
+    /// carries. This is the record: a compaction leaves the replaced messages in
+    /// the file, and a caller that wants the audit trail reads them here.
+    pub async fn get_transcript_as_rpc(&self) -> Vec<AgentMessage> {
+        let path = self.session_path.read().await.clone();
+        let messages = match path {
+            Some(path) => crate::sessions::load_transcript(&path).unwrap_or_default(),
+            None => self.messages.read().await.clone(),
+        };
+        messages
+            .iter()
+            .map(|m| AgentMessage {
+                role: m.role.clone(),
+                content: vec![MessageContent {
+                    content_type: "text".to_string(),
+                    text: Some(m.content.clone()),
+                }],
+                model: None,
+                usage: None,
+                stop_reason: None,
+            })
+            .collect()
     }
 
     pub async fn get_messages_as_rpc(&self) -> Vec<AgentMessage> {

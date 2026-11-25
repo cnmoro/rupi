@@ -121,6 +121,30 @@ impl RpcHandler {
                 )
                 .await;
             }
+            RpcCommand::GetTranscript { id } => {
+                let msgs = session.read().await.get_transcript_as_rpc().await;
+                write_success(
+                    tx,
+                    id,
+                    "get_transcript",
+                    Some(serde_json::json!({ "messages": msgs })),
+                )
+                .await;
+            }
+            RpcCommand::AbortBash { id } => {
+                session.read().await.abort_bash();
+                write_success(tx, id, "abort_bash", None::<serde_json::Value>).await;
+            }
+            RpcCommand::ClearQueue { id } => {
+                let dropped = session.read().await.clear_queue().await;
+                write_success(
+                    tx,
+                    id,
+                    "clear_queue",
+                    Some(serde_json::json!({ "dropped": dropped })),
+                )
+                .await;
+            }
             RpcCommand::Compact { id, .. } => match session.read().await.compact().await {
                 Ok(result) => {
                     let data = serde_json::json!({
@@ -412,6 +436,24 @@ mod tests {
         let responses = handle_and_collect(&handler, cmd).await;
         let data = responses[0].data.as_ref().unwrap();
         assert!(data.get("model").is_some());
+    }
+
+    #[tokio::test]
+    async fn the_new_commands_answer_over_rpc() {
+        // The three gaps a headless caller hit: no way to withdraw a queued
+        // message, no way to stop one command, no way to read the record.
+        let handler = create_test_handler();
+        for (line, command) in [
+            (r#"{"type":"clear_queue","id":"a"}"#, "clear_queue"),
+            (r#"{"type":"abort_bash","id":"b"}"#, "abort_bash"),
+            (r#"{"type":"get_transcript","id":"c"}"#, "get_transcript"),
+        ] {
+            let cmd: RpcCommand = serde_json::from_str(line).expect("the command must parse");
+            let responses = handle_and_collect(&handler, cmd).await;
+            assert_eq!(responses.len(), 1, "{} answered oddly", command);
+            assert_eq!(responses[0].command, command);
+            assert!(responses[0].success, "{} failed", command);
+        }
     }
 
     #[tokio::test]

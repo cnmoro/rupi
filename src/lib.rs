@@ -19,4 +19,5 @@ pub mod sessions;
 pub mod skills;
 pub mod spill;
 pub mod todo;
+pub mod tool_host;
 pub mod tools;

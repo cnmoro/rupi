@@ -71,6 +71,30 @@ pub struct Cli {
     #[arg(long, env = "RUPI_STREAM_IDLE_TIMEOUT", default_value_t = 120)]
     pub stream_idle_timeout: u64,
 
+    /// Run the semantic code search and print the result, then exit.
+    ///
+    /// The one tool with no equivalent in a shell. Exposed so a script the agent
+    /// writes can compose it with `grep`, `jq` and the rest, which is the useful
+    /// half of Pi's codemode without a JavaScript engine in the binary.
+    #[arg(long, value_name = "QUERY")]
+    pub search_code: Option<String>,
+
+    /// Execute tool calls read as JSONL on stdin, and exit when stdin closes.
+    ///
+    /// The remote half of "the agent runs here, the tools run there": start this
+    /// on another machine over SSH, or inside a container, and point a local rupi
+    /// at it with --tool-command.
+    #[arg(long)]
+    pub tool_daemon: bool,
+
+    /// Run every tool through this command instead of running it here.
+    ///
+    /// The command must speak the tool protocol on stdin and stdout, which
+    /// `--tool-daemon` does. For example:
+    /// `--tool-command "ssh build-box rupi --tool-daemon"`.
+    #[arg(long, value_name = "COMMAND")]
+    pub tool_command: Option<String>,
+
     /// List all saved sessions with IDs and metadata
     #[arg(long)]
     pub list_sessions: bool,
@@ -95,7 +119,9 @@ impl Cli {
     pub fn mode(&self) -> &str {
         // One prompt wins over every other mode. A caller that passes it wants an
         // answer on stdout, not a session that waits for more input.
-        if self.prompt.is_some() {
+        if self.tool_daemon {
+            "tool-daemon"
+        } else if self.prompt.is_some() {
             "once"
         } else if self.rpc {
             "rpc"

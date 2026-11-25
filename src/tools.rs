@@ -73,12 +73,55 @@ pub struct ToolContext {
     pub cancelled: Arc<AtomicBool>,
     pub todos: std::sync::Arc<crate::todo::TodoStore>,
     pub goal: std::sync::Arc<crate::goal::GoalRegistry>,
+    /// Stops the running command alone, and nothing else in the turn.
+    ///
+    /// `cancelled` ends the whole turn, which is the wrong tool for "this build is
+    /// stuck". The command returns its cancellation notice as its result, and the
+    /// model carries on from there.
+    pub command_cancelled: Arc<AtomicBool>,
+    /// Where a running command sends the output it has produced so far.
+    ///
+    /// Set for the turn that is streaming, and `None` otherwise, so a tool run
+    /// outside a turn costs nothing.
+    pub updates:
+        Arc<Mutex<Option<tokio::sync::mpsc::UnboundedSender<crate::rpc::types::AgentEvent>>>>,
 }
 
 impl ToolContext {
     /// A context with an empty plan and no goal.
     pub fn new() -> Self {
         ToolContext::default()
+    }
+}
+
+/// What a running command listens to, and where it reports.
+#[derive(Clone, Default)]
+pub struct BashControl {
+    /// The turn was cancelled. Every tool stops.
+    pub cancelled: Arc<AtomicBool>,
+    /// This command was cancelled. The turn continues.
+    pub command_cancelled: Arc<AtomicBool>,
+    /// Where partial output goes, when a caller is listening.
+    pub updates: Option<tokio::sync::mpsc::UnboundedSender<crate::rpc::types::AgentEvent>>,
+}
+
+impl BashControl {
+    /// The control a tool call inherits from its context.
+    pub fn from_context(ctx: &ToolContext) -> Self {
+        BashControl {
+            cancelled: ctx.cancelled.clone(),
+            command_cancelled: ctx.command_cancelled.clone(),
+            updates: ctx
+                .updates
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .clone(),
+        }
+    }
+
+    /// Whether the command must stop now, for either reason.
+    pub fn stop_requested(&self) -> bool {
+        self.cancelled.load(Ordering::SeqCst) || self.command_cancelled.load(Ordering::SeqCst)
     }
 }
 
@@ -437,7 +480,7 @@ fn mutation_then_run(
     if let Some(timeout) = then_run.timeout {
         bash_args["timeout"] = serde_json::json!(timeout);
     }
-    let outcome = run_bash_blocking(&bash_args, ctx.cancelled.clone());
+    let outcome = run_bash_blocking(&bash_args, BashControl::from_context(ctx));
 
     // A failed command never undoes the mutation. Saying so explicitly stops the
     // model from re-applying an edit that is already on disk.
@@ -485,8 +528,14 @@ Re-issue it if you still need the check.",
 
 /// Execute a tool call and return the result.
 pub fn execute_tool(tool_call: &ToolCall, ctx: &ToolContext) -> String {
+    // A configured host runs everything except the tools that belong to the
+    // conversation. Approval has already been decided above this point, so a
+    // declined call is never sent anywhere.
+    if let Some(result) = crate::tool_host::forward(tool_call, &BashControl::from_context(ctx)) {
+        return result;
+    }
     match tool_call.name.as_str() {
-        "bash" => execute_bash_with_cancel(&tool_call.arguments, ctx.cancelled.clone()),
+        "bash" => execute_bash_with_cancel(&tool_call.arguments, BashControl::from_context(ctx)),
         "read" => execute_read(&tool_call.arguments),
         "write" => mutation_then_run(tool_call, execute_write(tool_call), "write", ctx),
         "edit" => mutation_then_run(tool_call, execute_edit(&tool_call.arguments), "edit", ctx),
@@ -508,6 +557,16 @@ pub async fn execute_tool_async(
     approval: Option<crate::agent::session::ApprovalFn>,
 ) -> String {
     static WORKERS: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(4);
+    // The plan and the goal are in-memory state: no file, no process, no network.
+    // Taking a worker for them meant a batch of slow calls starved them, and with
+    // a remote host, which serializes, a plan update waited minutes behind work it
+    // had nothing to do with.
+    if crate::tool_host::runs_locally(&call.name) {
+        if context.cancelled.load(Ordering::SeqCst) {
+            return cancelled_notice();
+        }
+        return execute_tool(&call, &context);
+    }
     let cancellation = async {
         while !context.cancelled.load(Ordering::SeqCst) {
             tokio::time::sleep(std::time::Duration::from_millis(20)).await;
@@ -598,11 +657,11 @@ fn resolve_path(path_str: &str) -> PathBuf {
 // ---- bash ----
 #[cfg(test)]
 fn execute_bash(args: &Value) -> String {
-    execute_bash_with_cancel(args, Arc::new(AtomicBool::new(false)))
+    execute_bash_with_cancel(args, BashControl::default())
 }
 
-fn execute_bash_with_cancel(args: &Value, cancelled: Arc<AtomicBool>) -> String {
-    run_bash_blocking(args, cancelled).text
+fn execute_bash_with_cancel(args: &Value, control: BashControl) -> String {
+    run_bash_blocking(args, control).text
 }
 
 /// What one bash run produced, plus whether it actually succeeded.
@@ -618,7 +677,7 @@ pub struct BashOutcome {
     pub succeeded: bool,
 }
 
-fn run_bash_blocking(args: &Value, cancelled: Arc<AtomicBool>) -> BashOutcome {
+fn run_bash_blocking(args: &Value, control: BashControl) -> BashOutcome {
     // Called on a blocking worker; a local IO runtime lets us cancel pipe reads
     // portably without leaving threads parked behind background children.
     std::thread::scope(|scope| {
@@ -628,7 +687,7 @@ fn run_bash_blocking(args: &Value, cancelled: Arc<AtomicBool>) -> BashOutcome {
                     .enable_all()
                     .build()
                 {
-                    Ok(runtime) => runtime.block_on(run_bash(args, cancelled)),
+                    Ok(runtime) => runtime.block_on(run_bash(args, control)),
                     Err(e) => BashOutcome {
                         text: format!("Failed to create bash IO runtime: {e}"),
                         succeeded: false,
@@ -644,6 +703,13 @@ fn run_bash_blocking(args: &Value, cancelled: Arc<AtomicBool>) -> BashOutcome {
 }
 
 const MAX_CAPTURE_BYTES: usize = 1024 * 1024;
+
+/// Most bytes of one stream reported as events while a command runs.
+///
+/// The result still carries everything up to `MAX_CAPTURE_BYTES`. This bounds
+/// only what a watching caller receives, so a command that prints megabytes does
+/// not make the event stream the slow part.
+const MAX_STREAMED_BYTES: usize = 256 * 1024;
 
 /// The fenced notice returned when a tool call is cancelled.
 ///
@@ -693,17 +759,40 @@ pub fn notice_close() -> String {
     format!("--- end rupi bash notice {} ---", notice_token())
 }
 
-async fn drain_pipe<R: tokio::io::AsyncRead + Unpin>(mut pipe: R, sink: Arc<Mutex<Vec<u8>>>) {
+async fn drain_pipe<R: tokio::io::AsyncRead + Unpin>(
+    mut pipe: R,
+    sink: Arc<Mutex<Vec<u8>>>,
+    stream: &'static str,
+    updates: Option<tokio::sync::mpsc::UnboundedSender<crate::rpc::types::AgentEvent>>,
+) {
     use tokio::io::AsyncReadExt;
     let mut chunk = [0; 8192];
+    let mut streamed = 0usize;
     while let Ok(n) = pipe.read(&mut chunk).await {
         if n == 0 {
             break;
         }
-        let mut buffer = sink.lock().unwrap_or_else(|e| e.into_inner());
-        let remaining = MAX_CAPTURE_BYTES.saturating_sub(buffer.len());
-        buffer.extend_from_slice(&chunk[..n.min(remaining)]);
-        // Continue draining excess output so a noisy command cannot deadlock.
+        {
+            let mut buffer = sink.lock().unwrap_or_else(|e| e.into_inner());
+            let remaining = MAX_CAPTURE_BYTES.saturating_sub(buffer.len());
+            buffer.extend_from_slice(&chunk[..n.min(remaining)]);
+            // Continue draining excess output so a noisy command cannot deadlock.
+        }
+        // Report progress, up to a bound. A command that prints megabytes must not
+        // turn the event stream into the bottleneck; the whole output still arrives
+        // in the tool result.
+        if let Some(tx) = updates.as_ref() {
+            if streamed < MAX_STREAMED_BYTES {
+                let room = MAX_STREAMED_BYTES - streamed;
+                let piece = &chunk[..n.min(room)];
+                streamed += piece.len();
+                let _ = tx.send(crate::rpc::types::AgentEvent::tool_execution_update(
+                    "bash".to_string(),
+                    stream,
+                    String::from_utf8_lossy(piece).to_string(),
+                ));
+            }
+        }
     }
 }
 
@@ -1102,14 +1191,16 @@ async fn kill_process_tree(child: &mut tokio::process::Child, exec_id: &str) {
     let _ = child.wait().await;
 }
 
-async fn run_bash(args: &Value, cancelled: Arc<AtomicBool>) -> BashOutcome {
+async fn run_bash(args: &Value, control: BashControl) -> BashOutcome {
     let Some(command) = get_arg(args, "command") else {
         return BashOutcome {
             text: "Error: missing 'command' argument".into(),
             succeeded: false,
         };
     };
-    if cancelled.load(Ordering::SeqCst) {
+    if control.stop_requested() {
+        // Clear the per-command flag so the next command is not cancelled too.
+        control.command_cancelled.store(false, Ordering::SeqCst);
         return BashOutcome {
             text: cancelled_notice(),
             succeeded: false,
@@ -1157,13 +1248,24 @@ async fn run_bash(args: &Value, cancelled: Arc<AtomicBool>) -> BashOutcome {
     let err = Arc::new(Mutex::new(Vec::new()));
     let mut readers = tokio::task::JoinSet::new();
     if let Some(pipe) = child.stdout.take() {
-        readers.spawn(drain_pipe(pipe, out.clone()));
+        readers.spawn(drain_pipe(
+            pipe,
+            out.clone(),
+            "stdout",
+            control.updates.clone(),
+        ));
     }
     if let Some(pipe) = child.stderr.take() {
-        readers.spawn(drain_pipe(pipe, err.clone()));
+        readers.spawn(drain_pipe(
+            pipe,
+            err.clone(),
+            "stderr",
+            control.updates.clone(),
+        ));
     }
-    let cancellation = async {
-        while !cancelled.load(Ordering::SeqCst) {
+    let stop = control.clone();
+    let cancellation = async move {
+        while !stop.stop_requested() {
             tokio::time::sleep(std::time::Duration::from_millis(20)).await;
         }
     };
@@ -1200,6 +1302,8 @@ async fn run_bash(args: &Value, cancelled: Arc<AtomicBool>) -> BashOutcome {
     if out.len() == MAX_CAPTURE_BYTES || err.len() == MAX_CAPTURE_BYTES {
         result.push_str("\n[output capture capped at 1 MiB per stream]");
     }
+    // The per-command cancellation applies to this command only.
+    control.command_cancelled.store(false, Ordering::SeqCst);
     BashOutcome {
         succeeded: notice.is_empty() && status == Some(0),
         text: result,
@@ -2796,7 +2900,7 @@ mod tests {
         use tokio::io::AsyncWriteExt;
         let (mut writer, reader) = tokio::io::duplex(8192);
         let sink = Arc::new(Mutex::new(Vec::new()));
-        let task = tokio::spawn(drain_pipe(reader, sink.clone()));
+        let task = tokio::spawn(drain_pipe(reader, sink.clone(), "stdout", None));
         writer
             .write_all(&vec![b'x'; MAX_CAPTURE_BYTES * 3])
             .await
@@ -2887,8 +2991,15 @@ mod tests {
             );
             assert!(!result.contains("timed out"), "{}", result);
         }
-        std::thread::sleep(std::time::Duration::from_millis(600));
-        let after = own_zombies();
+        // Wait for the count to settle rather than sampling it once. The suite runs
+        // in parallel, so a sibling test's command can be a zombie for a few
+        // milliseconds; a real leak never clears.
+        let mut after = own_zombies();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while after > before + 1 && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(100));
+            after = own_zombies();
+        }
         assert!(
             after <= before + 1,
             "ten commands left {} zombies parented to this process",

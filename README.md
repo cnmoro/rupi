@@ -68,9 +68,16 @@ JSONL protocol over stdin and stdout. Send one JSON command per line on stdin, r
 ...
 ```
 
-Events: `generation_id`, `agent_start`, `turn_start`, `message_start`, `message_update`, `message_end`, `turn_end`, `agent_end`, `tool_execution_start`, `tool_execution_end`.
+Events: `generation_id`, `agent_start`, `turn_start`, `message_start`, `message_update`, `message_end`, `turn_end`, `agent_end`, `tool_execution_start`, `tool_execution_update`, `tool_execution_end`.
 
-Commands: `ping`, `prompt`, `steer`, `follow_up`, `abort`, `new_session`, `get_state`, `set_model`, `cycle_model`, `get_available_models`, `set_thinking_level`, `cycle_thinking_level`, `compact`, `set_auto_compaction`, `get_messages`, `list_sessions`, `set_loop`, `stop_loop`. Every command takes an optional `id`, and the `response` line for that command carries it back with `success`. A command that is refused answers with `success: false` and a reason.
+Three of those commands and one of those events exist for a caller that is watching rather than typing:
+
+- `tool_execution_update` carries a running command's output as it arrives, on `stdout` or `stderr`. A build says what it is doing for minutes before it finishes, and without this a long command and a hung one looked the same. Up to 256 KiB per stream reaches the event stream; the whole output still reaches the tool result.
+- `abort_bash` stops the command that is running and lets the turn continue. `abort` ends the whole run, which is the wrong answer to "this build is stuck": the command returns its cancellation notice as its result, and the model carries on from there.
+- `clear_queue` drops every queued steer and follow-up, and reports how many went. A caller that queued a message and changed its mind had no way to withdraw it, so the message waited and then redirected a turn that had moved on.
+- `get_transcript` returns every message the record holds, including what compaction replaced. `get_messages` returns the context, which is what the next request carries.
+
+Commands: `ping`, `prompt`, `steer`, `follow_up`, `abort`, `abort_bash`, `clear_queue`, `new_session`, `get_state`, `set_model`, `cycle_model`, `get_available_models`, `set_thinking_level`, `cycle_thinking_level`, `compact`, `set_auto_compaction`, `get_messages`, `get_transcript`, `list_sessions`, `set_loop`, `stop_loop`. Every command takes an optional `id`, and the `response` line for that command carries it back with `success`. A command that is refused answers with `success: false` and a reason.
 
 **Steer / follow-up in RPC**: add `"streamingBehavior"` to the prompt command:
 
@@ -106,6 +113,39 @@ Exit code 0 with the answer on stdout, or a non-zero code with the reason on std
 A prompt given this way starts a fresh session unless `--session <id>` names one.
 
 This is also how one agent starts another. See **Subagents** below.
+
+### Semantic search — `./rupi --search-code "<query>"`
+
+Runs the semantic code search and prints the result. It needs no provider, no API key and no session.
+
+This is the one tool with no equivalent in a shell, so exposing it lets a script the agent writes compose it with `grep`, `jq` and the rest. That is the useful half of Pi's codemode without a JavaScript engine in the binary: the shell is already the scripting layer, and rupi already runs tool calls concurrently.
+
+### Tool host — `./rupi --tool-daemon`
+
+Runs tool calls for an agent in another process. One JSON object per line in, one per line out, on stdin and stdout:
+
+```json
+{"id":"1","name":"read","arguments":{"file_path":"src/main.rs"}}
+{"id":"1","result":"...the file..."}
+```
+
+A local agent sends its tools there with `--tool-command`:
+
+```sh
+./rupi --tool-command "ssh build-box rupi --tool-daemon"
+./rupi --tool-command "docker exec -i work rupi --tool-daemon"
+```
+
+The conversation, the provider and the credentials stay local. Only tool calls cross. rupi owns no transport: the command is yours, so anything that gives a pipe works, and there is no SSH logic, key handling or deployment in the binary.
+
+`todo_write` and `goal` always run locally, because they are conversation state rather than work. Approval is decided before a call leaves, so a declined call is never sent. Calls are serialized, one at a time. A host that fails returns an error that says the tool did not run, and the next call starts a new host.
+
+An abort reaches a tool running on the host: the wait is polled, the host and everything it started are killed as one process group, and a call still queued behind another is never sent. An answer is capped at 8 MiB, and each exchange carries an id of its own, so a host that answers twice can never hand one call's output to the next.
+
+The daemon runs tools with the privileges of wherever it runs, and it holds no provider configuration: it starts on a machine with no `rupi.json` and no API key. That is the point and also the whole risk. Two things to know before you point it somewhere:
+
+- The command inherits this process's environment, exactly as the `bash` tool does. With `--tool-command "docker exec -i ..."` that sends your local variables, API keys included, into the container. Scrub what you do not want to cross.
+- A long remote command still holds the single host slot, because calls are serialized. `todo_write` and `goal` are unaffected: they are conversation state and never wait for a worker.
 
 ### Raw — `./rupi --raw`
 
@@ -177,7 +217,15 @@ RPC has no goal command. A headless caller drives rounds itself — it owns the 
   - The conversation is append-only. Nothing already sent is ever edited, so an automatic prefix cache (vLLM, SGLang, OpenAI, DeepSeek) keeps matching. A compaction is the only thing that breaks the prefix, and it replaces the head by design.
   - Two `cache_control` breakpoints are sent for servers that need explicit ones: a static breakpoint on the system message, and a moving breakpoint on the last message. The moving one is the important half — marking only the system message would leave the entire conversation, which is nearly all of the tokens, re-prefilled every turn. Because the history is append-only, this turn's breakpoint is the next turn's cache hit. Servers with automatic caching ignore the field.
   - The compaction call reuses the same prefix; see **Cache-aligned summarization** below.
-- **Compaction**: checked before each model request, including successive tool turns. When the context passes `window - 16384` tokens, **auto-compact** calls the LLM to summarize the old messages. A **snip** pass truncates long tool-role messages older than the last 6 turns, which costs nothing and lets more messages fit in the retained tail. The snip is applied to the tail that compaction stores, never to the live conversation: a run that snipped and then declined to compact would rewrite message bodies the provider had already cached and gain nothing for it. Set the window with `--context-window` (default 128000). A compaction is recorded in the session file, and resuming honours it: everything the summary replaced is left out, so a compacted session does not reopen over budget and immediately compact again.
+- **Context overflow recovery**: compaction decides when to run from an estimate of the token count, and an estimate is sometimes wrong. The provider then answers 400, and that used to end the turn — stopping an unattended run for the one failure the agent can fix by itself. A refusal for size now triggers one forced compaction and one retry. Forced, because the ordinary path declines for exactly the reason that was wrong, and it halves what it keeps so a cut exists at all. A second refusal in the same run fails, because compacting did not help.
+- **Compaction**: checked before each model request, including successive tool turns. When the context passes `window - 16384` tokens, **auto-compact** calls the LLM to summarize the old messages. A **snip** pass truncates long tool-role messages older than the last 6 turns, which costs nothing and lets more messages fit in the retained tail. The snip is applied to the tail that compaction stores, never to the live conversation: a run that snipped and then declined to compact would rewrite message bodies the provider had already cached and gain nothing for it. Set the window with `--context-window` (default 128000). A compaction is recorded in the session file, and resuming honours it: everything the summary replaced is left out of the context, so a compacted session does not reopen over budget and immediately compact again. The replaced messages stay in the file, and `get_transcript` reads them.
+
+  The cut is chosen by what the kept tail COSTS, not by walking back until the tail reaches the budget. Both steps of the old search could only keep more, so one oversized message — a single huge tool result — made every candidate keep it. Compaction then summarized a couple of old lines, reported success, freed nothing, and ran again on the next turn: a paid summarizer call per turn, forever, with the context still over budget. Measured on that shape, it kept 100,038 of 100,046 tokens.
+
+  The record names its boundary as well as counting it. A count is a fact about ordering, and the file can hold a different number of lines than the compactor held in memory: a persist that failed, a line lost to a crash mid-write, a transcript someone edited. The count then pointed at the wrong message and replay deleted real history without a word. The digest of the first kept message turns a drifted count into a search.
+
+  The record and the checkpoint also name the files the replaced span read and changed, taken from the tool calls rather than from the summary, and carried forward across compactions. A summarizer forgets to mention a path when its text gets long; the arguments of an `edit` call do not.
+- **Summary budget**: a one-off call such as a summary asks for an output budget derived from the context window, up to 32768 tokens, with room left for the input. It was a fixed 4096. On a reasoning model the thinking consumes that budget, so the summary arrived truncated or empty, checkpoint validation rejected it, the one retry failed the same way, and every compaction on such a model fell back to the mechanical checkpoint.
 - **Cache-aligned summarization**: the summarizer call replays the conversation's own system prompt, its tool schemas, and the region verbatim, then appends the compaction instruction as the final user message. That makes the call a genuine prefix of the last routed request, so the provider serves it from its KV cache instead of re-prefilling the whole span. The region replayed is the text from **before** the snip pass, because a snipped body no longer matches what the provider cached. The kept tail still gets the snipped copy. If an endpoint rejects the tool schemas on a non-streaming call, rupi retries without them and the summary still lands.
 - **Checkpoint validation**: a summarizer response is checked before it is stored. Headings are matched on what they say, not how they are typeset, so `**Current Work**` and `## 1. Current Work` both count, and a fenced code block inside a section does not end it. A response that is empty, too short, missing a required section, carrying a section with no substance, or simply the instruction echoed back is refused. Whatever comes back replaces the whole region, so a refusal, a filtered stub, or a stream cut off at the token limit would delete the context silently and leave the agent continuing from nothing. rupi then retries once, and if that also fails it builds a checkpoint mechanically from the messages — the files touched, the commands run, the last exchanges — which invents nothing and always works.
 - **Checkpoint framing**: the summary is stored as a message that states it is established background, wrapped in `<compacted-summary>` tags. The instruction tells the summarizer to merge a prior checkpoint rather than re-condense it, so repeated compactions consolidate instead of decaying.

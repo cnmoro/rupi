@@ -146,6 +146,21 @@ pub enum RpcCommand {
         #[serde(skip_serializing_if = "Option::is_none")]
         id: Option<String>,
     },
+    /// Every message the transcript holds, compaction included.
+    GetTranscript {
+        #[serde(skip_serializing_if = "Option::is_none")]
+        id: Option<String>,
+    },
+    /// Stop the running command, and let the turn continue.
+    AbortBash {
+        #[serde(skip_serializing_if = "Option::is_none")]
+        id: Option<String>,
+    },
+    /// Drop every queued steer and follow-up.
+    ClearQueue {
+        #[serde(skip_serializing_if = "Option::is_none")]
+        id: Option<String>,
+    },
     ListSessions {
         #[serde(skip_serializing_if = "Option::is_none")]
         id: Option<String>,
@@ -263,6 +278,18 @@ pub enum AgentEvent {
         result: String,
         timestamp: u64,
     },
+    /// Output a tool produced while it was still running.
+    ///
+    /// A build or a test suite says what it is doing for minutes before it
+    /// finishes. Without this a caller saw nothing until the tool returned, so a
+    /// long command was indistinguishable from a hung one.
+    ToolExecutionUpdate {
+        tool_name: String,
+        /// `stdout` or `stderr`.
+        stream: String,
+        chunk: String,
+        timestamp: u64,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -342,6 +369,15 @@ impl AgentEvent {
         AgentEvent::ToolExecutionStart {
             tool_name,
             arguments,
+            timestamp: now_millis(),
+        }
+    }
+
+    pub fn tool_execution_update(tool_name: String, stream: &str, chunk: String) -> Self {
+        AgentEvent::ToolExecutionUpdate {
+            tool_name,
+            stream: stream.to_string(),
+            chunk,
             timestamp: now_millis(),
         }
     }

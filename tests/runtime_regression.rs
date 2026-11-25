@@ -841,3 +841,133 @@ async fn a_cut_stream_is_never_reported_as_a_finished_answer() {
         answer
     );
 }
+
+#[tokio::test]
+async fn a_running_command_reports_its_output_as_it_goes() {
+    // A build says what it is doing for minutes before it finishes. Without this a
+    // caller saw nothing until the tool returned, so a long command and a hung one
+    // looked the same.
+    init_sessions();
+    let session = AgentSession::new(
+        Arc::new(ControlledProvider::default()),
+        "test".into(),
+        128000,
+        ".".into(),
+        vec![],
+        vec![],
+    );
+    let (tx, mut rx) = mpsc::unbounded_channel();
+    {
+        let mut updates = session
+            .tool_context()
+            .updates
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        *updates = Some(tx);
+    }
+    let result = rupi::tools::execute_tool_async(
+        rupi::tools::ToolCall {
+            id: "1".into(),
+            name: "bash".into(),
+            arguments: serde_json::json!({
+                "command": "echo first; sleep 0.2; echo second 1>&2"
+            }),
+            raw_arguments: None,
+        },
+        session.tool_context().clone(),
+        None,
+    )
+    .await;
+    assert!(result.contains("first"), "{}", result);
+
+    let mut streamed = Vec::new();
+    while let Ok(event) = rx.try_recv() {
+        let value = serde_json::to_value(&event).unwrap();
+        if value["type"] == "tool_execution_update" {
+            streamed.push((
+                value["stream"].as_str().unwrap_or("").to_string(),
+                value["chunk"].as_str().unwrap_or("").to_string(),
+            ));
+        }
+    }
+    assert!(
+        streamed
+            .iter()
+            .any(|(s, c)| s == "stdout" && c.contains("first")),
+        "no stdout update arrived: {:?}",
+        streamed
+    );
+    assert!(
+        streamed
+            .iter()
+            .any(|(s, c)| s == "stderr" && c.contains("second")),
+        "no stderr update arrived: {:?}",
+        streamed
+    );
+}
+
+#[tokio::test]
+async fn stopping_one_command_leaves_the_turn_alone() {
+    // `abort` ends the whole run, which is the wrong answer to "this build is
+    // stuck". The command returns its notice, and the next one still runs.
+    init_sessions();
+    let session = Arc::new(AgentSession::new(
+        Arc::new(ControlledProvider::default()),
+        "test".into(),
+        128000,
+        ".".into(),
+        vec![],
+        vec![],
+    ));
+    let stopper = session.clone();
+    tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        stopper.abort_bash();
+    });
+    let call = |command: &str| rupi::tools::ToolCall {
+        id: "1".into(),
+        name: "bash".into(),
+        arguments: serde_json::json!({ "command": command, "timeout": 20 }),
+        raw_arguments: None,
+    };
+    let stopped =
+        rupi::tools::execute_tool_async(call("sleep 15"), session.tool_context().clone(), None)
+            .await;
+    assert!(stopped.contains("cancelled"), "{}", stopped);
+
+    // The flag applied to that command only.
+    let after = rupi::tools::execute_tool_async(
+        call("echo still here"),
+        session.tool_context().clone(),
+        None,
+    )
+    .await;
+    assert!(
+        after.contains("still here"),
+        "the next command was cancelled too: {}",
+        after
+    );
+    assert!(
+        !session.is_streaming().await,
+        "stopping a command ended the run"
+    );
+}
+
+#[tokio::test]
+async fn a_queued_message_can_be_withdrawn() {
+    init_sessions();
+    let session = AgentSession::new(
+        Arc::new(ControlledProvider::default()),
+        "test".into(),
+        128000,
+        ".".into(),
+        vec![],
+        vec![],
+    );
+    session.follow_up("one").await;
+    session.steer("two").await;
+    assert_eq!(session.clear_queue().await, 2);
+    assert!(!session.has_pending_steer().await);
+    assert!(!session.has_pending_follow_up().await);
+    assert_eq!(session.clear_queue().await, 0);
+}

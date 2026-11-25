@@ -586,16 +586,29 @@ step is just to look at what is actually in the directory.\n\
     fn many_blocks_stay_fast() {
         // Searching the whole remainder for both marker styles every round made the
         // scan quadratic: 40,000 blocks took four seconds.
+        //
+        // Measured as growth, not as a deadline. A wall-clock bound in a suite that
+        // runs in parallel fails whenever the machine is busy, which says nothing
+        // about this code.
         let block = "```tool\n{\"name\":\"bash\",\"input\":{\"command\":\"ls\"}}\n```\n";
-        let text = block.repeat(20_000);
-        let started = std::time::Instant::now();
-        let calls = extract_tool_calls_from_text(&text);
-        let elapsed = started.elapsed();
-        assert_eq!(calls.len(), 20_000);
+        let time_for = |count: usize| {
+            let text = block.repeat(count);
+            let started = std::time::Instant::now();
+            let calls = extract_tool_calls_from_text(&text);
+            assert_eq!(calls.len(), count);
+            started.elapsed()
+        };
+        // Warm the allocator so the first measurement does not carry the cost.
+        let _ = time_for(500);
+        let small = time_for(5_000).max(std::time::Duration::from_micros(200));
+        let large = time_for(20_000);
+        // Four times the input. Linear work grows about fourfold; the quadratic
+        // version grew sixteenfold.
         assert!(
-            elapsed < std::time::Duration::from_millis(600),
-            "the scan took {:?} for 20000 blocks",
-            elapsed
+            large < small * 8,
+            "the scan grew faster than its input: {:?} for 5000 blocks, {:?} for 20000",
+            small,
+            large
         );
     }
 

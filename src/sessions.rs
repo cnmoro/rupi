@@ -56,6 +56,21 @@ pub struct SessionEntry<'a> {
     /// rather than a fact about file ordering.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub replaced_count: Option<usize>,
+    /// Digest of the first message the summary did NOT replace.
+    ///
+    /// The count above is a fact about ordering, and a concurrent writer disturbs
+    /// ordering. This names the boundary instead, so replay can check the count
+    /// and correct it. See `compaction::message_digest`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub first_kept_digest: Option<&'a str>,
+    /// Files the replaced span read, and files it changed.
+    ///
+    /// Structured, so it survives a summarizer that forgot to mention them. The
+    /// text of a summary drifts; a path does not.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub read_files: Option<&'a [String]>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub modified_files: Option<&'a [String]>,
     /// The complete checkpoint message body, framing and tags included.
     ///
     /// `summary` holds only the raw model text, so rebuilding a checkpoint from it
@@ -153,6 +168,9 @@ fn write_session_header(path: &std::path::Path, id: &str, model: &str) -> Result
         summary: None,
         tokens_before: None,
         replaced_count: None,
+        first_kept_digest: None,
+        read_files: None,
+        modified_files: None,
         checkpoint: None,
         anchor: None,
         session_id: Some(id),
@@ -241,6 +259,9 @@ pub fn append_message(path: &PathBuf, msg: &Message) -> Result<(), String> {
         summary: None,
         tokens_before: None,
         replaced_count: None,
+        first_kept_digest: None,
+        read_files: None,
+        modified_files: None,
         checkpoint: None,
         anchor: None,
         session_id: None,
@@ -250,6 +271,20 @@ pub fn append_message(path: &PathBuf, msg: &Message) -> Result<(), String> {
     file.write_all(format!("{}\n", serialize_json_line(&entry).trim()).as_bytes())
         .map_err(|e| format!("Cannot append to session file: {}", e))?;
     Ok(())
+}
+
+/// What a compaction says about its boundary, beyond the count.
+///
+/// Grouped so the writer's signature does not grow a new argument every time the
+/// record learns to describe itself better.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct CompactionBoundary<'a> {
+    /// Digest of the first message the summary did not replace.
+    pub first_kept_digest: Option<&'a str>,
+    /// Files the replaced span read.
+    pub read_files: &'a [String],
+    /// Files the replaced span changed.
+    pub modified_files: &'a [String],
 }
 
 /// Append a compaction entry to a session file.
@@ -266,6 +301,7 @@ pub fn append_compaction(
     replaced_count: usize,
     checkpoint: &str,
     anchor: Option<&str>,
+    boundary: CompactionBoundary<'_>,
 ) -> Result<(), String> {
     let entry = SessionEntry {
         entry_type: "compaction",
@@ -274,6 +310,9 @@ pub fn append_compaction(
         summary: Some(summary),
         tokens_before: Some(tokens_before),
         replaced_count: Some(replaced_count),
+        first_kept_digest: boundary.first_kept_digest,
+        read_files: Some(boundary.read_files),
+        modified_files: Some(boundary.modified_files),
         checkpoint: Some(checkpoint),
         anchor,
         session_id: None,
@@ -461,6 +500,125 @@ fn demote_tool_result(msg: &mut Message) {
     );
 }
 
+/// One stored `message` line as the message the agent holds.
+///
+/// Shared by both loaders. `load_transcript` had its own copy that accepted only
+/// lines matching `SessionMessageEntry`, so a message whose content is an array
+/// of blocks — what another agent's transcript, or a hand edit, looks like —
+/// reached `load_session` and vanished from the transcript.
+fn message_line_to_message(value: &serde_json::Value) -> Option<Message> {
+    let msg_val = value.get("message")?;
+    if let Ok(entry) = serde_json::from_value::<SessionMessageEntry>(msg_val.clone()) {
+        return Some(entry_to_message(&entry));
+    }
+    // Content the strict shape does not accept, kept as its text.
+    let role = msg_val["role"].as_str().unwrap_or("user");
+    let content = message_text(&msg_val["content"]);
+    Some(Message::new(normalize_role(role), &content))
+}
+
+/// One stored entry as the message the agent holds.
+fn entry_to_message(entry: &SessionMessageEntry) -> Message {
+    let mut msg = Message::new(normalize_role(&entry.role), &entry.content);
+    msg.tool_call_id = entry.tool_call_id.clone();
+    msg.reasoning_content = entry.reasoning_content.clone();
+    if let Some(calls) = entry.tool_calls.as_ref() {
+        let tool_calls: Vec<crate::tools::ToolCall> = calls
+            .iter()
+            .filter_map(|v| {
+                Some(crate::tools::ToolCall {
+                    id: v.get("id")?.as_str()?.to_string(),
+                    name: v.get("name")?.as_str()?.to_string(),
+                    arguments: v.get("arguments").cloned().unwrap_or_default(),
+                    raw_arguments: None,
+                })
+            })
+            .collect();
+        if !tool_calls.is_empty() {
+            msg.tool_calls = Some(tool_calls);
+        }
+    }
+    msg
+}
+
+/// Every message in a transcript, with no compaction applied.
+///
+/// `load_session` returns the context: what a compaction replaced is left out,
+/// because that is what the next request must carry. The replaced messages are
+/// still in the file, and this is how a caller reads them — an audit trail, or a
+/// search over work the summary no longer describes.
+pub fn load_transcript(path: &PathBuf) -> Result<Vec<Message>, String> {
+    let contents = match std::fs::read_to_string(path) {
+        Ok(text) => text,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) => return Err(format!("Cannot read session file: {}", e)),
+    };
+    let contents = contents
+        .strip_prefix('\u{feff}')
+        .unwrap_or(contents.as_str());
+    let mut messages = Vec::new();
+    for line in contents.lines() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let Ok(val) = serde_json::from_str::<serde_json::Value>(line) else {
+            continue;
+        };
+        match val["type"].as_str().unwrap_or("") {
+            "message" => {
+                if let Some(msg) = message_line_to_message(&val) {
+                    messages.push(msg);
+                }
+            }
+            // A compaction is part of the record, so the checkpoint it stored is
+            // part of the transcript. Nothing is dropped here.
+            "compaction" => {
+                if let Some(body) = val["checkpoint"].as_str() {
+                    messages.push(Message::new("user", body));
+                }
+                if let Some(anchor) = val["anchor"].as_str() {
+                    messages.push(Message::new("user", anchor));
+                }
+            }
+            _ => {}
+        }
+    }
+    Ok(messages)
+}
+
+/// The files named by the most recent compaction record in a transcript.
+///
+/// Read on resume so the next checkpoint carries the list forward instead of
+/// starting empty. Returns `(read, modified)`.
+pub fn last_compaction_files(path: &PathBuf) -> (Vec<String>, Vec<String>) {
+    let Ok(contents) = std::fs::read_to_string(path) else {
+        return (Vec::new(), Vec::new());
+    };
+    let mut found = (Vec::new(), Vec::new());
+    for line in contents.lines() {
+        let Ok(val) = serde_json::from_str::<serde_json::Value>(line.trim()) else {
+            continue;
+        };
+        if val["type"] != "compaction" {
+            continue;
+        }
+        let list = |key: &str| -> Vec<String> {
+            val[key]
+                .as_array()
+                .map(|items| {
+                    items
+                        .iter()
+                        .filter_map(|v| v.as_str().map(str::to_string))
+                        .collect()
+                })
+                .unwrap_or_default()
+        };
+        found = (list("read_files"), list("modified_files"));
+    }
+    found
+}
+
 /// Load all entries from a session file.
 pub fn load_session(path: &PathBuf) -> Result<Vec<Message>, String> {
     if !path.exists() {
@@ -510,7 +668,26 @@ pub fn load_session(path: &PathBuf) -> Result<Vec<Message>, String> {
                         // Drop only what this summary actually replaced. Anything
                         // another writer appended while the summary was in flight
                         // sits past that boundary and has to survive.
-                        let boundary = (replaced as usize).min(messages.len());
+                        let hint = (replaced as usize).min(messages.len());
+                        // The count is a hint about ordering. The digest names the
+                        // message the count was supposed to point at, so a hint
+                        // that drifted becomes a search instead of a wrong cut.
+                        let boundary = match val["first_kept_digest"].as_str() {
+                            Some(digest) => {
+                                let found =
+                                    crate::compaction::locate_boundary(&messages, hint, digest);
+                                if found.is_some_and(|at| at != hint) {
+                                    eprintln!(
+                                        "rupi: a compaction boundary moved from {} to {}; the transcript grew while the summary was in flight",
+                                        hint,
+                                        found.unwrap_or(hint)
+                                    );
+                                }
+                                found.unwrap_or(hint)
+                            }
+                            // Written before the digest existed.
+                            None => hint,
+                        };
                         let mut kept: Vec<Message> = messages.split_off(boundary);
                         // An older transcript also has the body as its own line.
                         kept.retain(|m| !m.content.starts_with(COMPACTION_PREFIX));
@@ -530,41 +707,8 @@ pub fn load_session(path: &PathBuf) -> Result<Vec<Message>, String> {
                 continue;
             }
             if entry_type == "message" {
-                if let Some(msg_val) = val.get("message") {
-                    let role = msg_val["role"].as_str().unwrap_or("user");
-                    let content = message_text(&msg_val["content"]);
-                    let content = content.as_str();
-
-                    // Try to deserialize with optional tool_calls and tool_call_id
-                    if let Ok(entry) =
-                        serde_json::from_value::<SessionMessageEntry>(msg_val.clone())
-                    {
-                        let mut msg = Message::new(normalize_role(&entry.role), &entry.content);
-                        msg.tool_call_id = entry.tool_call_id;
-                        msg.reasoning_content = entry.reasoning_content;
-                        if let Some(calls) = entry.tool_calls {
-                            let tool_calls: Vec<crate::tools::ToolCall> = calls
-                                .into_iter()
-                                .filter_map(|v| {
-                                    let id = v.get("id")?.as_str()?.to_string();
-                                    let name = v.get("name")?.as_str()?.to_string();
-                                    let args = v.get("arguments").cloned().unwrap_or_default();
-                                    Some(crate::tools::ToolCall {
-                                        id,
-                                        name,
-                                        arguments: args,
-                                        raw_arguments: None,
-                                    })
-                                })
-                                .collect();
-                            if !tool_calls.is_empty() {
-                                msg.tool_calls = Some(tool_calls);
-                            }
-                        }
-                        messages.push(msg);
-                    } else {
-                        messages.push(Message::new(normalize_role(role), content));
-                    }
+                if let Some(msg) = message_line_to_message(&val) {
+                    messages.push(msg);
                 }
             }
         }
@@ -694,6 +838,7 @@ mod tests {
             3,
             &format!("{}\nthe summary", COMPACTION_PREFIX),
             None,
+            CompactionBoundary::default(),
         )
         .unwrap();
 
@@ -712,6 +857,129 @@ mod tests {
         // And what the summary really replaced is gone.
         assert!(!loaded.iter().any(|m| m.content == "one"));
         assert!(!loaded.iter().any(|m| m.content == "three"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_drifted_count_is_corrected_by_the_digest() {
+        // The count indexes the list the compactor held in memory. The file can
+        // hold a different number of lines: a persist that failed, a line lost to
+        // a crash mid-write, an edited transcript. The count then points at the
+        // wrong message and replay deletes real history without a word. The digest
+        // names the boundary, so a drifted count becomes a search.
+        let dir = std::env::temp_dir().join(format!("rupi-drift-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("drift.jsonl");
+        std::fs::write(&path, "").unwrap();
+
+        let kept_first = Message::new("user", "the third thing I asked");
+        for msg in [
+            Message::new("user", "the first thing I asked"),
+            Message::new("assistant", "the first answer"),
+            kept_first.clone(),
+            Message::new("assistant", "the third answer"),
+        ] {
+            append_message(&path, &msg).unwrap();
+        }
+
+        // The compactor believed it had five messages, so it recorded a count of
+        // three. Only four reached the file.
+        let digest = crate::compaction::message_digest(&kept_first);
+        append_compaction(
+            &path,
+            "the story so far",
+            9000,
+            3,
+            "[Compacted conversation history]\nsummary body",
+            None,
+            CompactionBoundary {
+                first_kept_digest: Some(&digest),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        let replayed = load_session(&path).unwrap();
+        assert!(
+            replayed
+                .iter()
+                .any(|m| m.content == "the third thing I asked"),
+            "the drifted count deleted a message the summary never replaced: {:?}",
+            replayed
+                .iter()
+                .map(|m| m.content.clone())
+                .collect::<Vec<_>>()
+        );
+        assert!(
+            !replayed
+                .iter()
+                .any(|m| m.content == "the first thing I asked"),
+            "a message the summary replaced survived"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_transcript_keeps_a_message_the_strict_shape_rejects() {
+        // A transcript from another agent, or one edited by hand, holds content as
+        // an array of blocks. `load_session` accepts those; the transcript loader
+        // had its own stricter copy and dropped them.
+        let dir = std::env::temp_dir().join(format!("rupi-blocks-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("blocks.jsonl");
+        let lines = [
+            r#"{"type":"message","message":{"role":"user","content":[{"type":"text","text":"content as blocks"}]}}"#,
+            r#"{"type":"message","message":{"role":"assistant","content":"a plain answer"}}"#,
+        ];
+        std::fs::write(&path, format!("{}\n", lines.join("\n"))).unwrap();
+
+        let context = load_session(&path).unwrap();
+        let transcript = load_transcript(&path).unwrap();
+        assert_eq!(
+            transcript.len(),
+            context.len(),
+            "the transcript lost a message the context kept"
+        );
+        assert!(
+            transcript.iter().any(|m| m.content == "content as blocks"),
+            "the block content is missing: {:?}",
+            transcript
+                .iter()
+                .map(|m| m.content.clone())
+                .collect::<Vec<_>>()
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_record_carries_the_files_the_span_touched() {
+        let dir = std::env::temp_dir().join(format!("rupi-files-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("files.jsonl");
+        std::fs::write(&path, "").unwrap();
+        let read = vec!["src/parse.rs".to_string()];
+        let modified = vec!["src/emit.rs".to_string()];
+        append_compaction(
+            &path,
+            "summary",
+            100,
+            1,
+            "[Compacted conversation history]\nbody",
+            None,
+            CompactionBoundary {
+                first_kept_digest: None,
+                read_files: &read,
+                modified_files: &modified,
+            },
+        )
+        .unwrap();
+        let line = std::fs::read_to_string(&path).unwrap();
+        let val: serde_json::Value = serde_json::from_str(line.trim()).unwrap();
+        assert_eq!(val["modified_files"][0], "src/emit.rs");
+        assert_eq!(val["read_files"][0], "src/parse.rs");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -738,6 +1006,7 @@ mod tests {
             10,
             &format!("{}\nsummary A", COMPACTION_PREFIX),
             Some("the anchor"),
+            CompactionBoundary::default(),
         )
         .unwrap();
 
@@ -757,6 +1026,7 @@ mod tests {
             8,
             &format!("{}\nsummary B", COMPACTION_PREFIX),
             None,
+            CompactionBoundary::default(),
         )
         .unwrap();
 
@@ -1237,6 +1507,7 @@ mod tests {
             0,
             "[Compacted conversation history]\ntest summary",
             None,
+            CompactionBoundary::default(),
         )
         .unwrap();
         let contents = fs::read_to_string(&path).unwrap();

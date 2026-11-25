@@ -37,7 +37,44 @@ async fn main() {
     // environment marker the parent's bash tool sets AND from the parent links, so
     // it holds even when the command scrubbed its environment.
     rupi::agent::session::set_subagent_mode(tools::started_by_an_agent());
+
+    // Where the tools run. A host that is itself asked to forward would send
+    // every call back out again, so the two flags are refused together.
+    if cli.tool_daemon && cli.tool_command.is_some() {
+        eprintln!("rupi: --tool-daemon runs tools here, and --tool-command sends them elsewhere. Pick one.");
+        std::process::exit(2);
+    }
+    if let Some(ref command) = cli.tool_command {
+        if command.trim().is_empty() {
+            eprintln!("rupi: --tool-command needs a command to run");
+            std::process::exit(2);
+        }
+        eprintln!("rupi: tools run through `{}`", command);
+        rupi::tool_host::set_tool_command(Some(command.clone()));
+    }
     tools::set_agent_limit(cli.max_agents);
+
+    // Two entry points answer before any provider exists, because neither needs
+    // one. They must also run before the config is loaded: the tool host is meant
+    // to hold no credentials, and a bare machine with no `rupi.json` and no API
+    // key could not start the daemon at all while this sat below the config check.
+    if cli.mode() == "tool-daemon" {
+        rupi::modes::tool_daemon::serve_stdio().await;
+        return;
+    }
+    if let Some(ref query) = cli.search_code {
+        let result = rupi::tools::execute_tool(
+            &rupi::tools::ToolCall {
+                id: "cli".to_string(),
+                name: "search_code".to_string(),
+                arguments: serde_json::json!({ "query": query }),
+                raw_arguments: None,
+            },
+            &rupi::tools::ToolContext::new(),
+        );
+        println!("{}", result);
+        return;
+    }
 
     // The bound on a chain of agents. Advisory text in a prompt is not a limit, and
     // a model that loops on starting agents would otherwise fan out until the

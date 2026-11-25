@@ -341,9 +341,24 @@ fn chunk_lines(source: &str, desired_length: usize) -> Vec<ChunkBoundary> {
     merge_adjacent_chunks(&lines, desired_length)
 }
 
+/// The largest character boundary at or below `index`.
+///
+/// Every offset here comes from arithmetic — a line length, a tree-sitter node,
+/// `end - 1` — and arithmetic does not respect characters. Slicing one byte
+/// inside a `─` panics, which took the whole process down over a box-drawing
+/// character in a source file. `str::floor_char_boundary` does this in the
+/// standard library and is still unstable.
+fn floor_char_boundary(source: &str, index: usize) -> usize {
+    let mut index = index.min(source.len());
+    while index > 0 && !source.is_char_boundary(index) {
+        index -= 1;
+    }
+    index
+}
+
 /// Convert byte offset to 1-indexed line number.
 fn byte_to_line(source: &str, byte_offset: usize) -> usize {
-    source[..byte_offset.min(source.len())]
+    source[..floor_char_boundary(source, byte_offset)]
         .lines()
         .count()
         .max(1)
@@ -371,12 +386,14 @@ pub fn chunk_file(file_path: &str, content: &str, language: Option<String>) -> V
     boundaries
         .into_iter()
         .map(|b| {
-            let end = b.end.min(source_len);
+            // Both ends land on characters, whatever the arithmetic produced.
+            let end = floor_char_boundary(content, b.end.min(source_len));
+            let start = floor_char_boundary(content, b.start).min(end);
             CodeChunk {
                 file_path: file_path.to_string(),
-                start_line: byte_to_line(content, b.start),
+                start_line: byte_to_line(content, start),
                 end_line: byte_to_line(content, end.saturating_sub(1)),
-                content: content[b.start..end].to_string(),
+                content: content[start..end].to_string(),
                 language: language.clone(),
             }
         })
@@ -919,6 +936,43 @@ pub fn search_keyword(chunks: &[CodeChunk], query: &str, top_k: usize) -> Vec<Co
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn a_multibyte_character_does_not_panic_the_chunker() {
+        // A box-drawing character in a source file took the whole process down:
+        // the chunk ended right after it, and `end - 1` landed inside it.
+        let content = "fn draw() {\n    println!(\"───────\");\n}\n";
+        let chunks = chunk_file("src/draw.rs", content, Some("rust".to_string()));
+        assert!(!chunks.is_empty(), "nothing was chunked");
+        for chunk in &chunks {
+            assert!(
+                content.contains(chunk.content.trim_end()),
+                "a chunk is not a slice of the file"
+            );
+        }
+
+        // The same, with the character at every offset of a long line, which is
+        // where the arithmetic lands in the middle of one.
+        for pad in 0..12 {
+            let line = format!(
+                "// {}─ a comment that keeps going{}\n",
+                " ".repeat(pad),
+                "x".repeat(400)
+            );
+            let source = line.repeat(30);
+            let chunks = chunk_file("src/pad.rs", &source, None);
+            assert!(!chunks.is_empty(), "nothing was chunked at pad {}", pad);
+        }
+    }
+
+    #[test]
+    fn byte_to_line_accepts_an_offset_inside_a_character() {
+        let source = "primeira linha\nsegunda ─ linha\n";
+        let inside = source.find('─').expect("the character is there") + 1;
+        // One line, no panic. The offset is clamped down to the character.
+        assert_eq!(byte_to_line(source, inside), 2);
+        assert_eq!(byte_to_line(source, usize::MAX), 2);
+    }
     use super::*;
 
     #[test]

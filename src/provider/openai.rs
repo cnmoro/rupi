@@ -193,7 +193,36 @@ pub fn stream_idle_timeout() -> u64 {
     STREAM_IDLE_TIMEOUT.load(std::sync::atomic::Ordering::Relaxed)
 }
 
+/// Smallest output budget a one-off call ever asks for.
+const MIN_ONE_OFF_OUTPUT: u64 = 4096;
+
+/// Largest output budget a one-off call ever asks for.
+///
+/// A summary is a page of text. The ceiling exists because a reasoning model
+/// spends output tokens on thinking, and the budget has to cover both.
+const MAX_ONE_OFF_OUTPUT: u64 = 32768;
+
+/// Tokens held back so the input and the output fit the window together.
+const ONE_OFF_OUTPUT_MARGIN: u64 = 1024;
+
 impl OpenAIProvider {
+    /// Output budget for a one-off call, such as a compaction summary.
+    ///
+    /// This was a fixed 4096. On a reasoning model the thinking consumes that
+    /// budget, so the summary arrived truncated or empty, checkpoint validation
+    /// rejected it, the one retry failed the same way, and every compaction fell
+    /// back to the mechanical checkpoint. The budget now follows the window and
+    /// leaves room for the input it is summarizing.
+    fn one_off_output_budget(&self, messages: &[Message]) -> u64 {
+        let input = crate::compaction::estimate_total_tokens(messages);
+        let room = self
+            .config
+            .context_window
+            .saturating_sub(input)
+            .saturating_sub(ONE_OFF_OUTPUT_MARGIN);
+        room.clamp(MIN_ONE_OFF_OUTPUT, MAX_ONE_OFF_OUTPUT)
+    }
+
     pub fn new(config: OpenAIConfig) -> Self {
         let mut builder = Client::builder()
             .connect_timeout(std::time::Duration::from_secs(10))
@@ -250,7 +279,7 @@ impl OpenAIProvider {
             "model": model,
             "messages": api_messages,
             "stream": false,
-            "max_tokens": 4096,
+            "max_tokens": self.one_off_output_budget(messages),
         });
         if with_tools && !self.cached_tools.is_empty() {
             body["tools"] = serde_json::Value::Array(self.cached_tools.clone());
@@ -706,6 +735,49 @@ impl ChatProvider for OpenAIProvider {
 
 #[cfg(test)]
 mod tests {
+    fn provider_with_window(window: u64) -> OpenAIProvider {
+        OpenAIProvider::new(OpenAIConfig {
+            base_url: "http://127.0.0.1:1/v1".into(),
+            api_key: "t".into(),
+            model: "m".into(),
+            context_window: window,
+            reasoning: false,
+            timeout_secs: 0,
+        })
+    }
+
+    #[test]
+    fn a_one_off_call_gets_more_than_four_thousand_tokens() {
+        // The fixed 4096 was the whole budget. A reasoning model spends it on
+        // thinking, so the summary came back truncated and compaction always fell
+        // back to the mechanical checkpoint.
+        let provider = provider_with_window(128_000);
+        let small = vec![Message::new("user", "summarize this")];
+        assert_eq!(
+            provider.one_off_output_budget(&small),
+            MAX_ONE_OFF_OUTPUT,
+            "a short input must get the full ceiling"
+        );
+    }
+
+    #[test]
+    fn a_one_off_call_leaves_room_for_its_input() {
+        // A nearly full window must not ask for an output that cannot fit.
+        let provider = provider_with_window(10_000);
+        let big = vec![Message::new("user", &"x".repeat(32_000))];
+        let budget = provider.one_off_output_budget(&big);
+        assert!(
+            budget <= MAX_ONE_OFF_OUTPUT,
+            "budget above the ceiling: {}",
+            budget
+        );
+        assert!(
+            budget >= MIN_ONE_OFF_OUTPUT,
+            "budget below the floor: {}",
+            budget
+        );
+    }
+
     use super::*;
 
     fn body_of(messages: &[Message]) -> serde_json::Value {

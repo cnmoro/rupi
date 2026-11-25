@@ -75,6 +75,59 @@ pub fn snip_old_tool_results(messages: &mut [Message], preserve_turns: usize) ->
     removed
 }
 
+/// Longest tool result kept when a span has to be shrunk in place.
+pub const TAIL_RESULT_CHARS: usize = 2000;
+
+/// Cut every long tool result in `messages` down to a readable head and tail.
+///
+/// For the span compaction cannot cut into. A parallel batch of tool calls is one
+/// indivisible block: a cut inside it orphans a result, so the cut can only land
+/// before the whole block. When that block alone is over budget, the summary
+/// frees nothing, the next turn compacts again, and the summarizer is paid every
+/// turn for no result. Cutting the results themselves is the move that is left,
+/// and it keeps the call and result structure the provider requires.
+///
+/// The full result is still on disk: a long one was spilled when it was stored.
+pub fn shrink_tool_results(messages: &mut [Message], budget_each: usize) -> u64 {
+    let mut freed = 0u64;
+    for msg in messages.iter_mut() {
+        if msg.role != "tool" || msg.content.chars().count() <= budget_each {
+            continue;
+        }
+        let before = msg.content.len();
+        let head_chars = budget_each / 2;
+        let tail_chars = budget_each - head_chars;
+        let head_end = floor_boundary(&msg.content, byte_index_of_char(&msg.content, head_chars));
+        let tail_start = ceil_boundary(
+            &msg.content,
+            byte_index_of_char(
+                &msg.content,
+                msg.content.chars().count().saturating_sub(tail_chars),
+            ),
+        );
+        if tail_start <= head_end {
+            continue;
+        }
+        msg.content = format!(
+            "{}\n... [{} characters cut to keep the conversation inside the context window; \
+the full result was spilled to disk when it was stored] ...\n{}",
+            &msg.content[..head_end],
+            tail_start - head_end,
+            &msg.content[tail_start..]
+        );
+        freed += before.saturating_sub(msg.content.len()) as u64;
+    }
+    freed
+}
+
+/// Byte offset of the character at `position`, or the end of the text.
+fn byte_index_of_char(text: &str, position: usize) -> usize {
+    text.char_indices()
+        .nth(position)
+        .map(|(index, _)| index)
+        .unwrap_or(text.len())
+}
+
 /// Largest character boundary at or below `index`.
 fn floor_boundary(text: &str, index: usize) -> usize {
     let mut i = index.min(text.len());
@@ -183,47 +236,100 @@ pub fn tool_pairing_balanced_after(messages: &[Message], cut: usize) -> bool {
 /// region, never leave more context than the caller budgeted for. Returns `None`
 /// when no valid boundary above zero exists, which means nothing can be cut.
 pub fn snap_cut_to_boundary(messages: &[Message], candidate: usize) -> Option<usize> {
-    let mut cut = candidate.min(messages.len());
+    let limit = candidate.min(messages.len());
+    // Backwards first: a lower cut keeps more of the recent conversation.
+    let mut cut = limit;
     while cut > 0 {
-        if tool_pairing_balanced_before(messages, cut) && tool_pairing_balanced_after(messages, cut)
-        {
+        if legal_cut(messages, cut) {
             return Some(cut);
         }
         cut -= 1;
     }
+    // Then forwards, which keeps less and frees more.
+    let mut cut = limit + 1;
+    while cut < messages.len() {
+        if legal_cut(messages, cut) {
+            return Some(cut);
+        }
+        cut += 1;
+    }
     None
+}
+
+/// Whether a cut at `index` leaves both halves with their tool pairs intact.
+///
+/// `index` is the first message to KEEP. Two shapes are illegal:
+///
+/// - The kept half opens on a tool result, whose call stays in the summarized
+///   half. That result is an orphan.
+/// - The summarized half ends on an assistant message with calls, whose results
+///   went to the kept half. That call is unanswered.
+///
+/// Decided in constant time from the two messages at the boundary. Asking the
+/// `tool_pairing_balanced_*` helpers instead rescans both halves for every
+/// candidate, which made the search quadratic over a conversation of hundreds of
+/// messages. `legal_cut_matches_the_pairing_helpers` holds the two in agreement.
+fn legal_cut(messages: &[Message], index: usize) -> bool {
+    if index == 0 || index >= messages.len() {
+        return false;
+    }
+    if messages[index].role == "tool" {
+        return false;
+    }
+    let previous = &messages[index - 1];
+    let opens_calls = previous.role == "assistant"
+        && previous
+            .tool_calls
+            .as_ref()
+            .is_some_and(|calls| !calls.is_empty());
+    !opens_calls
 }
 
 /// Find the cut point index: the first message to KEEP.
 /// Everything before this index is summarized.
-/// We keep approximately `keep_recent` tokens worth of recent messages at the end.
 ///
-/// The returned index is always a boundary where neither half splits a tool
-/// call from its results.
+/// The cut keeps as much recent conversation as fits in `keep_recent`, and never
+/// splits a tool call from its results.
+///
+/// It used to walk back until the kept tail REACHED the budget, then snap to a
+/// legal boundary. Both steps can only keep more, so one oversized message — a
+/// single huge tool result — made every candidate keep that message. Compaction
+/// then summarized a couple of old lines, reported success, freed nothing, and
+/// ran again on the next turn: a paid summarizer call per turn, forever, with the
+/// context still over budget. Choosing the cut by what the tail COSTS fixes that,
+/// because a later cut always costs less.
 pub fn find_cut_point(messages: &[Message], keep_recent: u64) -> Option<usize> {
     if messages.len() < 4 {
         return None; // Not enough messages to compact
     }
 
-    let mut accumulated: u64 = 0;
-    let mut candidate: Option<usize> = None;
-
-    // Walk backwards from the end, accumulating tokens.
+    // `tail[i]` is what keeping `messages[i..]` costs.
+    let mut tail = vec![0u64; messages.len() + 1];
     for i in (0..messages.len()).rev() {
-        accumulated = accumulated.saturating_add(estimate_message_tokens(&messages[i]));
-        if accumulated >= keep_recent {
-            candidate = Some(i);
-            break;
+        tail[i] = tail[i + 1].saturating_add(estimate_message_tokens(&messages[i]));
+    }
+
+    // The whole conversation already fits. Nothing to compact.
+    if tail[0] <= keep_recent {
+        return None;
+    }
+
+    let mut fits = None;
+    let mut cheapest = None;
+    for (cut, cost) in tail.iter().enumerate().take(messages.len()).skip(1) {
+        if !legal_cut(messages, cut) {
+            continue;
+        }
+        // Ascending cuts cost less, so the last legal one frees the most.
+        cheapest = Some(cut);
+        if fits.is_none() && *cost <= keep_recent {
+            fits = Some(cut);
         }
     }
 
-    // All messages fit in keep_recent — nothing to compact.
-    let candidate = candidate?;
-    let cut = snap_cut_to_boundary(messages, candidate)?;
-    if cut == 0 {
-        return None;
-    }
-    Some(cut)
+    // One message can cost more than the whole budget. No cut fits then, and the
+    // most useful answer is the cut that frees the most.
+    fits.or(cheapest)
 }
 
 // ---------------------------------------------------------------------------
@@ -345,6 +451,18 @@ pub fn frame_summary(summary: &str) -> String {
 /// promotes it from something transient into something carried by every later
 /// request and written to the session file.
 pub fn build_checkpoint_body(summary: &str) -> String {
+    build_checkpoint_body_with_files(summary, &[], &[])
+}
+
+/// A checkpoint body that also names the files the replaced span touched.
+///
+/// The paths come from the tool calls rather than the summary, so they are there
+/// even when the model's text left them out.
+pub fn build_checkpoint_body_with_files(
+    summary: &str,
+    read_files: &[String],
+    modified_files: &[String],
+) -> String {
     let (summary, redacted) = crate::redact::redact_secrets(summary);
     let notice = if redacted > 0 {
         format!(
@@ -355,12 +473,20 @@ pub fn build_checkpoint_body(summary: &str) -> String {
     } else {
         String::new()
     };
+    let mut files = String::new();
+    if !modified_files.is_empty() {
+        files.push_str(&format!("\n\nFiles changed: {}", modified_files.join(", ")));
+    }
+    if !read_files.is_empty() {
+        files.push_str(&format!("\nFiles read: {}", read_files.join(", ")));
+    }
     format!(
-        "{}\n{}{}\n\n{}",
+        "{}\n{}{}\n\n{}{}",
         crate::sessions::COMPACTION_PREFIX,
         CHECKPOINT_PREAMBLE,
         notice,
-        frame_summary(&summary)
+        frame_summary(&summary),
+        files
     )
 }
 
@@ -544,6 +670,79 @@ pub fn validate_summary(summary: &str) -> Result<(), CheckpointProblem> {
 
 /// Longest a single recorded path or command may be in a mechanical checkpoint.
 const MECHANICAL_ITEM_CHARS: usize = 120;
+/// A short, stable name for one message.
+///
+/// Compaction records how many messages its summary replaced. A count is a fact
+/// about ordering, and ordering is exactly what a concurrent writer disturbs: a
+/// message appended while the summary was in flight shifts every later position
+/// by one, and replay then cut in the wrong place. The digest of the first kept
+/// message turns the count into a hint that can be checked, and a wrong hint into
+/// a search rather than a silent mistake.
+///
+/// Derived from what reaches the provider: the role, the text, the answered call
+/// and the ids of any calls. Two different messages share a digest only by
+/// collision of SHA-256, and `locate_boundary` starts from the hint, so even then
+/// it lands on the nearer one.
+pub fn message_digest(msg: &Message) -> String {
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    hasher.update(msg.role.as_bytes());
+    hasher.update([0]);
+    hasher.update(msg.content.as_bytes());
+    hasher.update([0]);
+    hasher.update(msg.tool_call_id.as_deref().unwrap_or("").as_bytes());
+    if let Some(calls) = msg.tool_calls.as_ref() {
+        for call in calls {
+            hasher.update([0]);
+            hasher.update(call.id.as_bytes());
+        }
+    }
+    let digest = hasher.finalize();
+    digest[..8].iter().map(|b| format!("{:02x}", b)).collect()
+}
+
+/// Where the kept tail begins, given the recorded hint and digest.
+///
+/// The hint is checked first, because it is right whenever nothing disturbed the
+/// order. When it is wrong, the nearest message with the recorded digest is the
+/// boundary. `None` means the digest is nowhere in the list, and the caller must
+/// fall back to the hint alone.
+pub fn locate_boundary(messages: &[Message], hint: usize, digest: &str) -> Option<usize> {
+    // The hint is right whenever nothing disturbed the order. A tool result is
+    // never a boundary, even a hinted one: its call would stay in the summarized
+    // half. `repair_tool_pairing` cleans up the shape if no candidate is legal.
+    if messages
+        .get(hint)
+        .is_some_and(|m| m.role != "tool" && message_digest(m) == digest)
+    {
+        return Some(hint);
+    }
+    // A boundary at the very end keeps nothing, which is a legal compaction of the
+    // whole conversation. There is no message to name there, so the hint stands.
+    if hint == messages.len() {
+        return Some(hint);
+    }
+    let mut nearest: Option<usize> = None;
+    for (index, msg) in messages.iter().enumerate() {
+        // A tail must never start on a tool result: its call would stay in the
+        // summarized half and the request would be malformed.
+        if msg.role == "tool" || message_digest(msg) != digest {
+            continue;
+        }
+        let closer = match nearest {
+            None => true,
+            // A tie goes to the later index. The drift this corrects comes from
+            // lines the file is missing, so the true boundary is at or after the
+            // hint, never before it.
+            Some(current) => index.abs_diff(hint) <= current.abs_diff(hint),
+        };
+        if closer {
+            nearest = Some(index);
+        }
+    }
+    nearest
+}
+
 /// Most paths a mechanical checkpoint lists.
 const MECHANICAL_MAX_FILES: usize = 40;
 /// Most commands a mechanical checkpoint lists.
@@ -568,6 +767,61 @@ fn mechanical_item(value: &str) -> String {
     }
     let head: String = line.chars().take(MECHANICAL_ITEM_CHARS).collect();
     format!("{}... [{} chars]", head, line.chars().count())
+}
+
+/// Files the region read, and files it changed.
+///
+/// Taken from the tool calls, not from the summary. A summarizer forgets to
+/// mention a path, or renames it, or drops the list when the text gets long; the
+/// arguments of an `edit` call do none of that. Bounded and deduplicated, with
+/// the same redaction the mechanical checkpoint applies.
+pub fn files_touched(region: &[Message]) -> (Vec<String>, Vec<String>) {
+    let mut read: Vec<String> = Vec::new();
+    let mut modified: Vec<String> = Vec::new();
+    for msg in region {
+        let Some(calls) = msg.tool_calls.as_ref() else {
+            continue;
+        };
+        for call in calls {
+            let Some(path) = call.arguments.get("file_path").and_then(|p| p.as_str()) else {
+                continue;
+            };
+            let item = mechanical_item(path);
+            if item.is_empty() {
+                continue;
+            }
+            let bucket = match call.name.as_str() {
+                "write" | "edit" => &mut modified,
+                "read" => &mut read,
+                _ => continue,
+            };
+            if !bucket.contains(&item) && bucket.len() < MECHANICAL_MAX_FILES {
+                bucket.push(item);
+            }
+        }
+    }
+    // A file that was changed is more interesting as changed than as read.
+    read.retain(|path| !modified.contains(path));
+    (read, modified)
+}
+
+/// Carry a file list forward across compactions, newest first.
+///
+/// A second compaction replaces a span that holds a checkpoint and little else,
+/// so its own tool calls name no files and the list would vanish exactly when the
+/// conversation can no longer be read back. Pi calls this cumulative tracking.
+/// The newest paths come first, because the cap drops the tail.
+pub fn merge_files(recent: &[String], previous: &[String]) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for path in recent.iter().chain(previous.iter()) {
+        if out.len() >= MECHANICAL_MAX_FILES {
+            break;
+        }
+        if !out.contains(path) {
+            out.push(path.clone());
+        }
+    }
+    out
 }
 
 /// Build a checkpoint from the region with no model call.
@@ -840,6 +1094,195 @@ mod tests {
             Message::tool_result("c1", "a"),
         ];
         assert_eq!(snap_cut_to_boundary(&msgs, 1), None);
+    }
+
+    #[test]
+    fn the_boundary_search_prefers_the_later_tie_and_skips_tool_results() {
+        // Duplicate messages are ordinary: a loop prompt repeats verbatim. The
+        // drift this corrects comes from lines the file is MISSING, so the true
+        // boundary is at or after the hint, never before it.
+        let a = Message::new("user", "keep going");
+        let b = Message::new("assistant", "working");
+        let msgs = vec![
+            Message::new("user", "start"),
+            a.clone(),
+            b.clone(),
+            a.clone(),
+            b.clone(),
+            a.clone(),
+            b.clone(),
+        ];
+        let digest = message_digest(&a);
+        assert_eq!(
+            locate_boundary(&msgs, 4, &digest),
+            Some(5),
+            "a tie went to the earlier message, which is further from the truth"
+        );
+        assert_eq!(locate_boundary(&msgs, 3, &digest), Some(3), "an exact hint");
+
+        // A digest that names a tool result is never a boundary: its call would
+        // stay in the summarized half.
+        let pair = vec![
+            Message::new("user", "go"),
+            assistant_with_calls(&["c1"]),
+            Message::tool_result("c1", "done"),
+            Message::new("assistant", "finished"),
+        ];
+        let result_digest = message_digest(&pair[2]);
+        assert_eq!(
+            locate_boundary(&pair, 2, &result_digest),
+            None,
+            "a tool result was accepted as the start of the tail"
+        );
+    }
+
+    #[test]
+    fn an_uncuttable_batch_is_shrunk_in_place() {
+        // A parallel batch of 30 calls is one indivisible block: a cut inside it
+        // orphans a result, so the cut can only land before the whole thing. With
+        // an ordinary window, shrinking the results brings the tail inside budget
+        // and the recent work survives.
+        let calls: Vec<crate::tools::ToolCall> = (0..30)
+            .map(|i| crate::tools::ToolCall {
+                id: format!("c{}", i),
+                name: "bash".into(),
+                arguments: serde_json::json!({"command": format!("check {}", i)}),
+                raw_arguments: None,
+            })
+            .collect();
+        let mut msgs = vec![
+            Message::new("user", "do the work"),
+            Message::new("assistant", "starting"),
+            Message::tool_call("running the checks", calls),
+        ];
+        for i in 0..30 {
+            msgs.push(Message::tool_result(&format!("c{}", i), &"z".repeat(4000)));
+        }
+        // A window where this batch is over the compaction threshold on its own.
+        let window = 40_000u64;
+        let before = estimate_total_tokens(&msgs);
+        assert!(before > 25_000, "the batch must be large: {}", before);
+
+        let cut = find_cut_point(&msgs, (window / 10).clamp(1, 20000)).expect("a cut");
+        let mut tail: Vec<Message> = msgs[cut..].to_vec();
+        assert!(
+            should_compact(estimate_total_tokens(&tail), window),
+            "this shape must leave the batch in the tail, over budget"
+        );
+        let freed = shrink_tool_results(&mut tail, TAIL_RESULT_CHARS);
+        assert!(freed > 0, "nothing was shrunk");
+        let after = estimate_total_tokens(&tail);
+        assert!(
+            !should_compact(after, window),
+            "the tail is still over budget after shrinking: {}",
+            after
+        );
+        // The structure the provider requires is intact.
+        assert_eq!(tail.iter().filter(|m| m.role == "tool").count(), 30);
+        assert!(tail
+            .iter()
+            .filter(|m| m.role == "tool")
+            .all(|m| m.content.contains("characters cut")));
+    }
+
+    #[test]
+    fn shrinking_keeps_both_ends_and_multibyte_text() {
+        let mut msgs = vec![Message::tool_result("c", &"á".repeat(5000))];
+        let freed = shrink_tool_results(&mut msgs, 100);
+        assert!(freed > 0);
+        assert!(msgs[0].content.starts_with('á'));
+        assert!(msgs[0].content.ends_with('á'));
+        assert!(msgs[0].content.chars().count() < 400);
+        // A short result is left alone.
+        let mut short = vec![Message::tool_result("c", "ok")];
+        assert_eq!(shrink_tool_results(&mut short, 100), 0);
+        assert_eq!(short[0].content, "ok");
+    }
+
+    #[test]
+    fn one_oversized_message_still_frees_the_context() {
+        // A single enormous tool result costs more than the whole keep budget.
+        // The old search could only keep more, so it cut at index 1, summarized
+        // one line, freed nothing, and compacted again on the next turn forever.
+        let mut msgs = vec![Message::new("user", "start the work")];
+        msgs.push(assistant_with_calls(&["big"]));
+        msgs.push(Message::tool_result("big", &"x".repeat(400_000)));
+        msgs.push(Message::new("assistant", "that is what the file holds"));
+        let before = estimate_total_tokens(&msgs);
+
+        let cut = find_cut_point(&msgs, 2000).expect("an oversized message must still cut");
+        let kept: u64 = msgs[cut..].iter().map(estimate_message_tokens).sum();
+        assert!(
+            kept * 10 < before,
+            "compaction freed almost nothing: {} of {} tokens kept",
+            kept,
+            before
+        );
+        assert!(
+            tool_pairing_balanced_before(&msgs, cut) && tool_pairing_balanced_after(&msgs, cut),
+            "the cut split a tool call from its result"
+        );
+    }
+
+    #[test]
+    fn the_cut_keeps_as_much_as_the_budget_allows() {
+        let mut msgs = Vec::new();
+        for i in 0..20 {
+            msgs.push(Message::new("user", &format!("turn {}", i)));
+            msgs.push(Message::new("assistant", &"y".repeat(400)));
+        }
+        let cut = find_cut_point(&msgs, 2000).expect("a plain conversation must cut");
+        let kept: u64 = msgs[cut..].iter().map(estimate_message_tokens).sum();
+        assert!(kept <= 2000, "the kept tail is over budget: {}", kept);
+        let one_more: u64 = msgs[cut - 1..].iter().map(estimate_message_tokens).sum();
+        assert!(
+            one_more > 2000,
+            "one more message would still fit, so the cut kept too little"
+        );
+    }
+
+    #[test]
+    fn legal_cut_matches_the_pairing_helpers() {
+        // `legal_cut` decides in constant time what the helpers decide by
+        // rescanning. They must never disagree.
+        let shapes: [&[&str]; 6] = [
+            &["user", "assistant", "user", "assistant"],
+            &["user", "calls", "tool", "assistant"],
+            &["user", "calls", "tool", "tool", "assistant"],
+            &["calls", "tool", "calls", "tool"],
+            &["user", "tool", "assistant", "calls", "tool"],
+            &[
+                "calls",
+                "tool",
+                "assistant",
+                "user",
+                "calls",
+                "tool",
+                "tool",
+            ],
+        ];
+        for shape in shapes {
+            let msgs: Vec<Message> = shape
+                .iter()
+                .enumerate()
+                .map(|(i, kind)| match *kind {
+                    "calls" => assistant_with_calls(&["c"]),
+                    "tool" => Message::tool_result("c", "done"),
+                    role => Message::new(role, &format!("message {}", i)),
+                })
+                .collect();
+            for cut in 1..msgs.len() {
+                let helpers = tool_pairing_balanced_before(&msgs, cut)
+                    && tool_pairing_balanced_after(&msgs, cut);
+                assert_eq!(
+                    legal_cut(&msgs, cut),
+                    helpers,
+                    "disagreement at cut {} of {:?}",
+                    cut,
+                    shape
+                );
+            }
+        }
     }
 
     #[test]

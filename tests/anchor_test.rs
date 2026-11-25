@@ -75,6 +75,10 @@ enum Turn {
     Text(&'static str),
     /// Fail the turn, the way a provider that drops mid-stream does.
     Fail,
+    /// Refuse the request for its size, the way a provider answers 400.
+    Overflow,
+    /// Call `bash` `count` times at once, each returning `output_bytes`.
+    ToolBatch { count: usize, output_bytes: usize },
 }
 
 /// A scripted provider that records what the summarizer was actually sent.
@@ -230,6 +234,38 @@ impl ChatProvider for MockProvider {
                         reasoning_content: String::new(),
                     })
                     .await;
+            }
+            Some(Turn::ToolBatch {
+                count,
+                output_bytes,
+            }) => {
+                let calls: Vec<ToolCall> = (0..count)
+                    .map(|i| ToolCall {
+                        id: format!("batch_{}", i),
+                        name: "bash".to_string(),
+                        arguments: serde_json::json!({
+                            "command": format!("printf 'z%.0s' $(seq 1 {})", output_bytes)
+                        }),
+                        raw_arguments: None,
+                    })
+                    .collect();
+                let _ = tx
+                    .send(StreamEvent::ToolCalls {
+                        calls,
+                        content: "running every check at once".to_string(),
+                        input_tokens: 10,
+                        output_tokens: 5,
+                        cost: None,
+                        finish_reason: Some("tool_calls".to_string()),
+                        reasoning_content: String::new(),
+                    })
+                    .await;
+            }
+            Some(Turn::Overflow) => {
+                return Err(AgentError::Api {
+                    message: "{\"error\":{\"message\":\"This model's maximum context length is 128000 tokens. However, your messages resulted in 131204 tokens.\",\"code\":\"context_length_exceeded\"}}".to_string(),
+                    status_code: 400,
+                });
             }
             Some(Turn::Fail) => {
                 let _ = tx
@@ -2164,4 +2200,219 @@ async fn one_shot_mode_never_reports_tool_narration_as_the_answer() {
             e
         ),
     }
+}
+
+#[tokio::test]
+async fn a_refused_oversized_request_compacts_and_retries() {
+    // Compaction decides when to run from an estimate. When the estimate is wrong
+    // the provider answers 400, and the agent can fix that by itself: make room
+    // and ask again. Reported as an error instead, an unattended run stopped on
+    // the one failure it was equipped to handle.
+    //
+    // The window here is wide, so automatic compaction never fires. The only
+    // compaction in this run is the forced one the refusal triggers.
+    let provider = Arc::new(MockProvider::new(
+        vec![
+            Turn::ToolCall { output_bytes: 4000 },
+            Turn::ToolCall { output_bytes: 4000 },
+            Turn::Overflow,
+            Turn::Text("the work is done"),
+        ],
+        &valid_summary("the earlier steps"),
+    ));
+    let session = session_with_window(provider.clone(), 200_000);
+    run_prompt(&session, ORIGINAL_REQUEST).await;
+
+    assert!(
+        !provider.aligned_requests().is_empty(),
+        "the refusal did not trigger a compaction"
+    );
+    let said = session.messages().await;
+    assert!(
+        said.iter()
+            .any(|m| m.role == "assistant" && m.content == "the work is done"),
+        "the run did not continue after the refusal: {:?}",
+        said.iter().map(|m| m.role.clone()).collect::<Vec<_>>()
+    );
+    assert!(
+        said[0]
+            .content
+            .starts_with("[Compacted conversation history]"),
+        "the forced compaction did not land in the history"
+    );
+}
+
+#[tokio::test]
+async fn a_second_refusal_in_one_run_is_not_retried_again() {
+    // A second failure means compacting did not help. Retrying forever would burn
+    // the summarizer on every attempt.
+    let provider = Arc::new(MockProvider::new(
+        vec![
+            Turn::ToolCall { output_bytes: 4000 },
+            Turn::ToolCall { output_bytes: 4000 },
+            Turn::Overflow,
+            Turn::Overflow,
+            Turn::Text("unreachable"),
+        ],
+        &valid_summary("the earlier steps"),
+    ));
+    let session = session_with_window(provider.clone(), 200_000);
+    run_prompt(&session, ORIGINAL_REQUEST).await;
+    assert_eq!(
+        provider.aligned_requests().len(),
+        1,
+        "the summarizer ran more than once for one run"
+    );
+}
+
+#[tokio::test]
+async fn a_real_compaction_records_its_boundary_and_its_files() {
+    // The record must name the first kept message and the files the replaced span
+    // touched. Both come from the span itself, not from the summarizer's text.
+    // Many small turns, so the conversation passes the threshold with a tail that
+    // can be cut into. An uncuttable batch as the tail is a different case, and
+    // `a_parallel_batch_does_not_make_compaction_spin` covers it.
+    let mut script = vec![Turn::Edit {
+        path: "/tmp/rupi-compaction-files.txt".to_string(),
+        old: "",
+        new: "hello",
+        then_run: None,
+    }];
+    for _ in 0..24 {
+        script.push(Turn::ToolCall { output_bytes: 1200 });
+    }
+    script.push(Turn::Text("done"));
+    let provider = Arc::new(MockProvider::new(
+        script,
+        &valid_summary("the edit and the checks"),
+    ));
+    let _ = std::fs::write("/tmp/rupi-compaction-files.txt", "");
+    // A window above the 16384-token reserve, so a tail survives the cut and the
+    // record has a first kept message to name. Below the reserve every tail is
+    // over budget, and keeping nothing is the correct answer.
+    let session = session_with_window(provider.clone(), 20_000);
+    run_prompt(&session, ORIGINAL_REQUEST).await;
+    assert!(
+        !provider.aligned_requests().is_empty(),
+        "this run must compact"
+    );
+
+    let path = session.session_path().await.expect("a session file");
+    let raw = std::fs::read_to_string(&path).expect("the transcript must read");
+    let record = raw
+        .lines()
+        .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+        .find(|val| val["type"] == "compaction")
+        .expect("a compaction record");
+
+    assert!(
+        record["first_kept_digest"].is_string(),
+        "the record did not name its boundary"
+    );
+    let changed = record["modified_files"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
+    assert!(
+        changed
+            .iter()
+            .any(|p| p.as_str().unwrap_or("").contains("rupi-compaction-files")),
+        "the edited file is missing from the record: {:?}",
+        record["modified_files"]
+    );
+    let in_memory = session.messages().await;
+    assert!(
+        in_memory[0].content.contains("Files changed:"),
+        "the checkpoint does not name the files"
+    );
+    let _ = std::fs::remove_file("/tmp/rupi-compaction-files.txt");
+}
+
+#[tokio::test]
+async fn the_transcript_keeps_what_compaction_replaced() {
+    // Compaction removes messages from the CONTEXT, not from the record. A caller
+    // that wants the audit trail reads the transcript.
+    let provider = Arc::new(MockProvider::new(
+        vec![
+            Turn::ToolCall { output_bytes: 6000 },
+            Turn::ToolCall { output_bytes: 6000 },
+            Turn::Text("done"),
+        ],
+        &valid_summary("the earlier work"),
+    ));
+    let session = session_with(provider.clone());
+    run_prompt(&session, ORIGINAL_REQUEST).await;
+    assert!(
+        !provider.aligned_requests().is_empty(),
+        "this run must compact"
+    );
+
+    let context = session.get_messages_as_rpc().await;
+    let transcript = session.get_transcript_as_rpc().await;
+    assert!(
+        transcript.len() > context.len(),
+        "the transcript is no longer than the context: {} vs {}",
+        transcript.len(),
+        context.len()
+    );
+    let first_request = |msgs: &Vec<rupi::rpc::types::AgentMessage>| {
+        msgs.iter().any(|m| {
+            m.content
+                .iter()
+                .any(|c| c.text.as_deref().unwrap_or("").contains(ORIGINAL_REQUEST))
+        })
+    };
+    assert!(
+        first_request(&transcript),
+        "the request that started the session is missing from the transcript"
+    );
+}
+
+#[tokio::test]
+async fn a_parallel_batch_does_not_make_compaction_spin() {
+    // A batch of calls is one indivisible block: a cut inside it orphans a result,
+    // so the cut can only land before the whole thing. When the block alone is
+    // over budget, compaction used to free nothing, report success, and run again
+    // on the next turn — a paid summarizer call per turn, forever.
+    let provider = Arc::new(MockProvider::new(
+        vec![
+            Turn::ToolBatch {
+                count: 12,
+                output_bytes: 3000,
+            },
+            Turn::Text("every check passed"),
+        ],
+        &valid_summary("the batch of checks"),
+    ));
+    // A window larger than the 16384-token reserve, so "inside budget" means
+    // something. The default test window is smaller than the reserve, which puts
+    // every conversation over budget by definition.
+    let window = 20_000;
+    let session = session_with_window(provider.clone(), window);
+    run_prompt(&session, ORIGINAL_REQUEST).await;
+
+    let after = session.messages().await;
+    let tokens = rupi::compaction::estimate_total_tokens(&after);
+    assert!(
+        !rupi::compaction::should_compact(tokens, window),
+        "the conversation is still over budget after compacting: {} tokens",
+        tokens
+    );
+    assert_well_formed(&after, "after a batch compaction");
+
+    // A second prompt must not pay the summarizer again for nothing.
+    let summaries_before = provider.aligned_requests().len();
+    run_prompt(&session, "carry on").await;
+    let summaries_after = provider.aligned_requests().len();
+    let tokens_now = rupi::compaction::estimate_total_tokens(&session.messages().await);
+    assert!(
+        !rupi::compaction::should_compact(tokens_now, window),
+        "the second turn left the context over budget: {} tokens",
+        tokens_now
+    );
+    assert!(
+        summaries_after - summaries_before <= 1,
+        "the summarizer ran {} times for one quiet turn",
+        summaries_after - summaries_before
+    );
 }
