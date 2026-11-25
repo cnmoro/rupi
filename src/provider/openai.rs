@@ -139,7 +139,13 @@ struct AccumulatedToolCall {
 /// True for opencode.ai endpoints (the only ones that want `x-opencode-session`).
 fn is_opencode_url(base_url: &str) -> bool {
     let rest = base_url.split("://").nth(1).unwrap_or(base_url);
-    let host = rest.split('/').next().unwrap_or("").split(':').next().unwrap_or("");
+    let host = rest
+        .split('/')
+        .next()
+        .unwrap_or("")
+        .split(':')
+        .next()
+        .unwrap_or("");
     host == "opencode.ai" || host.ends_with(".opencode.ai")
 }
 
